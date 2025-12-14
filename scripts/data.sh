@@ -5,8 +5,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=12
-#SBATCH --output=/home/rohin/ZIP/logs/data.out
-#SBATCH --error=/home/rohin/ZIP/logs/data.err
+#SBATCH --output=/home/rohin/icl_value/logs/data.out
+#SBATCH --error=/home/rohin/icl_value/logs/data.err
 #SBATCH --account=liquidai
 #SBATCH --exclude=liquid-gpu-[054]
 
@@ -26,7 +26,7 @@ export NCCL_SOCKET_IFNAME=bond0
 export LC_CTYPE=en_US.UTF-8
 export PYTHONUNBUFFERED=1
 
-cd $HOME/ZIP
+cd $HOME/icl_value
 source ~/miniconda3/etc/profile.d/conda.sh
 conda deactivate && conda deactivate
 conda activate zip
@@ -36,8 +36,7 @@ conda activate zip
 model="Qwen/Qwen3-1.7B"
 dataset="rohinm/adaptivemath"
 prompt_column="problem"
-output_file="data/zip_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
-# output_file="data/zip_training_adaptivemath_data_qwen17b_thinking_4_min_p_001.parquet"
+output_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
 thinking_samples=0
 non_thinking_samples=32
 max_num_seqs=32
@@ -47,7 +46,7 @@ max_prompts=128_000_000
 temperature=1.0
 min_p=0.01
 
-echo "Starting ZIP training data generation:"
+echo "Starting ICL Value training data generation:"
 echo "  Model: $model"
 echo "  Output: $output_file"
 echo "  Prompts: $max_prompts (${thinking_samples} reasoning + ${non_thinking_samples} non-reasoning per prompt)"
@@ -64,7 +63,7 @@ python3 -u src/data.py \
     --dp-size 8 --tp-size 1 \
     --allow-partial-merge \
     --temperature $temperature --min-p $min_p \
-    --max-model-len 32768 --max-num-seqs $max_num_seqs 2>&1 | tee -a /home/rohin/ZIP/logs/data_$(basename ${output_file} .parquet).log
+    --max-model-len 32768 --max-num-seqs $max_num_seqs 2>&1 | tee -a /home/rohin/icl_value/logs/data_$(basename ${output_file} .parquet).log
 
 exit_code=${PIPESTATUS[0]}
 echo "Data generation completed with exit code: $exit_code at $(date)"

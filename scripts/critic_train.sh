@@ -5,8 +5,8 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=12
-#SBATCH --output=/home/rohin/ZIP/logs/joint_distribution_critic_train.out
-#SBATCH --error=/home/rohin/ZIP/logs/joint_distribution_critic_train.err
+#SBATCH --output=/home/rohin/icl_value/logs/joint_distribution_critic_train.out
+#SBATCH --error=/home/rohin/icl_value/logs/joint_distribution_critic_train.err
 #SBATCH --account=liquidai
 #SBATCH --exclude=liquid-gpu-[054]
 # Network configuration
@@ -25,13 +25,13 @@ export NCCL_SOCKET_IFNAME=bond0
 export LC_CTYPE=en_US.UTF-8
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:256"
-cd $HOME/ZIP
+cd $HOME/icl_value
 source ~/miniconda3/etc/profile.d/conda.sh
 conda deactivate && conda deactivate
 conda activate zip
 # === Configuration ===
 model_id="Qwen/Qwen3-1.7B"
-data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
+data_path="/home/rohin/icl_value/data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
 weights_path="models/joint_distribution_critic_half_correctness_only"
 distribution_token_id=151669
 learning_rate=3e-5
@@ -64,7 +64,7 @@ python3 -u src/train_in_context_critic.py \
     --wandb_project "$wandb_project" \
     --ablation_type "$ablation_type" \
     --correctness_only \
-    --dist-backend "ddp" 2>&1 | tee -a /home/rohin/ZIP/logs/train_joint_critic.log
+    --dist-backend "ddp" 2>&1 | tee -a /home/rohin/icl_value/logs/train_joint_critic.log
 exit_code=${PIPESTATUS[0]}
 echo "Done. Exit code: $exit_code"
 exit $exit_code
