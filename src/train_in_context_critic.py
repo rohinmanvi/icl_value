@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Fine-tune a model for Joint Reward-Cost Prediction (JointValueCost) with DDP support.
-Includes "In-Context Critic" logic: prepends sibling responses + ground truth answer
-to the context to improve prediction of the target response.
+Includes "In-Context Critic" logic: prepends sibling responses (and optional reward/length
+feedback) to the context to improve prediction of target responses.
 Uses PRE-TOKENIZED data from the generation step to ensure <think> tags and 
 special formatting are preserved exactly.
 
 UPDATED: Uses a single packed sequence per prompt containing ALL trajectories 
-for supervision in a single forward pass.
+for supervision in a single forward pass (supervising trajectories N..end).
 
 Example usage:
     python train.py --model_id Qwen/Qwen3-1.7B \
@@ -42,23 +42,26 @@ NEWLINE_TOKEN_ID = 198
 class JointDistributionDataset(Dataset):
     def __init__(self, table, tokenizer, max_length: int = 131_072, thinking_only: bool = False,
                  thinking_token_id: int = 151667, reward_values: List[float] | None = None,
-                 label_column: str = "correct", ablation_type: str = "full",
-                 examples_per_prompt: int = 4, correctness_only: bool = False):
+                 label_column: str = "correct", ablation_type: str = "no_ans",
+                 examples_per_prompt: int = 1, correctness_only: bool = False,
+                 supervise_from_trajectory: int = 4):
         """
         Modified Dataset to implement In-Context Critic Hypothesis using PRE-TOKENIZED data.
         NOW PACKED: Creates one long sequence per prompt containing trajectories.
-        Each packed example supervises only the last trajectory in the packed suffix.
+        Each packed example supervises trajectories `supervise_from_trajectory..end`
+        in a single forward pass.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.ablation_type = ablation_type
         self.correctness_only = correctness_only
+        self.supervise_from_trajectory = int(supervise_from_trajectory)
         
         # Load Data
         df = pq.read_table(table).to_pandas() if isinstance(table, str) else table
         
         # Validation
-        required_cols = ["prompt_idx", "prompt", "output_token_ids", "answer"]
+        required_cols = ["prompt_idx", "prompt", "output_token_ids"]
         for c in required_cols:
             if c not in df.columns:
                 raise ValueError(f"Dataset missing required column: {c}")
@@ -108,7 +111,6 @@ class JointDistributionDataset(Dataset):
             
             # Common data elements
             prompt_text = rows[0]['prompt']
-            answer_text = rows[0]['answer']
             
             # Collect all trajectories for this prompt
             trajectories = []
@@ -128,7 +130,6 @@ class JointDistributionDataset(Dataset):
                 random.shuffle(trajs)
                 self.samples.append({
                     "prompt": prompt_text,
-                    "answer": answer_text,
                     "trajectories": trajs
                 })
 
@@ -212,22 +213,14 @@ class JointDistributionDataset(Dataset):
         full_label_positions = []
         full_bin_labels = []
 
-        # 1. Answer Logic (System Message)
-        # "full": Include Answer
-        # "no_ans" variants: Exclude Answer
-        use_answer = (self.ablation_type == "full")
-            
-        if use_answer:
-            ans_tokens = self.tokenizer.encode(f"The correct answer is:\n\n{sample['answer']}", add_special_tokens=False)
-            full_input_ids.extend(self.create_tokenized_message("system", ans_tokens))
-        
-        # 2. User: Prompt
+        # 1. User: Prompt
         prompt_tokens = self.tokenizer.encode(sample['prompt'], add_special_tokens=False)
         full_input_ids.extend(self.create_tokenized_message("user", prompt_tokens))
 
         prefix_len = len(full_input_ids)
 
-        # 3. Trajectory packing: include a suffix that fits max_length and supervise only the last trajectory.
+        # 2. Trajectory packing: include a suffix that fits max_length and supervise
+        # trajectories `supervise_from_trajectory..end` within the packed order.
         trajectories = sample['trajectories']
         if not trajectories:
             input_tensor = torch.tensor(full_input_ids, dtype=torch.long)
@@ -343,9 +336,13 @@ class JointDistributionDataset(Dataset):
                 "content_plus_footer_len": len(trunc_content) + len(footer),
             }]
 
-        # Build sequence; supervise only last trajectory in included
+        supervise_start_idx = max(0, self.supervise_from_trajectory - 1)
+        if len(included) <= supervise_start_idx:
+            supervise_start_idx = max(0, len(included) - 1)
+
+        # Build sequence; supervise trajectories from N..end in included
         for local_idx, info in enumerate(included):
-            is_supervised = (local_idx == len(included) - 1)
+            is_supervised = local_idx >= supervise_start_idx
 
             current_start_idx = len(full_input_ids)
             traj_block = info["traj_block"]
@@ -369,7 +366,7 @@ class JointDistributionDataset(Dataset):
             full_input_ids.extend(traj_block)
 
             # Add reward/length feedback only when there is a next trajectory in-context.
-            if not is_supervised:
+            if local_idx != (len(included) - 1):
                 if self.ablation_type == "full" or self.ablation_type == "no_ans":
                     reward_tokens = info["reward_tokens_full"]
                 elif self.ablation_type == "no_ans_no_rewards":
@@ -411,7 +408,7 @@ def compute_loss(model, batch, distribution_token_id, num_bins, num_length_bins)
     input_ids = batch["input_ids"].to(device)
     
     # Forward pass: get hidden states
-    outputs = model(input_ids=input_ids, output_hidden_states=True)
+    outputs = model(input_ids=input_ids, output_hidden_states=True, use_cache=False)
     hidden_states = outputs.hidden_states[-1]  # [B, S, E]
     
     flat_b, flat_s, flat_labels = [], [], []
@@ -425,16 +422,21 @@ def compute_loss(model, batch, distribution_token_id, num_bins, num_length_bins)
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {"loss_reward": zero.detach(), "loss_length": zero.detach()}
 
-    selected_h = hidden_states[torch.tensor(flat_b, device=device), torch.tensor(flat_s, device=device)]
-    
-    tgt = model.module if hasattr(model, "module") else model
+    b_idx = torch.tensor(flat_b, device=device)
+    s_idx = torch.tensor(flat_s, device=device)
+
+    # Unwrap possible torch.compile and/or DDP wrappers for lm_head access
+    tgt = model._orig_mod if hasattr(model, "_orig_mod") else model
+    tgt = tgt.module if hasattr(tgt, "module") else tgt
     lm_head = tgt.lm_head if hasattr(tgt, "lm_head") else tgt.get_output_embeddings()
     
     w = lm_head.weight[distribution_token_id : distribution_token_id + num_bins]
     b = lm_head.bias[distribution_token_id : distribution_token_id + num_bins] if hasattr(lm_head, "bias") and lm_head.bias is not None else None
     
-    # [N_selected, num_bins]
-    logits = F.linear(selected_h, w, b) 
+    # Project all positions to the small joint head to avoid materializing [N_selected, E]
+    # (important when supervising many trajectories in one packed sequence).
+    logits_all = F.linear(hidden_states, w, b)  # [B, S, num_bins]
+    logits = logits_all[b_idx, s_idx]  # [N_selected, num_bins]
     
     # 1. Main Joint Loss (Unchanged)
     target_labels = torch.tensor(flat_labels, device=device)
@@ -502,7 +504,8 @@ def train(model, dataset, distribution_token_id, num_bins, weights_path,
             "max_steps": max_steps,
             "joint_distribution_bins": f"{dataset.num_length_bins} length × {dataset.num_reward_states} reward",
             "reward_values": dataset.reward_values,
-            "ablation_type": dataset.ablation_type
+            "ablation_type": dataset.ablation_type,
+            "supervise_from_trajectory": dataset.supervise_from_trajectory,
         })
 
     model = model.to(device)
@@ -662,6 +665,7 @@ def main_worker(local_rank, world_size, cfg):
         ablation_type=cfg.ablation_type,
         examples_per_prompt=cfg.examples_per_prompt,
         correctness_only=cfg.correctness_only,
+        supervise_from_trajectory=cfg.supervise_from_trajectory,
     )
     num_bins = dataset.num_bins
     
@@ -696,12 +700,14 @@ def parse_args():
     # Removed unused ablations, kept strict list as requested
     p.add_argument("--ablation_type", 
                    choices=["full", "no_ans", "no_ans_no_rewards", "no_ans_first_reward_only"], 
-                   default="full", 
-                   help="Controls in-context data configuration.")
+                   default="no_ans", 
+                   help="Controls in-context feedback configuration. Note: the ground-truth answer is never added to the prompt; 'full' is kept as an alias of 'no_ans'.")
 
     # Dataset packing / supervision
-    p.add_argument("--examples_per_prompt", type=int, default=4,
+    p.add_argument("--examples_per_prompt", type=int, default=1,
                    help="Number of packed examples per prompt (reshuffle trajectories each time).")
+    p.add_argument("--supervise_from_trajectory", type=int, default=4,
+                   help="1-indexed trajectory number to start supervision (e.g., 4 => supervise trajectories 4..end; first 3 are context-only).")
 
     # Output space
     p.add_argument("--correctness_only", action="store_true",

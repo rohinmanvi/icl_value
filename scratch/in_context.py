@@ -56,7 +56,7 @@ def main():
         log(f"\nLoaded {len(dataset)} samples (context-target pairs).")
         log("="*80)
         log("VISUALIZATION KEY:")
-        log(colored("GRAY TEXT   = Context (Prompt + Sibling Response + Ground Truth Injection)", "light_grey"))
+        log(colored("GRAY TEXT   = Context (Prompt + sibling responses + reward/length feedback)", "light_grey"))
         log(colored("GREEN TEXT  = Target (The response we are calculating loss on)", "green", attrs=["bold"]))
         log("="*80 + "\n")
 

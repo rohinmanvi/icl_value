@@ -32,16 +32,21 @@ conda activate zip
 # === Configuration ===
 model_id="Qwen/Qwen3-1.7B"
 data_path="/home/rohin/icl_value/data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
-weights_path="models/joint_distribution_critic_half_correctness_only"
+weights_path="models/joint_distribution_critic_no_ans_supervise_from_8_with_32"
 distribution_token_id=151669
-learning_rate=3e-5
-# learning_rate=1e-4
+# learning_rate=3e-5
+learning_rate=1e-4
 label_column="correct"
 batch_size=1
 num_epochs=1
 wandb_project="new_joint_critic"
-# Ablation Choice: full, no_ans, no_ans_no_rewards, no_ans_first_reward_only
+# Ablation Choice: no_ans, no_ans_no_rewards, no_ans_first_reward_only (note: "full" is an alias of "no_ans"; no answer injection)
 ablation_type="no_ans"
+# Dataset packing / supervision
+# 1-indexed trajectory number to start supervision (e.g., 4 => supervise trajectories 4..end; first 3 are context-only).
+supervise_from_trajectory=8
+# Number of packed examples per prompt (reshuffle trajectories each time). With multi-trajectory supervision, 1 is usually sufficient.
+examples_per_prompt=1
 
 echo "=================================================="
 echo "Starting Joint Critic Training"
@@ -49,9 +54,10 @@ echo "  Model: $model_id"
 echo "  Data: $data_path"
 echo "  Output: $weights_path"
 echo "  Ablation: $ablation_type"
+echo "  Supervise From Trajectory: $supervise_from_trajectory"
+echo "  Examples/Prompt: $examples_per_prompt"
 echo "=================================================="
 # Run Training
-# Note: Ensure the python file provided is saved as src/train_joint_critic.py
 python3 -u src/train_in_context_critic.py \
     --model_id "$model_id" \
     --data_path "$data_path" \
@@ -63,7 +69,8 @@ python3 -u src/train_in_context_critic.py \
     --num_epochs $num_epochs \
     --wandb_project "$wandb_project" \
     --ablation_type "$ablation_type" \
-    --correctness_only \
+    --supervise_from_trajectory $supervise_from_trajectory \
+    --examples_per_prompt $examples_per_prompt \
     --dist-backend "ddp" 2>&1 | tee -a /home/rohin/icl_value/logs/train_joint_critic.log
 exit_code=${PIPESTATUS[0]}
 echo "Done. Exit code: $exit_code"
