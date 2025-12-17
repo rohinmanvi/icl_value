@@ -40,6 +40,8 @@ dp_size=8
 arrow_batch_size=1024
 max_length=131072
 shuffle_seed=0
+label_rollouts_per_prompt=-1  # -1=all, 0=none, K>0=subsample K per prompt
+label_seed=0
 
 echo "Starting in-context critic labeling:"
 echo "  Critic model: $critic_model_id"
@@ -48,6 +50,8 @@ echo "  Output:      $out_file"
 echo "  DP size:     $dp_size"
 echo "  Max length:  $max_length"
 echo "  Seed:        $shuffle_seed"
+echo "  Label/prompt:$label_rollouts_per_prompt"
+echo "  Label seed:  $label_seed"
 echo "  Start time:  $(date)"
 
 python3 -u src/label_in_context_critic.py \
@@ -57,11 +61,12 @@ python3 -u src/label_in_context_critic.py \
     --dp-size $dp_size \
     --arrow-batch-size $arrow_batch_size \
     --max-length $max_length \
-    --shuffle-seed $shuffle_seed 2>&1 | tee -a /home/rohin/icl_value/logs/critic_label_$(basename ${out_file} .parquet).log
+    --shuffle-seed $shuffle_seed \
+    --label-rollouts-per-prompt $label_rollouts_per_prompt \
+    --label-seed $label_seed 2>&1 | tee -a /home/rohin/icl_value/logs/critic_label_$(basename ${out_file} .parquet).log
 
 exit_code=${PIPESTATUS[0]}
 echo "Labeling completed with exit code: $exit_code at $(date)"
 
 [ -f "$out_file" ] && echo "Output file size: $(du -h $out_file | cut -f1)"
 exit $exit_code
-

@@ -14,6 +14,10 @@ The output Parquet preserves all input columns and appends:
   - critic_p_correct
   - critic_expected_tokens_remaining
 
+Optionally, you can label only a subset of rollouts per prompt group (selected
+uniformly without replacement with a per-prompt seed). Unlabeled rows are kept
+in the output with null critic columns.
+
 This script supports simple data-parallel execution across GPUs by splitting the
 input parquet by contiguous row-group ranges (with minimal overlap so prompt groups
 crossing boundaries are still processed exactly once).
@@ -80,6 +84,8 @@ class Config:
     length_bins: List[int]
     reward_values: List[float]
     shuffle_seed: int
+    label_rollouts_per_prompt: int
+    label_seed: int
     label_column: str
     ablation_type: str
 
@@ -136,6 +142,16 @@ def parse_args() -> Config:
     )
     p.add_argument("--shuffle-seed", type=int, default=0, help="Seed for deterministic per-prompt shuffles.")
     p.add_argument(
+        "--label-rollouts-per-prompt",
+        type=int,
+        default=-1,
+        help=(
+            "If >0, label only this many rollouts per prompt_idx group (selected uniformly without replacement). "
+            "If 0, label none. If <0, label all rollouts (default)."
+        ),
+    )
+    p.add_argument("--label-seed", type=int, default=0, help="Seed for selecting which rollouts to label per prompt.")
+    p.add_argument(
         "--label-column",
         choices=["correct"],
         default="correct",
@@ -180,6 +196,10 @@ def parse_args() -> Config:
     if not (min(reward_values) <= 0.0 <= max(reward_values) and min(reward_values) <= 1.0 <= max(reward_values)):
         raise ValueError("--reward-values must span [0, 1] for correctness labeling.")
 
+    label_rollouts_per_prompt = int(args.label_rollouts_per_prompt)
+    if label_rollouts_per_prompt < -1:
+        raise ValueError("--label-rollouts-per-prompt must be >= -1")
+
     return Config(
         critic_model_id=str(args.critic_model_id),
         in_parquet=str(args.in_parquet),
@@ -195,6 +215,8 @@ def parse_args() -> Config:
         length_bins=length_bins,
         reward_values=reward_values,
         shuffle_seed=int(args.shuffle_seed),
+        label_rollouts_per_prompt=label_rollouts_per_prompt,
+        label_seed=int(args.label_seed),
         label_column=str(args.label_column),
         ablation_type=str(args.ablation_type),
     )
@@ -470,13 +492,14 @@ def _pack_and_score_prompt_group(
     max_length: int,
     shuffle_seed: int,
     prompt_idx: int,
+    rows_to_label: set[int] | None,
     distribution_token_id: int,
     num_bins: int,
     num_length_bins: int,
     correct_reward_index: int,
     length_midpoints: torch.Tensor,
     autocast_ctx,
-) -> Tuple[List[List[float]], List[List[float]]]:
+) -> Tuple[List[List[float] | None], List[List[float] | None]]:
     """
     Return (p_correct_lists, expected_remaining_lists) aligned to each row's output_token_ids.
     """
@@ -487,8 +510,11 @@ def _pack_and_score_prompt_group(
     random.Random(int(shuffle_seed) + int(prompt_idx)).shuffle(order)
 
     # Allocate outputs (per row, aligned to its original output_token_ids length).
-    out_p_correct: List[List[float]] = [[] for _ in range(len(trajectories))]
-    out_expected: List[List[float]] = [[] for _ in range(len(trajectories))]
+    out_p_correct: List[List[float] | None] = [None for _ in range(len(trajectories))]
+    out_expected: List[List[float] | None] = [None for _ in range(len(trajectories))]
+
+    label_all = rows_to_label is None
+    remaining_to_label: set[int] | None = None if label_all else set(rows_to_label)
 
     prompt_tokens = tokenizer.encode(prompt or "", add_special_tokens=False)
     prefix = _create_tokenized_message("user", prompt_tokens)
@@ -496,82 +522,94 @@ def _pack_and_score_prompt_group(
 
     # Label all trajectories by scoring one or more suffix packs (minimal number of packs).
     remaining = list(order)
-    while remaining:
+    while remaining and (label_all or remaining_to_label):
         infos = _build_infos(remaining, tokenizer)
         included_infos, _truncated_last = _choose_suffix_that_fits(
             infos, prefix_len=prefix_len, max_length=max_length, tokenizer=tokenizer
         )
         if not included_infos:
             # Degenerate: cannot fit even a single assistant header/footer.
-            # Fill NaNs for remaining trajectories to keep alignment.
+            # Fill NaNs for any trajectories we intended to label to keep alignment.
             for traj in remaining:
+                if not label_all and remaining_to_label is not None and traj.row_idx not in remaining_to_label:
+                    continue
                 L = len(traj.response_ids)
                 out_p_correct[traj.row_idx] = [float("nan")] * L
                 out_expected[traj.row_idx] = [float("nan")] * L
             break
 
+        included_row_ids = {info.traj.row_idx for info in included_infos}
+        should_score = label_all or (
+            remaining_to_label is not None and bool(included_row_ids.intersection(remaining_to_label))
+        )
+
         # Build packed input_ids and capture per-trajectory token positions (aligned to output_token_ids).
-        full_input_ids: List[int] = list(prefix)
-        positions_by_row: Dict[int, List[int]] = {}
+        if should_score:
+            full_input_ids: List[int] = list(prefix)
+            positions_by_row: Dict[int, List[int]] = {}
 
-        for local_idx, info in enumerate(included_infos):
-            current_start = len(full_input_ids)
-            full_input_ids.extend(info.traj_block)
+            for local_idx, info in enumerate(included_infos):
+                current_start = len(full_input_ids)
+                full_input_ids.extend(info.traj_block)
 
-            # Positions correspond to the tokens in traj_content (excluding any appended footer token).
-            tok_positions = [current_start + len(info.header) + i for i in range(len(info.traj_content))]
-            positions_by_row[info.traj.row_idx] = tok_positions
+                # Positions correspond to the tokens in traj_content (excluding any appended footer token).
+                tok_positions = [current_start + len(info.header) + i for i in range(len(info.traj_content))]
+                positions_by_row[info.traj.row_idx] = tok_positions
 
-            # Add reward/length feedback only if there is a next trajectory in this pack.
-            if local_idx != (len(included_infos) - 1):
-                full_input_ids.extend(_create_tokenized_message("user", info.reward_tokens_full))
+                # Add reward/length feedback only if there is a next trajectory in this pack.
+                if local_idx != (len(included_infos) - 1):
+                    full_input_ids.extend(_create_tokenized_message("user", info.reward_tokens_full))
 
-        if len(full_input_ids) > max_length:
-            raise RuntimeError(
-                f"Internal error: packed sequence length {len(full_input_ids)} exceeds max_length={max_length}."
-            )
+            if len(full_input_ids) > max_length:
+                raise RuntimeError(
+                    f"Internal error: packed sequence length {len(full_input_ids)} exceeds max_length={max_length}."
+                )
 
-        device = next(model.parameters()).device
-        input_ids_t = torch.tensor(full_input_ids, dtype=torch.long, device=device).unsqueeze(0)
-        attention_mask_t = torch.ones_like(input_ids_t, dtype=torch.long, device=device)
+            device = next(model.parameters()).device
+            input_ids_t = torch.tensor(full_input_ids, dtype=torch.long, device=device).unsqueeze(0)
+            attention_mask_t = torch.ones_like(input_ids_t, dtype=torch.long, device=device)
 
-        with autocast_ctx:
-            logits_all = _score_packed_sequence(
-                model,
-                input_ids=input_ids_t,
-                attention_mask=attention_mask_t,
-                distribution_token_id=distribution_token_id,
-                num_bins=num_bins,
-                num_length_bins=num_length_bins,
-                correct_reward_index=correct_reward_index,
-                length_midpoints=length_midpoints,
-            )
+            with autocast_ctx:
+                logits_all = _score_packed_sequence(
+                    model,
+                    input_ids=input_ids_t,
+                    attention_mask=attention_mask_t,
+                    distribution_token_id=distribution_token_id,
+                    num_bins=num_bins,
+                    num_length_bins=num_length_bins,
+                    correct_reward_index=correct_reward_index,
+                    length_midpoints=length_midpoints,
+                )
 
-        # Extract and store outputs for trajectories in this pack.
-        for info in included_infos:
-            row_idx = info.traj.row_idx
-            L_orig = len(info.traj.response_ids)
-            tok_positions = positions_by_row.get(row_idx, [])
-            p_list, e_list = _extract_token_lists(
-                logits_all,
-                positions=tok_positions,
-                num_bins=num_bins,
-                num_length_bins=num_length_bins,
-                correct_reward_index=correct_reward_index,
-                length_midpoints=length_midpoints,
-            )
+            # Extract and store outputs for trajectories in this pack.
+            for info in included_infos:
+                row_idx = info.traj.row_idx
+                if not label_all and rows_to_label is not None and row_idx not in rows_to_label:
+                    continue
 
-            # If we truncated content to fit, positions cover only the prefix; pad the remainder with NaNs.
-            if len(p_list) < L_orig:
-                pad = [float("nan")] * (L_orig - len(p_list))
-                p_list = p_list + pad
-                e_list = e_list + pad
-            out_p_correct[row_idx] = p_list
-            out_expected[row_idx] = e_list
+                L_orig = len(info.traj.response_ids)
+                tok_positions = positions_by_row.get(row_idx, [])
+                p_list, e_list = _extract_token_lists(
+                    logits_all,
+                    positions=tok_positions,
+                    num_bins=num_bins,
+                    num_length_bins=num_length_bins,
+                    correct_reward_index=correct_reward_index,
+                    length_midpoints=length_midpoints,
+                )
+
+                # If we truncated content to fit, positions cover only the prefix; pad the remainder with NaNs.
+                if len(p_list) < L_orig:
+                    pad = [float("nan")] * (L_orig - len(p_list))
+                    p_list = p_list + pad
+                    e_list = e_list + pad
+                out_p_correct[row_idx] = p_list
+                out_expected[row_idx] = e_list
 
         # Remove processed suffix trajectories from remaining.
-        processed_row_ids = {info.traj.row_idx for info in included_infos}
-        remaining = [t for t in remaining if t.row_idx not in processed_row_ids]
+        remaining = [t for t in remaining if t.row_idx not in included_row_ids]
+        if remaining_to_label is not None:
+            remaining_to_label.difference_update(included_row_ids)
 
     return out_p_correct, out_expected
 
@@ -701,6 +739,22 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                 reward = max(0.0, min(1.0, reward))
                 trajectories.append(_Trajectory(row_idx=i_row, response_ids=toks_list, reward=reward))
 
+            rows_to_label: set[int] | None
+            if cfg.label_rollouts_per_prompt < 0:
+                rows_to_label = None
+            else:
+                k = int(cfg.label_rollouts_per_prompt)
+                n_rows = len(trajectories)
+                if k <= 0:
+                    rows_to_label = set()
+                elif k >= n_rows:
+                    rows_to_label = None
+                else:
+                    import random
+
+                    rng = random.Random(int(cfg.label_seed) + int(current_prompt_idx))
+                    rows_to_label = set(rng.sample(range(n_rows), k))
+
             p_correct_lists, expected_lists = _pack_and_score_prompt_group(
                 model,
                 tokenizer,
@@ -709,6 +763,7 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                 max_length=cfg.max_length,
                 shuffle_seed=cfg.shuffle_seed,
                 prompt_idx=int(current_prompt_idx),
+                rows_to_label=rows_to_label,
                 distribution_token_id=cfg.distribution_token_id,
                 num_bins=num_bins,
                 num_length_bins=num_length_bins,
@@ -718,7 +773,11 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
             )
 
             n_rows = table.num_rows
-            table = table.append_column("critic_model_id", pa.array([cfg.critic_model_id] * n_rows, type=pa.string()))
+            if rows_to_label is None:
+                model_ids = [cfg.critic_model_id] * n_rows
+            else:
+                model_ids = [cfg.critic_model_id if (p_correct_lists[i] is not None) else None for i in range(n_rows)]
+            table = table.append_column("critic_model_id", pa.array(model_ids, type=pa.string()))
             table = table.append_column("critic_p_correct", pa.array(p_correct_lists, type=pa.list_(pa.float32())))
             table = table.append_column(
                 "critic_expected_tokens_remaining", pa.array(expected_lists, type=pa.list_(pa.float32()))
@@ -812,7 +871,9 @@ def main() -> None:
         f"  max_length:      {cfg.max_length}\n"
         f"  length_bins:     {cfg.length_bins}\n"
         f"  reward_values:   {cfg.reward_values}\n"
-        f"  shuffle_seed:    {cfg.shuffle_seed}\n",
+        f"  shuffle_seed:    {cfg.shuffle_seed}\n"
+        f"  label_per_prompt: {cfg.label_rollouts_per_prompt}\n"
+        f"  label_seed:      {cfg.label_seed}\n",
         flush=True,
     )
 
