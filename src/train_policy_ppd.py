@@ -397,6 +397,7 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_cl
         label_positions: List[List[int]] = []
         ref_logprobs: List[List[float]] = []
         advantages: List[List[float]] = []
+        num_tokens = 0
 
         for i, r in enumerate(rows):
             ids = _as_list(r.get("input_ids"))
@@ -431,7 +432,22 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_cl
 
             label_positions.append(pos)
             ref_logprobs.append(old_lp)
-            advantages.append(_compute_advantages(p_corr, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)[:L])
+            adv = _compute_advantages(p_corr, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)[:L]
+            advantages.append(adv)
+
+            # Count trainable tokens (matches the filtering logic in _compute_policy_loss, excluding new logprobs).
+            seq_len = len(ids)
+            for t in range(L):
+                a = float(adv[t])
+                if not math.isfinite(a):
+                    continue
+                o = float(old_lp[t])
+                if not math.isfinite(o):
+                    continue
+                p = int(pos[t])
+                if p <= 0 or p >= seq_len:
+                    continue
+                num_tokens += 1
 
         return {
             "input_ids": input_ids,
@@ -439,6 +455,7 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_cl
             "label_positions": label_positions,
             "ref_logprobs": ref_logprobs,
             "advantages": advantages,  # A_success only
+            "num_tokens": int(num_tokens),
         }
 
     return collate
@@ -519,12 +536,17 @@ def _compute_policy_loss(
 
     if not flat_b:
         zero = token_logprobs.sum() * 0.0
+        z = zero.detach()
         return zero, {
-            "policy_loss": float(0.0),
-            "kl_loss": float(0.0),
-            "approx_kl": float("nan"),
-            "clip_frac": float("nan"),
+            "policy_loss": z,
+            "kl_loss": z,
+            "approx_kl": z,
+            "clip_frac": z,
             "tokens": 0,
+            "adv_mean": z,
+            "adv_abs_mean": z,
+            "ratio_mean": z,
+            "ratio_used_mean": z,
         }
 
     b_idx = torch.tensor(flat_b, device=device, dtype=torch.long)
@@ -738,6 +760,15 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     global_step = 0  # optimizer steps
     accum = 0
     t0 = time.perf_counter()
+    step_tokens_local = 0
+    step_policy_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_kl_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_approx_kl_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_clip_frac_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_adv_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_adv_abs_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_ratio_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_ratio_used_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
 
     def save_checkpoint(step: int):
         if not master:
@@ -774,6 +805,9 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     if not has:
                         break
 
+                if not distributed and int(batch.get("num_tokens", 0)) == 0:
+                    continue
+
                 accum += 1
 
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
@@ -802,8 +836,38 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                 loss.backward()
 
+                tok = int(metrics["tokens"]) if isinstance(metrics["tokens"], int) else int(metrics["tokens"].item())
+                step_tokens_local += tok
+                tok_f = float(tok)
+                step_policy_loss_sum = step_policy_loss_sum + metrics["policy_loss"].to(torch.float32) * tok_f
+                step_kl_loss_sum = step_kl_loss_sum + metrics["kl_loss"].to(torch.float32) * tok_f
+                step_approx_kl_sum = step_approx_kl_sum + metrics["approx_kl"].to(torch.float32) * tok_f
+                step_clip_frac_sum = step_clip_frac_sum + metrics["clip_frac"].to(torch.float32) * tok_f
+                step_adv_mean_sum = step_adv_mean_sum + metrics["adv_mean"].to(torch.float32) * tok_f
+                step_adv_abs_mean_sum = step_adv_abs_mean_sum + metrics["adv_abs_mean"].to(torch.float32) * tok_f
+                step_ratio_mean_sum = step_ratio_mean_sum + metrics["ratio_mean"].to(torch.float32) * tok_f
+                step_ratio_used_mean_sum = step_ratio_used_mean_sum + metrics["ratio_used_mean"].to(torch.float32) * tok_f
+
                 update = (accum % cfg.grad_accum_steps) == 0
                 if update:
+                    step_tokens_t = torch.tensor(step_tokens_local, device=device, dtype=torch.long)
+                    if distributed:
+                        dist.all_reduce(step_tokens_t, op=dist.ReduceOp.SUM)
+                    step_tokens_global = int(step_tokens_t.item())
+
+                    if step_tokens_global == 0:
+                        optimizer.zero_grad(set_to_none=True)
+                        step_tokens_local = 0
+                        step_policy_loss_sum.zero_()
+                        step_kl_loss_sum.zero_()
+                        step_approx_kl_sum.zero_()
+                        step_clip_frac_sum.zero_()
+                        step_adv_mean_sum.zero_()
+                        step_adv_abs_mean_sum.zero_()
+                        step_ratio_mean_sum.zero_()
+                        step_ratio_used_mean_sum.zero_()
+                        continue
+
                     if cfg.grad_clip and cfg.grad_clip > 0:
                         clip_grad_norm_(params, cfg.grad_clip)
 
@@ -821,27 +885,53 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
-                    if master and (global_step % max(1, cfg.log_every) == 0):
+                    do_log = (global_step % max(1, cfg.log_every) == 0)
+                    if do_log:
+                        sums = torch.stack(
+                            [
+                                step_policy_loss_sum,
+                                step_kl_loss_sum,
+                                step_approx_kl_sum,
+                                step_clip_frac_sum,
+                                step_adv_mean_sum,
+                                step_adv_abs_mean_sum,
+                                step_ratio_mean_sum,
+                                step_ratio_used_mean_sum,
+                            ]
+                        )
+                        if distributed:
+                            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+
+                        denom = float(max(1, step_tokens_global))
+                        mean_policy_loss = sums[0] / denom
+                        mean_kl_loss = sums[1] / denom
+                        mean_approx_kl = sums[2] / denom
+                        mean_clip_frac = sums[3] / denom
+                        mean_adv = sums[4] / denom
+                        mean_adv_abs = sums[5] / denom
+                        mean_ratio = sums[6] / denom
+                        mean_ratio_used = sums[7] / denom
+
+                    if master and do_log:
                         elapsed = time.perf_counter() - t0
-                        tok = int(metrics["tokens"]) if isinstance(metrics["tokens"], int) else int(metrics["tokens"].item())
                         log_dict = {
                             "train/step": global_step,
                             "train/lr": lr,
-                            "train/tokens": tok,
-                            "train/policy_loss": float(metrics["policy_loss"].item()),
-                            "train/kl_loss": float(metrics["kl_loss"].item()),
-                            "train/approx_kl": float(metrics["approx_kl"].item()),
-                            "train/clip_frac": float(metrics["clip_frac"].item()),
-                            "train/adv_mean": float(metrics["adv_mean"].item()),
-                            "train/adv_abs_mean": float(metrics["adv_abs_mean"].item()),
-                            "train/ratio_mean": float(metrics["ratio_mean"].item()),
-                            "train/ratio_used_mean": float(metrics["ratio_used_mean"].item()),
+                            "train/tokens": int(step_tokens_global),
+                            "train/policy_loss": float(mean_policy_loss.item()),
+                            "train/kl_loss": float(mean_kl_loss.item()),
+                            "train/approx_kl": float(mean_approx_kl.item()),
+                            "train/clip_frac": float(mean_clip_frac.item()),
+                            "train/adv_mean": float(mean_adv.item()),
+                            "train/adv_abs_mean": float(mean_adv_abs.item()),
+                            "train/ratio_mean": float(mean_ratio.item()),
+                            "train/ratio_used_mean": float(mean_ratio_used.item()),
                             "train/elapsed_s": elapsed,
                         }
                         print(
                             f"[step {global_step}] loss={log_dict['train/policy_loss']:.6f} "
                             f"kl={log_dict['train/approx_kl']:.6f} clip={log_dict['train/clip_frac']:.3f} "
-                            f"tokens={tok} lr={lr:.3e}",
+                            f"tokens={int(step_tokens_global)} lr={lr:.3e}",
                             flush=True,
                         )
                         if wb is not None:
@@ -849,6 +939,16 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                     if master and cfg.save_every and cfg.save_every > 0 and (global_step % cfg.save_every == 0):
                         save_checkpoint(global_step)
+
+                    step_tokens_local = 0
+                    step_policy_loss_sum.zero_()
+                    step_kl_loss_sum.zero_()
+                    step_approx_kl_sum.zero_()
+                    step_clip_frac_sum.zero_()
+                    step_adv_mean_sum.zero_()
+                    step_adv_abs_mean_sum.zero_()
+                    step_ratio_mean_sum.zero_()
+                    step_ratio_used_mean_sum.zero_()
 
                     if cfg.max_steps and cfg.max_steps > 0 and global_step >= cfg.max_steps:
                         break

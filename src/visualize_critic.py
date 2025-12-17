@@ -538,6 +538,69 @@ def _reward_rgb(r: float) -> str:
     return f"rgb({rr},{gg},{bb})"
 
 
+_NAN_COLOR = "rgb(235,235,235)"
+
+
+def _is_finite(x: Any) -> bool:
+    try:
+        return x is not None and math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _p_correct_rgb(x: Any) -> str:
+    if not _is_finite(x):
+        return _NAN_COLOR
+    return _reward_rgb(float(x))
+
+
+def _len_rgb(norm: Any) -> str:
+    if not _is_finite(norm):
+        return _NAN_COLOR
+    x = float(norm)
+    x = 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+    # ColorBrewer-esque: light blue -> orange
+    lo = (198.0, 219.0, 239.0)
+    hi = (253.0, 174.0, 97.0)
+    rr = int(lo[0] + (hi[0] - lo[0]) * x)
+    gg = int(lo[1] + (hi[1] - lo[1]) * x)
+    bb = int(lo[2] + (hi[2] - lo[2]) * x)
+    return f"rgb({rr},{gg},{bb})"
+
+
+def _safe_float(x: Any) -> float:
+    if x is None:
+        return float("nan")
+    try:
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+def _to_int_list(x: Any) -> List[int]:
+    if x is None:
+        return []
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    return [int(t) for t in list(x)]
+
+
+def _to_float_list(x: Any) -> List[float]:
+    if x is None:
+        return []
+    if hasattr(x, "tolist"):
+        x = x.tolist()
+    return [_safe_float(v) for v in list(x)]
+
+
+def _pad_or_truncate(xs: List[float], n: int) -> List[float]:
+    if len(xs) < n:
+        return xs + [float("nan")] * (n - len(xs))
+    if len(xs) > n:
+        return xs[:n]
+    return xs
+
+
 def _decode_token(tokenizer: Any, tid: int, cache: Dict[int, str]) -> str:
     if tid in cache:
         return cache[tid]
@@ -611,17 +674,37 @@ pre {{ background: #f6f6f6; padding: 10px; border: 1px solid #ddd; overflow-x: a
 .toks {{ white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.4; }}
 .tok {{ padding: 0 1px; border-radius: 2px; }}
 .legend {{ display:flex; align-items:center; gap:10px; margin: 10px 0; }}
-.bar {{ width: 220px; height: 14px; border: 1px solid #bbb; background: linear-gradient(to right, rgb(255,0,0), rgb(0,255,0)); }}
+.mode {{ display:flex; gap:8px; margin: 10px 0; }}
+.mode button {{ border: 1px solid #bbb; background: #f6f6f6; padding: 6px 10px; cursor: pointer; border-radius: 4px; }}
+.mode button.active {{ background: #e9e9e9; }}
+.bar {{ width: 220px; height: 14px; border: 1px solid #bbb; }}
+.bar-correct {{ background: linear-gradient(to right, rgb(255,0,0), rgb(0,255,0)); }}
+.bar-length {{ background: linear-gradient(to right, rgb(198,219,239), rgb(253,174,97)); }}
 .small {{ font-size: 12px; color: #333; }}
 hr {{ border: 0; border-top: 1px solid #ddd; margin: 16px 0; }}
+body[data-mode="correct"] .tok {{ background-color: var(--pc, transparent); }}
+body[data-mode="length"] .tok {{ background-color: var(--len, transparent); }}
 </style>
 </head>
-<body>
+<body data-mode="correct">
 <h1>{t}</h1>
-<div class="legend">
-  <div class="bar"></div>
-  <div class="small">0 → 1</div>
+<div class="mode">
+  <button id="btn-correct" class="active" onclick="setMode('correct')">Correctness</button>
+  <button id="btn-length" onclick="setMode('length')">Length</button>
 </div>
+<div class="legend">
+  <div class="bar bar-correct"></div>
+  <div class="small">p_correct (0 → 1)</div>
+  <div class="bar bar-length"></div>
+  <div class="small">log1p(tokens_so_far + E[tokens_remaining])</div>
+</div>
+<script>
+function setMode(mode) {{
+  document.body.dataset.mode = mode;
+  document.getElementById('btn-correct').classList.toggle('active', mode === 'correct');
+  document.getElementById('btn-length').classList.toggle('active', mode === 'length');
+}}
+</script>
 """
 
 
@@ -630,46 +713,30 @@ def _html_footer() -> str:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--weights_path", required=True)
-    p.add_argument("--data_path", required=True)
-    p.add_argument("--out_html", required=True)
+    p = argparse.ArgumentParser(
+        description=(
+            "Visualize in-context critic predictions stored in a Parquet file produced by `src/label_in_context_critic.py`, "
+            "without running model inference again."
+        )
+    )
+    p.add_argument("--data_path", required=True, help="Input parquet containing `critic_p_correct` and `critic_expected_tokens_remaining`.")
+    p.add_argument("--out_html", required=True, help="Output HTML path.")
 
-    p.add_argument("--num_prompts", type=int, default=20)
-    p.add_argument("--tail_steps", type=int, default=50)
-    p.add_argument("--trace_path", type=str, default=None)
-
-    p.add_argument("--distribution_token_id", type=int, default=151669)
-    p.add_argument("--label_column", choices=["auto", "correct", "value"], default="correct")
-    p.add_argument("--ablation_type", choices=["full", "no_ans", "no_ans_no_rewards", "no_ans_first_reward_only"], default="no_ans")
-    p.add_argument("--examples_per_prompt", type=int, default=1)
-    p.add_argument("--supervise_from_trajectory", type=int, default=4)
-    p.add_argument("--correctness_only", action="store_true")
-    p.add_argument("--max_length", type=int, default=131072)
-
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--shuffle_seed", type=int, default=0)
-
-    p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    p.add_argument("--num_epochs", type=int, default=1)
-    p.add_argument("--max_steps", type=int, default=-1)
-
-    p.add_argument("--learning_rate", type=float, default=3e-5)
-    p.add_argument("--min_learning_rate", type=float, default=0.0)
-    p.add_argument("--warmup_ratio", type=float, default=0.05)
-
-    p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--dtype", type=str, choices=["float16", "bfloat16", "float32"], default="bfloat16")
-    p.add_argument("--attn_implementation", type=str, default="auto")
-    p.add_argument("--trust_remote_code", action="store_true")
-
-    p.add_argument("--max_trajectories", type=int, default=0)
-    p.add_argument("--max_tokens_per_traj", type=int, default=0)
+    p.add_argument("--num_prompts", type=int, default=20, help="Number of prompt_idx groups to display.")
+    p.add_argument("--max_rollouts_per_prompt", type=int, default=1, help="Max labeled rollouts to show per prompt_idx.")
+    p.add_argument("--max_tokens_per_traj", type=int, default=0, help="If >0, truncate displayed tokens per rollout.")
+    p.add_argument("--prompt_idx", type=int, nargs="*", default=None, help="Optional list of prompt_idx values to include.")
+    p.add_argument("--arrow_batch_size", type=int, default=1024, help="Parquet batch size for scanning rows.")
+    p.add_argument(
+        "--trust_remote_code",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Passed to `AutoTokenizer.from_pretrained` when loading the tokenizer from `critic_model_id`.",
+    )
     return p.parse_args()
 
 
-def main() -> None:
+def _main_infer() -> None:
     args = parse_args()
 
     torch.manual_seed(int(args.seed))
@@ -887,6 +954,257 @@ def main() -> None:
                 f"tok {len(tm.token_ids)}",
                 f"trunc {1 if tm.truncated else 0}",
             ]
+            out_parts.append('<div class="card">')
+            out_parts.append(f'<div class="hdr">{html_lib.escape(" | ".join(hdr))}</div>')
+            out_parts.append(f'<div class="toks">{"".join(spans)}</div>')
+            out_parts.append("</div>")
+
+        out_parts.append("</div>")
+
+    out_parts.append(_html_footer())
+
+    out_dir = os.path.dirname(os.path.abspath(args.out_html))
+    if out_dir and not os.path.isdir(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(args.out_html, "w", encoding="utf-8") as f:
+        f.write("".join(out_parts))
+
+    print(args.out_html)
+
+
+def main() -> None:
+    args = parse_args()
+
+    pf = pq.ParquetFile(args.data_path)
+    schema_names = set(pf.schema_arrow.names)
+    required = {
+        "prompt_idx",
+        "prompt",
+        "output_token_ids",
+        "critic_model_id",
+        "critic_p_correct",
+        "critic_expected_tokens_remaining",
+    }
+    missing = sorted([c for c in required if c not in schema_names])
+    if missing:
+        raise ValueError(f"Input parquet missing required columns: {missing}")
+
+    arrow_batch_size = max(1, int(args.arrow_batch_size))
+    num_prompts = int(args.num_prompts)
+    if num_prompts <= 0:
+        raise ValueError("--num_prompts must be > 0")
+    max_rollouts_per_prompt = int(args.max_rollouts_per_prompt)
+    if max_rollouts_per_prompt <= 0:
+        raise ValueError("--max_rollouts_per_prompt must be > 0")
+
+    # Infer tokenizer from the first non-null critic_model_id.
+    critic_model_id = None
+    for rb in pf.iter_batches(columns=["critic_model_id"], batch_size=arrow_batch_size):
+        vals = rb.column(rb.schema.get_field_index("critic_model_id")).to_pylist()
+        for v in vals:
+            if v is not None:
+                critic_model_id = str(v)
+                break
+        if critic_model_id is not None:
+            break
+    if critic_model_id is None:
+        raise RuntimeError("No non-null `critic_model_id` found; cannot infer tokenizer.")
+
+    tok = None
+    tok_err: Optional[str] = None
+    try:
+        tok = AutoTokenizer.from_pretrained(critic_model_id, trust_remote_code=bool(args.trust_remote_code))
+        if tok.pad_token_id is None:
+            tok.pad_token_id = tok.eos_token_id
+    except Exception as e:
+        tok_err = repr(e)
+        tok = None
+
+    prompt_filter = None
+    prompt_order = None
+    if args.prompt_idx:
+        prompt_order = {int(pid): i for i, pid in enumerate(args.prompt_idx)}
+        prompt_filter = set(prompt_order.keys())
+
+    cols = ["prompt_idx", "prompt", "output_token_ids", "correct", "critic_p_correct", "critic_expected_tokens_remaining"]
+    cols = [c for c in cols if c in schema_names]
+
+    from collections import OrderedDict
+
+    selected: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+
+    def _done() -> bool:
+        if len(selected) < num_prompts:
+            return False
+        return all(len(v["rows"]) >= max_rollouts_per_prompt for v in selected.values())
+
+    for rb in pf.iter_batches(columns=cols, batch_size=arrow_batch_size):
+        col = {name: rb.column(rb.schema.get_field_index(name)).to_pylist() for name in rb.schema.names}
+        if not col:
+            continue
+        n = len(next(iter(col.values())))
+        for i in range(n):
+            p_list = col["critic_p_correct"][i]
+            e_list = col["critic_expected_tokens_remaining"][i]
+            if p_list is None or e_list is None:
+                continue
+
+            pid = int(col["prompt_idx"][i])
+            if prompt_filter is not None and pid not in prompt_filter:
+                continue
+
+            if pid not in selected:
+                if len(selected) >= num_prompts:
+                    continue
+                prompt_text = col["prompt"][i]
+                selected[pid] = {"prompt": "" if prompt_text is None else str(prompt_text), "rows": []}
+
+            entry = selected[pid]
+            if len(entry["rows"]) >= max_rollouts_per_prompt:
+                continue
+
+            toks = _to_int_list(col["output_token_ids"][i])
+            p = _pad_or_truncate(_to_float_list(p_list), len(toks))
+            e = _pad_or_truncate(_to_float_list(e_list), len(toks))
+            gt_correct = _safe_float(col.get("correct", [float("nan")] * n)[i]) if "correct" in col else float("nan")
+
+            entry["rows"].append(
+                {
+                    "output_token_ids": toks,
+                    "critic_p_correct": p,
+                    "critic_expected_tokens_remaining": e,
+                    "correct": gt_correct,
+                }
+            )
+
+            if _done():
+                break
+        if _done():
+            break
+
+    if prompt_order is not None:
+        selected = OrderedDict(sorted(selected.items(), key=lambda kv: prompt_order.get(int(kv[0]), 10**18)))
+
+    # Compute global min/max for log-length coloring across selected tokens.
+    log_lengths: List[float] = []
+    total_lengths: List[float] = []
+    for entry in selected.values():
+        for row in entry["rows"]:
+            toks = row["output_token_ids"]
+            exp_rem = row["critic_expected_tokens_remaining"]
+            for t_i in range(min(len(toks), len(exp_rem))):
+                rem = _safe_float(exp_rem[t_i])
+                if not math.isfinite(rem):
+                    continue
+                total = float(t_i + 1) + float(rem)
+                if not math.isfinite(total) or total < 0.0:
+                    continue
+                total_lengths.append(total)
+                log_lengths.append(math.log1p(total))
+
+    log_min = float(min(log_lengths)) if log_lengths else 0.0
+    log_max = float(max(log_lengths)) if log_lengths else 1.0
+    denom = (log_max - log_min) if (log_max > log_min) else 0.0
+
+    title = f"critic labeled report: {os.path.basename(args.data_path)}"
+    out_parts: List[str] = [_html_header(title)]
+
+    out_parts.append('<div class="meta">')
+    out_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
+    out_parts.append(f"critic_model_id: {html_lib.escape(critic_model_id)}<br>")
+    out_parts.append(f"num_prompts: {int(num_prompts)}<br>")
+    out_parts.append(f"max_rollouts_per_prompt: {int(max_rollouts_per_prompt)}<br>")
+    out_parts.append(f"max_tokens_per_traj: {int(args.max_tokens_per_traj)}<br>")
+    if total_lengths:
+        out_parts.append(f"len_total_min: {float(min(total_lengths)):.2f}<br>")
+        out_parts.append(f"len_total_max: {float(max(total_lengths)):.2f}<br>")
+    out_parts.append(f"log_len_min: {log_min:.6f}<br>")
+    out_parts.append(f"log_len_max: {log_max:.6f}<br>")
+    if tok_err is not None:
+        out_parts.append(f"tokenizer_load_error: {html_lib.escape(tok_err)}<br>")
+        out_parts.append("decoding: token ids only<br>")
+    out_parts.append("</div>")
+
+    decode_cache: Dict[int, str] = {}
+
+    for item_i, (pid, entry) in enumerate(selected.items(), start=1):
+        out_parts.append("<hr>")
+        out_parts.append(f"<h2>item {item_i}</h2>")
+        out_parts.append('<div class="meta">')
+        out_parts.append(f"prompt_idx: {int(pid)}<br>")
+        out_parts.append(f"labeled_rollouts: {len(entry['rows'])}<br>")
+        out_parts.append("</div>")
+
+        out_parts.append("<h3>prompt</h3>")
+        out_parts.append(f'<pre class="prompt">{html_lib.escape(str(entry.get("prompt") or ""))}</pre>')
+
+        out_parts.append("<h3>rollouts</h3>")
+        out_parts.append('<div class="grid">')
+
+        for r_i, row in enumerate(entry["rows"], start=1):
+            toks: List[int] = list(row["output_token_ids"])
+            p_list: List[float] = list(row["critic_p_correct"])
+            e_list: List[float] = list(row["critic_expected_tokens_remaining"])
+            gt_correct = _safe_float(row.get("correct"))
+
+            max_tok = int(args.max_tokens_per_traj)
+            if max_tok > 0:
+                toks = toks[:max_tok]
+                p_list = p_list[:max_tok]
+                e_list = e_list[:max_tok]
+
+            p_arr = np.array([_safe_float(x) for x in p_list], dtype=np.float64)
+            p_mean = float(np.nanmean(p_arr)) if np.any(np.isfinite(p_arr)) else float("nan")
+
+            tot_arr: List[float] = []
+            for t_i, rem in enumerate(e_list):
+                rem_f = _safe_float(rem)
+                if not math.isfinite(rem_f):
+                    tot_arr.append(float("nan"))
+                    continue
+                tot_arr.append(float(t_i + 1) + float(rem_f))
+            tot_np = np.array(tot_arr, dtype=np.float64)
+            tot_mean = float(np.nanmean(tot_np)) if np.any(np.isfinite(tot_np)) else float("nan")
+
+            hdr = [
+                f"rollout {r_i}",
+                ("gt nan" if not math.isfinite(gt_correct) else f"gt {gt_correct:.0f}"),
+                ("p̄ nan" if not math.isfinite(p_mean) else f"p̄ {p_mean:.4f}"),
+                ("L̄ nan" if not math.isfinite(tot_mean) else f"L̄ {tot_mean:.1f}"),
+                f"tok {len(toks)}",
+            ]
+
+            spans: List[str] = []
+            for t_i, tid in enumerate(toks):
+                pc = _safe_float(p_list[t_i]) if t_i < len(p_list) else float("nan")
+                rem = _safe_float(e_list[t_i]) if t_i < len(e_list) else float("nan")
+
+                if math.isfinite(rem):
+                    total = float(t_i + 1) + float(rem)
+                else:
+                    total = float("nan")
+
+                if math.isfinite(total) and total >= 0.0:
+                    logv = math.log1p(total)
+                    norm = (logv - log_min) / denom if denom > 0 else 0.5
+                else:
+                    logv = float("nan")
+                    norm = float("nan")
+
+                pc_col = _p_correct_rgb(pc)
+                len_col = _len_rgb(norm)
+
+                if tok is None:
+                    s = f"<{int(tid)}>"
+                else:
+                    s = _decode_token(tok, int(tid), decode_cache)
+
+                title = f"t {t_i} | p {pc:.4f} | rem {rem:.2f} | total {total:.2f} | log {logv:.4f}"
+                spans.append(
+                    f'<span class="tok" style="--pc:{pc_col}; --len:{len_col};" title="{html_lib.escape(title)}">{html_lib.escape(s)}</span>'
+                )
+
             out_parts.append('<div class="card">')
             out_parts.append(f'<div class="hdr">{html_lib.escape(" | ".join(hdr))}</div>')
             out_parts.append(f'<div class="toks">{"".join(spans)}</div>')
