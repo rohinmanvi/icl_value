@@ -1,2 +1,5 @@
 data/
 models/
+logs/
+wandb/
+__pycache__/

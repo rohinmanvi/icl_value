@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=defq
-#SBATCH --job-name=icl_critic_label
+#SBATCH --job-name=data_icl_critic_label
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
@@ -40,7 +40,7 @@ dp_size=8
 arrow_batch_size=1024
 max_length=131072
 shuffle_seed=0
-label_rollouts_per_prompt=-1  # -1=all, 0=none, K>0=subsample K per prompt
+label_rollouts_per_prompt=1  # -1=all, 0=none, K>0=subsample K per prompt
 label_seed=0
 
 echo "Starting in-context critic labeling:"
