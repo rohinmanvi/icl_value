@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# Qwen role/control token ids (set for Qwen3-style chat)
+# Qwen chat token ids
 IM_START_TOKEN_ID = 151644
 IM_END_TOKEN_ID = 151645
 USER_TOKEN_ID = 872
@@ -62,12 +62,24 @@ def _last_hidden_state(model: Any, input_ids: torch.Tensor, attention_mask: Opti
     m = _unwrap_model(model)
     base = _get_base_model(m)
     if base is None:
-        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, output_hidden_states=True, return_dict=True)
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
         hs = out.hidden_states
         if hs is None:
             raise RuntimeError("no hidden_states")
         return hs[-1]
-    out = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, output_hidden_states=False, return_dict=True)
+    out = base(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
     if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
         return out.last_hidden_state
     if hasattr(out, "hidden_states") and out.hidden_states is not None:
@@ -75,356 +87,50 @@ def _last_hidden_state(model: Any, input_ids: torch.Tensor, attention_mask: Opti
     raise RuntimeError("no last hidden state")
 
 
-@dataclass
-class TrajectoryMeta:
-    local_idx: int
-    reward_gt: float
-    supervised: bool
-    token_ids: List[int]          # content + footer (no header)
-    abs_positions: List[int]      # positions for token_ids in packed input_ids
-    truncated: bool
+def create_tokenized_message(role: str, tokenized_content: List[int]) -> List[int]:
+    role_token_id = {
+        "system": SYSTEM_TOKEN_ID,
+        "user": USER_TOKEN_ID,
+        "assistant": ASSISTANT_TOKEN_ID,
+    }[role]
+    content = list(tokenized_content)
+    if content and content[-1] == IM_END_TOKEN_ID:
+        content = content[:-1]
+    return [IM_START_TOKEN_ID, role_token_id, NEWLINE_TOKEN_ID] + content + [IM_END_TOKEN_ID, NEWLINE_TOKEN_ID]
 
 
-class JointDistributionPackedDataset(torch.utils.data.Dataset):
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer: Any,
-        max_length: int,
-        label_column: str,
-        ablation_type: str,
-        examples_per_prompt: int,
-        supervise_from_trajectory: int,
-        correctness_only: bool,
-        shuffle_seed: Optional[int],
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = int(max_length)
-        self.ablation_type = ablation_type
-        self.supervise_from_trajectory = int(supervise_from_trajectory)
-        self.correctness_only = bool(correctness_only)
+def _value_edges(reward_values: List[float]) -> List[float]:
+    n = len(reward_values)
+    if n >= 2:
+        edges = [0.0] * (n + 1)
+        for i in range(1, n):
+            edges[i] = 0.5 * (reward_values[i - 1] + reward_values[i])
+        first_step = reward_values[1] - reward_values[0]
+        last_step = reward_values[-1] - reward_values[-2]
+        edges[0] = reward_values[0] - 0.5 * first_step
+        edges[-1] = reward_values[-1] + 0.5 * last_step
+    else:
+        edges = [reward_values[0] - 0.5, reward_values[0] + 0.5]
+    edges[0] = max(0.0, edges[0])
+    edges[-1] = min(1.0, edges[-1])
+    return edges
 
-        if shuffle_seed is not None:
-            random.seed(int(shuffle_seed))
 
-        label_choice = (label_column or "correct").lower()
-        cols = ["prompt_idx", "prompt", "output_token_ids"]
-        if label_choice == "auto":
-            cols += ["correct", "value"]
-        elif label_choice == "correct":
-            cols += ["correct"]
-        elif label_choice == "value":
-            cols += ["value"]
-        else:
-            raise ValueError(f"bad label_column: {label_column}")
-
-        table = pq.read_table(data_path, columns=list(dict.fromkeys(cols)))
-        df = table.to_pandas()
-
-        need = ["prompt_idx", "prompt", "output_token_ids"]
-        for c in need:
-            if c not in df.columns:
-                raise ValueError(f"missing col: {c}")
-
-        if label_choice == "auto":
-            if "correct" in df.columns:
-                self.reward_column = "correct"
-            elif "value" in df.columns:
-                self.reward_column = "value"
-            else:
-                raise ValueError("need correct or value")
-        elif label_choice == "correct":
-            if "correct" not in df.columns:
-                raise ValueError("need correct")
-            self.reward_column = "correct"
-        else:
-            if "value" not in df.columns:
-                raise ValueError("need value")
-            self.reward_column = "value"
-
-        if self.reward_column == "correct":
-            df["correct"] = df["correct"].astype(float)
-
-        self.samples: List[Dict[str, Any]] = []
-        grouped = df.groupby("prompt_idx", sort=True)
-        for prompt_idx, group in grouped:
-            rows = group.to_dict("records")
-            if not rows:
-                continue
-            prompt_text = rows[0]["prompt"]
-            trajectories = []
-            for r in rows:
-                toks = r["output_token_ids"]
-                if hasattr(toks, "tolist"):
-                    toks = toks.tolist()
-                trajectories.append(
-                    {
-                        "response_ids": list(toks),
-                        "reward": float(r[self.reward_column]),
-                    }
-                )
-            for _ in range(int(examples_per_prompt)):
-                trajs = list(trajectories)
-                random.shuffle(trajs)
-                self.samples.append(
-                    {
-                        "prompt_idx": int(prompt_idx),
-                        "prompt": prompt_text,
-                        "trajectories": trajs,
-                    }
-                )
-
-        if self.correctness_only:
-            self.length_bins = [0, self.max_length + 1]
-        else:
-            self.length_bins = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-        self.num_length_bins = len(self.length_bins) - 1
-
-        if self.reward_column == "correct":
-            self.reward_values = [0.0, 1.0]
-        else:
-            self.reward_values = [0.0, 0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333, 1.0]
-
-        self.num_reward_states = len(self.reward_values)
-        self.num_bins = self.num_length_bins * self.num_reward_states
-
-        self.value_bin_edges = self._value_edges()
-
-    def _value_edges(self) -> List[float]:
-        if self.num_reward_states >= 2:
-            edges = [0.0] * (self.num_reward_states + 1)
-            for i in range(1, self.num_reward_states):
-                edges[i] = 0.5 * (self.reward_values[i - 1] + self.reward_values[i])
-            first_step = self.reward_values[1] - self.reward_values[0]
-            last_step = self.reward_values[-1] - self.reward_values[-2]
-            edges[0] = self.reward_values[0] - 0.5 * first_step
-            edges[-1] = self.reward_values[-1] + 0.5 * last_step
-        else:
-            edges = [self.reward_values[0] - 0.5, self.reward_values[0] + 0.5]
-        edges[0] = max(0.0, edges[0])
-        edges[-1] = min(1.0, edges[-1])
-        return edges
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def _get_bin_idx(self, tokens_to_completion: int, reward: float) -> int:
-        length_bin = 0
-        for i in range(len(self.length_bins) - 1):
-            if tokens_to_completion >= self.length_bins[i] and tokens_to_completion < self.length_bins[i + 1]:
-                length_bin = i
-                break
-        if tokens_to_completion >= self.length_bins[-1]:
-            length_bin = self.num_length_bins - 1
-
-        reward_state = 0
-        for i in range(len(self.value_bin_edges) - 1):
-            if reward >= self.value_bin_edges[i] and reward < self.value_bin_edges[i + 1]:
-                reward_state = i
-                break
-        if reward >= self.value_bin_edges[-1]:
-            reward_state = self.num_reward_states - 1
-
-        return length_bin + reward_state * self.num_length_bins
-
-    @staticmethod
-    def create_tokenized_message(role: str, tokenized_content: List[int]) -> List[int]:
-        role_token_id = {
-            "system": SYSTEM_TOKEN_ID,
-            "user": USER_TOKEN_ID,
-            "assistant": ASSISTANT_TOKEN_ID,
-        }[role]
-        content = list(tokenized_content)
-        if content and content[-1] == IM_END_TOKEN_ID:
-            content = content[:-1]
-        return [IM_START_TOKEN_ID, role_token_id, NEWLINE_TOKEN_ID] + content + [IM_END_TOKEN_ID, NEWLINE_TOKEN_ID]
-
-    def get_packed(self, idx: int) -> Dict[str, Any]:
-        sample = self.samples[idx]
-
-        full_input_ids: List[int] = []
-        full_label_positions: List[int] = []
-        full_bin_labels: List[int] = []
-        traj_meta: List[TrajectoryMeta] = []
-
-        prompt_tokens = self.tokenizer.encode(sample["prompt"], add_special_tokens=False)
-        full_input_ids.extend(self.create_tokenized_message("user", prompt_tokens))
-        prefix_len = len(full_input_ids)
-
-        trajectories = sample["trajectories"]
-        if not trajectories:
-            input_tensor = torch.tensor(full_input_ids, dtype=torch.long)
-            return {
-                "prompt_idx": sample["prompt_idx"],
-                "prompt": sample["prompt"],
-                "input_ids": input_tensor,
-                "label_positions": full_label_positions,
-                "bin_labels": full_bin_labels,
-                "num_bins": self.num_bins,
-                "traj_meta": traj_meta,
-            }
-
-        infos: List[Dict[str, Any]] = []
-        for traj in trajectories:
-            traj_content = list(traj["response_ids"])
-            header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
-            has_eos = bool(traj_content) and (traj_content[-1] == IM_END_TOKEN_ID)
-            footer = [] if has_eos else [IM_END_TOKEN_ID]
-            traj_block = header + traj_content + footer
-
-            content_plus_footer_len = len(traj_content) + len(footer)
-            full_feedback_str = f"Reward: {float(traj['reward'])}\nLength: {content_plus_footer_len} tokens"
-            length_only_str = f"Length: {content_plus_footer_len} tokens"
-
-            reward_tokens_full = self.tokenizer.encode(full_feedback_str, add_special_tokens=False)
-            reward_tokens_len = self.tokenizer.encode(length_only_str, add_special_tokens=False)
-
-            reward_block_len_full = len(reward_tokens_full) + 5
-            reward_block_len_len = len(reward_tokens_len) + 5
-
-            infos.append(
-                {
-                    "traj": traj,
-                    "traj_content": traj_content,
-                    "header": header,
-                    "footer": footer,
-                    "traj_block": traj_block,
-                    "traj_block_len": len(traj_block),
-                    "content_plus_footer_len": content_plus_footer_len,
-                    "reward_tokens_full": reward_tokens_full,
-                    "reward_tokens_len": reward_tokens_len,
-                    "reward_block_len_full": reward_block_len_full,
-                    "reward_block_len_len": reward_block_len_len,
-                }
-            )
-
-        n = len(infos)
-        assistant_suffix = [0] * (n + 1)
-        full_fb_suffix = [0] * (n + 1)
-        len_fb_suffix = [0] * (n + 1)
-        for i in range(n - 1, -1, -1):
-            assistant_suffix[i] = assistant_suffix[i + 1] + infos[i]["traj_block_len"]
-            full_fb_suffix[i] = full_fb_suffix[i + 1]
-            len_fb_suffix[i] = len_fb_suffix[i + 1]
-            if i != n - 1:
-                full_fb_suffix[i] += infos[i]["reward_block_len_full"]
-                len_fb_suffix[i] += infos[i]["reward_block_len_len"]
-
-        start_idx = n - 1
-        for s in range(n):
-            base = prefix_len + assistant_suffix[s]
-            if self.ablation_type in ("full", "no_ans"):
-                total = base + full_fb_suffix[s]
-            elif self.ablation_type == "no_ans_no_rewards":
-                total = base + len_fb_suffix[s]
-            elif self.ablation_type == "no_ans_first_reward_only":
-                if s == n - 1:
-                    total = base
-                else:
-                    total = base + infos[s]["reward_block_len_full"] + len_fb_suffix[s + 1]
-            else:
-                total = base + full_fb_suffix[s]
-            if total <= self.max_length:
-                start_idx = s
-                break
-
-        included = infos[start_idx:]
-
-        if start_idx == n - 1:
-            last = included[0]
-            budget = self.max_length - prefix_len
-            min_block = len(last["header"]) + len(last["footer"])
-            if budget < min_block:
-                input_tensor = torch.tensor(full_input_ids[: self.max_length], dtype=torch.long)
-                return {
-                    "prompt_idx": sample["prompt_idx"],
-                    "prompt": sample["prompt"],
-                    "input_ids": input_tensor,
-                    "label_positions": [],
-                    "bin_labels": [],
-                    "num_bins": self.num_bins,
-                    "traj_meta": [],
-                }
-
-            max_content_len = budget - min_block
-            if max_content_len < 0:
-                max_content_len = 0
-
-            trunc_content = list(last["traj_content"][:max_content_len])
-            has_eos = bool(trunc_content) and trunc_content[-1] == IM_END_TOKEN_ID
-            footer = [] if has_eos else [IM_END_TOKEN_ID]
-            traj_block = last["header"] + trunc_content + footer
-
-            included = [
-                {
-                    **last,
-                    "traj_content": trunc_content,
-                    "footer": footer,
-                    "traj_block": traj_block,
-                    "traj_block_len": len(traj_block),
-                    "content_plus_footer_len": len(trunc_content) + len(footer),
-                }
-            ]
-
-        supervise_start_idx = max(0, self.supervise_from_trajectory - 1)
-        if len(included) <= supervise_start_idx:
-            supervise_start_idx = max(0, len(included) - 1)
-
-        for local_idx, info in enumerate(included):
-            is_supervised = local_idx >= supervise_start_idx
-
-            current_start_idx = len(full_input_ids)
-            traj_block = info["traj_block"]
-            header_len = len(info["header"])
-            token_ids = list(info["traj_content"]) + list(info["footer"])
-            abs_positions = [current_start_idx + header_len + i for i in range(len(token_ids))]
-
-            reward_val = float(info["traj"]["reward"])
-            reward_val = 0.0 if reward_val < 0.0 else 1.0 if reward_val > 1.0 else reward_val
-
-            if is_supervised:
-                block_len = info["traj_block_len"]
-                for i in range(info["content_plus_footer_len"]):
-                    abs_pos = current_start_idx + header_len + i
-                    tokens_to_completion = (current_start_idx + block_len) - abs_pos - 1
-                    bin_idx = self._get_bin_idx(tokens_to_completion, reward_val)
-                    full_label_positions.append(abs_pos)
-                    full_bin_labels.append(bin_idx)
-
-            full_input_ids.extend(traj_block)
-
-            if local_idx != (len(included) - 1):
-                if self.ablation_type in ("full", "no_ans"):
-                    reward_tokens = info["reward_tokens_full"]
-                elif self.ablation_type == "no_ans_no_rewards":
-                    reward_tokens = info["reward_tokens_len"]
-                elif self.ablation_type == "no_ans_first_reward_only":
-                    reward_tokens = info["reward_tokens_full"] if local_idx == 0 else info["reward_tokens_len"]
-                else:
-                    reward_tokens = info["reward_tokens_full"]
-                full_input_ids.extend(self.create_tokenized_message("user", reward_tokens))
-
-            traj_meta.append(
-                TrajectoryMeta(
-                    local_idx=local_idx,
-                    reward_gt=reward_val,
-                    supervised=is_supervised,
-                    token_ids=token_ids,
-                    abs_positions=abs_positions,
-                    truncated=(start_idx == n - 1 and local_idx == 0 and len(info["traj_content"]) < len(info["traj"]["response_ids"])),
-                )
-            )
-
-        input_tensor = torch.tensor(full_input_ids, dtype=torch.long)
-        return {
-            "prompt_idx": sample["prompt_idx"],
-            "prompt": sample["prompt"],
-            "input_ids": input_tensor,
-            "label_positions": full_label_positions,
-            "bin_labels": full_bin_labels,
-            "num_bins": self.num_bins,
-            "traj_meta": traj_meta,
-        }
+def _lr_schedule(step: int, total_steps: int, lr: float, min_lr: float, warmup_ratio: float) -> float:
+    if total_steps <= 0:
+        return lr
+    warmup_steps = int(float(warmup_ratio) * float(total_steps))
+    if warmup_steps < 1:
+        warmup_steps = 0
+    if warmup_steps > 0 and step <= warmup_steps:
+        return lr * float(step) / float(warmup_steps)
+    if step <= warmup_steps:
+        return lr
+    if step >= total_steps:
+        return min_lr
+    denom = max(1, total_steps - warmup_steps)
+    progress = float(step - warmup_steps) / float(denom)
+    return float(min_lr) + 0.5 * (1.0 + math.cos(math.pi * progress)) * (float(lr) - float(min_lr))
 
 
 def _simulate_optimizer_steps(
@@ -460,23 +166,6 @@ def _simulate_optimizer_steps(
             if max_steps > 0 and len(steps) >= int(max_steps):
                 break
     return steps
-
-
-def _lr_schedule(step: int, total_steps: int, lr: float, min_lr: float, warmup_ratio: float) -> float:
-    if total_steps <= 0:
-        return lr
-    warmup_steps = int(float(warmup_ratio) * float(total_steps))
-    if warmup_steps < 1:
-        warmup_steps = 0
-    if warmup_steps > 0 and step <= warmup_steps:
-        return lr * float(step) / float(warmup_steps)
-    if step <= warmup_steps:
-        return lr
-    if step >= total_steps:
-        return min_lr
-    denom = max(1, total_steps - warmup_steps)
-    progress = float(step - warmup_steps) / float(denom)
-    return float(min_lr) + 0.5 * (1.0 + math.cos(math.pi * progress)) * (float(lr) - float(min_lr))
 
 
 def _read_trace(trace_path: str) -> List[Dict[str, Any]]:
@@ -538,69 +227,6 @@ def _reward_rgb(r: float) -> str:
     return f"rgb({rr},{gg},{bb})"
 
 
-_NAN_COLOR = "rgb(235,235,235)"
-
-
-def _is_finite(x: Any) -> bool:
-    try:
-        return x is not None and math.isfinite(float(x))
-    except Exception:
-        return False
-
-
-def _p_correct_rgb(x: Any) -> str:
-    if not _is_finite(x):
-        return _NAN_COLOR
-    return _reward_rgb(float(x))
-
-
-def _len_rgb(norm: Any) -> str:
-    if not _is_finite(norm):
-        return _NAN_COLOR
-    x = float(norm)
-    x = 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
-    # ColorBrewer-esque: light blue -> orange
-    lo = (198.0, 219.0, 239.0)
-    hi = (253.0, 174.0, 97.0)
-    rr = int(lo[0] + (hi[0] - lo[0]) * x)
-    gg = int(lo[1] + (hi[1] - lo[1]) * x)
-    bb = int(lo[2] + (hi[2] - lo[2]) * x)
-    return f"rgb({rr},{gg},{bb})"
-
-
-def _safe_float(x: Any) -> float:
-    if x is None:
-        return float("nan")
-    try:
-        return float(x)
-    except Exception:
-        return float("nan")
-
-
-def _to_int_list(x: Any) -> List[int]:
-    if x is None:
-        return []
-    if hasattr(x, "tolist"):
-        x = x.tolist()
-    return [int(t) for t in list(x)]
-
-
-def _to_float_list(x: Any) -> List[float]:
-    if x is None:
-        return []
-    if hasattr(x, "tolist"):
-        x = x.tolist()
-    return [_safe_float(v) for v in list(x)]
-
-
-def _pad_or_truncate(xs: List[float], n: int) -> List[float]:
-    if len(xs) < n:
-        return xs + [float("nan")] * (n - len(xs))
-    if len(xs) > n:
-        return xs[:n]
-    return xs
-
-
 def _decode_token(tokenizer: Any, tid: int, cache: Dict[int, str]) -> str:
     if tid in cache:
         return cache[tid]
@@ -629,7 +255,11 @@ def _expected_reward_per_pos(
     input_ids = input_ids_1d.unsqueeze(0).to(device)
     pos = torch.tensor(positions, device=device, dtype=torch.long)
 
-    with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype, enabled=(device.type == "cuda")):
+    with torch.autocast(
+        device_type="cuda" if device.type == "cuda" else "cpu",
+        dtype=amp_dtype,
+        enabled=(device.type == "cuda" and amp_dtype != torch.float32),
+    ):
         h = _last_hidden_state(model, input_ids=input_ids)  # [1, S, E]
         h_sel = h[0, pos]  # [N, E]
 
@@ -650,8 +280,7 @@ def _expected_reward_per_pos(
         exp_r = (p_reward * rv).sum(dim=1)  # [N]
 
     exp_r_cpu = exp_r.detach().cpu().tolist()
-    out = {int(p): float(v) for p, v in zip(positions, exp_r_cpu)}
-    return out
+    return {int(p): float(v) for p, v in zip(positions, exp_r_cpu)}
 
 
 def _html_header(title: str) -> str:
@@ -667,44 +296,23 @@ body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, 
 h1,h2,h3 {{ margin: 12px 0 8px; }}
 pre {{ background: #f6f6f6; padding: 10px; border: 1px solid #ddd; overflow-x: auto; white-space: pre-wrap; }}
 .meta {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; background: #fbfbfb; border: 1px solid #ddd; padding: 10px; }}
-.prompt {{ margin-top: 8px; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 12px; align-items: start; }}
 .card {{ border: 1px solid #ddd; padding: 10px; }}
 .card .hdr {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; margin-bottom: 6px; }}
 .toks {{ white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; line-height: 1.4; }}
 .tok {{ padding: 0 1px; border-radius: 2px; }}
 .legend {{ display:flex; align-items:center; gap:10px; margin: 10px 0; }}
-.mode {{ display:flex; gap:8px; margin: 10px 0; }}
-.mode button {{ border: 1px solid #bbb; background: #f6f6f6; padding: 6px 10px; cursor: pointer; border-radius: 4px; }}
-.mode button.active {{ background: #e9e9e9; }}
-.bar {{ width: 220px; height: 14px; border: 1px solid #bbb; }}
-.bar-correct {{ background: linear-gradient(to right, rgb(255,0,0), rgb(0,255,0)); }}
-.bar-length {{ background: linear-gradient(to right, rgb(198,219,239), rgb(253,174,97)); }}
+.bar {{ width: 220px; height: 14px; border: 1px solid #bbb; background: linear-gradient(to right, rgb(255,0,0), rgb(0,255,0)); }}
 .small {{ font-size: 12px; color: #333; }}
 hr {{ border: 0; border-top: 1px solid #ddd; margin: 16px 0; }}
-body[data-mode="correct"] .tok {{ background-color: var(--pc, transparent); }}
-body[data-mode="length"] .tok {{ background-color: var(--len, transparent); }}
 </style>
 </head>
-<body data-mode="correct">
+<body>
 <h1>{t}</h1>
-<div class="mode">
-  <button id="btn-correct" class="active" onclick="setMode('correct')">Correctness</button>
-  <button id="btn-length" onclick="setMode('length')">Length</button>
-</div>
 <div class="legend">
-  <div class="bar bar-correct"></div>
-  <div class="small">p_correct (0 → 1)</div>
-  <div class="bar bar-length"></div>
-  <div class="small">log1p(tokens_so_far + E[tokens_remaining])</div>
+  <div class="bar"></div>
+  <div class="small">0 → 1</div>
 </div>
-<script>
-function setMode(mode) {{
-  document.body.dataset.mode = mode;
-  document.getElementById('btn-correct').classList.toggle('active', mode === 'correct');
-  document.getElementById('btn-length').classList.toggle('active', mode === 'length');
-}}
-</script>
 """
 
 
@@ -712,41 +320,191 @@ def _html_footer() -> str:
     return "</body>\n</html>\n"
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=(
-            "Visualize in-context critic predictions stored in a Parquet file produced by `src/label_in_context_critic.py`, "
-            "without running model inference again."
-        )
-    )
-    p.add_argument("--data_path", required=True, help="Input parquet containing `critic_p_correct` and `critic_expected_tokens_remaining`.")
-    p.add_argument("--out_html", required=True, help="Output HTML path.")
+@dataclass
+class Rollout:
+    response_ids: List[int]
+    reward: float
 
-    p.add_argument("--num_prompts", type=int, default=20, help="Number of prompt_idx groups to display.")
-    p.add_argument("--max_rollouts_per_prompt", type=int, default=1, help="Max labeled rollouts to show per prompt_idx.")
-    p.add_argument("--max_tokens_per_traj", type=int, default=0, help="If >0, truncate displayed tokens per rollout.")
-    p.add_argument("--prompt_idx", type=int, nargs="*", default=None, help="Optional list of prompt_idx values to include.")
-    p.add_argument("--arrow_batch_size", type=int, default=1024, help="Parquet batch size for scanning rows.")
-    p.add_argument(
-        "--trust_remote_code",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Passed to `AutoTokenizer.from_pretrained` when loading the tokenizer from `critic_model_id`.",
+
+@dataclass
+class PackedExample:
+    input_ids: torch.Tensor
+    target_token_ids: List[int]
+    target_positions: List[int]
+    context_rollout_indices: List[int]
+    target_truncated: bool
+
+
+def _make_traj_block(traj_content: List[int]) -> Tuple[List[int], List[int], List[int]]:
+    header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
+    has_eos = bool(traj_content) and (traj_content[-1] == IM_END_TOKEN_ID)
+    footer = [] if has_eos else [IM_END_TOKEN_ID]
+    block = header + list(traj_content) + footer
+    return header, footer, block
+
+
+def _feedback_tokens(tokenizer: Any, reward: float, content_plus_footer_len: int, full: bool) -> List[int]:
+    if full:
+        s = f"Reward: {float(reward)}\nLength: {int(content_plus_footer_len)} tokens"
+    else:
+        s = f"Length: {int(content_plus_footer_len)} tokens"
+    return tokenizer.encode(s, add_special_tokens=False)
+
+
+def _pack_for_target(
+    tokenizer: Any,
+    prompt_text: str,
+    rollouts: List[Rollout],
+    target_idx: int,
+    max_length: int,
+    ablation_type: str,
+    rng: random.Random,
+) -> PackedExample:
+    prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
+    prefix_ids = create_tokenized_message("user", prompt_tokens)
+    prefix_len = len(prefix_ids)
+
+    tgt = rollouts[target_idx]
+    tgt_content = list(tgt.response_ids)
+    tgt_header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
+
+    def build_target_block(content: List[int]) -> Tuple[List[int], List[int], List[int], List[int]]:
+        has_eos = bool(content) and (content[-1] == IM_END_TOKEN_ID)
+        footer = [] if has_eos else [IM_END_TOKEN_ID]
+        token_ids = list(content) + list(footer)  # content + footer
+        block = tgt_header + list(content) + list(footer)
+        return footer, token_ids, block, content
+
+    footer, tgt_token_ids, tgt_block, tgt_content_used = build_target_block(tgt_content)
+    fixed_len = prefix_len + len(tgt_block)
+
+    target_truncated = False
+    if fixed_len > int(max_length):
+        budget = int(max_length) - prefix_len
+        min_block = len(tgt_header) + 1
+        if budget < min_block:
+            return PackedExample(
+                input_ids=torch.tensor(prefix_ids[: int(max_length)], dtype=torch.long),
+                target_token_ids=[],
+                target_positions=[],
+                context_rollout_indices=[],
+                target_truncated=True,
+            )
+        max_content_len = budget - len(tgt_header) - 1
+        if max_content_len < 0:
+            max_content_len = 0
+        trunc_content = list(tgt_content[:max_content_len])
+        footer, tgt_token_ids, tgt_block, tgt_content_used = build_target_block(trunc_content)
+        target_truncated = True
+        fixed_len = prefix_len + len(tgt_block)
+
+    other = [i for i in range(len(rollouts)) if i != target_idx]
+    rng.shuffle(other)
+
+    context_indices: List[int] = []
+    context_blocks: List[Tuple[int, List[int], List[int]]] = []
+    # each entry: (rollout_idx, traj_block, feedback_user_message)
+
+    total_len = fixed_len
+    local_idx = 0
+    for ridx in other:
+        r = rollouts[ridx]
+        content = list(r.response_ids)
+        header, footer_r, block = _make_traj_block(content)
+        content_plus_footer_len = len(content) + len(footer_r)
+
+        if ablation_type in ("full", "no_ans"):
+            full_fb = True
+        elif ablation_type == "no_ans_no_rewards":
+            full_fb = False
+        elif ablation_type == "no_ans_first_reward_only":
+            full_fb = (local_idx == 0)
+        else:
+            full_fb = True
+
+        fb_tokens = _feedback_tokens(tokenizer, r.reward, content_plus_footer_len, full=full_fb)
+        fb_msg = create_tokenized_message("user", fb_tokens)
+
+        add_len = len(block) + len(fb_msg)
+        if total_len + add_len > int(max_length):
+            break
+
+        context_indices.append(ridx)
+        context_blocks.append((ridx, block, fb_msg))
+        total_len += add_len
+        local_idx += 1
+
+    full_ids: List[int] = []
+    full_ids.extend(prefix_ids)
+
+    for _, block, fb_msg in context_blocks:
+        full_ids.extend(block)
+        full_ids.extend(fb_msg)
+
+    target_start = len(full_ids)
+    full_ids.extend(tgt_block)
+
+    target_positions = [target_start + len(tgt_header) + i for i in range(len(tgt_token_ids))]
+
+    return PackedExample(
+        input_ids=torch.tensor(full_ids, dtype=torch.long),
+        target_token_ids=tgt_token_ids,
+        target_positions=target_positions,
+        context_rollout_indices=context_indices,
+        target_truncated=target_truncated,
     )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--weights_path", required=True)
+    p.add_argument("--data_path", required=True)
+    p.add_argument("--out_html", required=True)
+
+    p.add_argument("--num_prompts", type=int, default=20)
+    p.add_argument("--tail_steps", type=int, default=50)
+    p.add_argument("--trace_path", type=str, default=None)
+
+    p.add_argument("--prompt_idx", type=int, nargs="*", default=None)
+
+    p.add_argument("--distribution_token_id", type=int, default=151669)
+    p.add_argument("--label_column", choices=["auto", "correct", "value"], default="correct")
+    p.add_argument("--ablation_type", choices=["full", "no_ans", "no_ans_no_rewards", "no_ans_first_reward_only"], default="no_ans")
+    p.add_argument("--examples_per_prompt", type=int, default=1)
+    p.add_argument("--correctness_only", action="store_true")
+    p.add_argument("--max_length", type=int, default=131072)
+
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    p.add_argument("--num_epochs", type=int, default=1)
+    p.add_argument("--max_steps", type=int, default=-1)
+
+    p.add_argument("--learning_rate", type=float, default=3e-5)
+    p.add_argument("--min_learning_rate", type=float, default=0.0)
+    p.add_argument("--warmup_ratio", type=float, default=0.05)
+
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--dtype", type=str, choices=["float16", "bfloat16", "float32"], default="bfloat16")
+    p.add_argument("--attn_implementation", type=str, default="auto")
+    p.add_argument("--trust_remote_code", action="store_true")
+
+    p.add_argument("--tokenizer_path", type=str, default=None)
+
+    p.add_argument("--max_rollouts_per_prompt", type=int, default=0)
+    p.add_argument("--max_tokens_per_rollout", type=int, default=0)
+
     return p.parse_args()
 
 
-def _main_infer() -> None:
+def main() -> None:
     args = parse_args()
 
     torch.manual_seed(int(args.seed))
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     amp_dtype = _torch_dtype(args.dtype)
-
-    tok = AutoTokenizer.from_pretrained(args.weights_path, trust_remote_code=bool(args.trust_remote_code))
-    if tok.pad_token_id is None:
-        tok.pad_token_id = tok.eos_token_id
 
     model_kwargs: Dict[str, Any] = {"torch_dtype": amp_dtype, "trust_remote_code": bool(args.trust_remote_code)}
     if args.attn_implementation and args.attn_implementation != "auto":
@@ -756,470 +514,244 @@ def _main_infer() -> None:
     model.to(device)
     model.eval()
 
-    ds = JointDistributionPackedDataset(
-        data_path=args.data_path,
-        tokenizer=tok,
-        max_length=args.max_length,
-        label_column=args.label_column,
-        ablation_type=args.ablation_type,
-        examples_per_prompt=args.examples_per_prompt,
-        supervise_from_trajectory=args.supervise_from_trajectory,
-        correctness_only=bool(args.correctness_only),
-        shuffle_seed=(None if args.shuffle_seed is None else int(args.shuffle_seed)),
-    )
+    tok_src = args.tokenizer_path if args.tokenizer_path else args.weights_path
+    tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=bool(args.trust_remote_code))
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
 
-    prompt_to_indices: Dict[int, List[int]] = {}
-    for i, s in enumerate(ds.samples):
-        pid = int(s["prompt_idx"])
-        prompt_to_indices.setdefault(pid, []).append(i)
+    pf = pq.ParquetFile(args.data_path)
+    names = set(pf.schema_arrow.names)
 
-    selected: List[Dict[str, Any]] = []
-    total_steps = 0
-
-    if args.trace_path:
-        recs = _read_trace(args.trace_path)
-        if not recs:
-            raise RuntimeError("trace empty")
-        tail = recs[-int(args.tail_steps) :] if int(args.tail_steps) > 0 else recs
-
-        seen = set()
-        for r in reversed(tail):
-            step = int(r.get("step", 0))
-            pid = r.get("prompt_idx", None)
-            sample_indices = r.get("sample_indices", [])
-            if pid is None:
-                for si in sample_indices:
-                    if 0 <= int(si) < len(ds.samples):
-                        pid = int(ds.samples[int(si)]["prompt_idx"])
-                        break
-            if pid is None:
-                continue
-            if pid in seen:
-                continue
-            seen.add(pid)
-            use_si = sample_indices[0] if sample_indices else prompt_to_indices.get(pid, [None])[0]
-            selected.append({"prompt_idx": pid, "sample_idx": use_si, "step": step, "lr": None})
-            if len(selected) >= int(args.num_prompts):
-                break
-        selected = list(selected)
+    choice = (args.label_column or "correct").lower()
+    if choice == "auto":
+        if "correct" in names:
+            reward_col = "correct"
+        elif "value" in names:
+            reward_col = "value"
+        else:
+            raise ValueError("need correct or value")
+    elif choice == "correct":
+        if "correct" not in names:
+            raise ValueError("need correct")
+        reward_col = "correct"
+    elif choice == "value":
+        if "value" not in names:
+            raise ValueError("need value")
+        reward_col = "value"
     else:
-        steps = _simulate_optimizer_steps(
-            dataset_len=len(ds),
-            num_epochs=int(args.num_epochs),
-            batch_size=int(args.batch_size),
-            grad_accum=int(args.gradient_accumulation_steps),
-            seed=int(args.seed),
-            max_steps=int(args.max_steps),
-        )
-        total_steps = len(steps)
-        tail_steps = min(int(args.tail_steps), total_steps) if int(args.tail_steps) > 0 else total_steps
-        tail = steps[-tail_steps:] if tail_steps > 0 else []
+        raise ValueError(f"bad label_column: {args.label_column}")
 
-        seen = set()
-        for step_idx, batch_inds in zip(range(total_steps - tail_steps + 1, total_steps + 1), tail):
-            lr = _lr_schedule(
-                step=int(step_idx),
-                total_steps=int(total_steps),
-                lr=float(args.learning_rate),
-                min_lr=float(args.min_learning_rate),
-                warmup_ratio=float(args.warmup_ratio),
-            )
-            for si in batch_inds:
-                pid = int(ds.samples[int(si)]["prompt_idx"])
-                if pid in seen:
+    table = pq.read_table(args.data_path, columns=["prompt_idx", "prompt", "output_token_ids", reward_col])
+    df = table.to_pandas()
+
+    if reward_col == "correct":
+        df["correct"] = df["correct"].astype(float)
+
+    prompt_groups: Dict[int, Dict[str, Any]] = {}
+    grouped = df.groupby("prompt_idx", sort=True)
+    for pid, group in grouped:
+        rows = group.to_dict("records")
+        if not rows:
+            continue
+        prompt_text = rows[0]["prompt"]
+        ro: List[Rollout] = []
+        for r in rows:
+            toks = r["output_token_ids"]
+            if hasattr(toks, "tolist"):
+                toks = toks.tolist()
+            ro.append(Rollout(response_ids=list(toks), reward=float(r[reward_col])))
+        prompt_groups[int(pid)] = {"prompt": prompt_text, "rollouts": ro}
+
+    prompt_ids_sorted = sorted(prompt_groups.keys())
+
+    if args.correctness_only:
+        length_bins = [0, int(args.max_length) + 1]
+    else:
+        length_bins = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    num_length_bins = len(length_bins) - 1
+
+    if reward_col == "correct":
+        reward_values = [0.0, 1.0]
+    else:
+        reward_values = [0.0, 0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333, 1.0]
+    num_reward_states = len(reward_values)
+    num_bins = num_length_bins * num_reward_states
+
+    sample_prompt_ids: List[int] = []
+    for pid in prompt_ids_sorted:
+        for _ in range(int(args.examples_per_prompt)):
+            sample_prompt_ids.append(int(pid))
+
+    selected_prompt_ids: List[int] = []
+    if args.prompt_idx and len(args.prompt_idx) > 0:
+        for pid in args.prompt_idx:
+            if int(pid) in prompt_groups and int(pid) not in selected_prompt_ids:
+                selected_prompt_ids.append(int(pid))
+    else:
+        if args.trace_path:
+            recs = _read_trace(args.trace_path)
+            tail = recs[-int(args.tail_steps) :] if int(args.tail_steps) > 0 else recs
+            seen = set()
+            for r in reversed(tail):
+                pid = r.get("prompt_idx", None)
+                if pid is None:
+                    for si in r.get("sample_indices", []):
+                        if 0 <= int(si) < len(sample_prompt_ids):
+                            pid = sample_prompt_ids[int(si)]
+                            break
+                if pid is None:
+                    continue
+                pid = int(pid)
+                if pid in seen or pid not in prompt_groups:
                     continue
                 seen.add(pid)
-                selected.append({"prompt_idx": pid, "sample_idx": int(si), "step": int(step_idx), "lr": float(lr)})
-                if len(selected) >= int(args.num_prompts):
+                selected_prompt_ids.append(pid)
+                if len(selected_prompt_ids) >= int(args.num_prompts):
                     break
-            if len(selected) >= int(args.num_prompts):
-                break
-        selected = list(reversed(selected))
+            selected_prompt_ids = list(reversed(selected_prompt_ids))
+        else:
+            steps = _simulate_optimizer_steps(
+                dataset_len=len(sample_prompt_ids),
+                num_epochs=int(args.num_epochs),
+                batch_size=int(args.batch_size),
+                grad_accum=int(args.gradient_accumulation_steps),
+                seed=int(args.seed),
+                max_steps=int(args.max_steps),
+            )
+            total_steps = len(steps)
+            tail_steps = min(int(args.tail_steps), total_steps) if int(args.tail_steps) > 0 else total_steps
+            tail = steps[-tail_steps:] if tail_steps > 0 else []
+
+            seen = set()
+            for step_i, batch_inds in zip(range(total_steps - tail_steps + 1, total_steps + 1), tail):
+                _ = _lr_schedule(
+                    step=int(step_i),
+                    total_steps=int(total_steps),
+                    lr=float(args.learning_rate),
+                    min_lr=float(args.min_learning_rate),
+                    warmup_ratio=float(args.warmup_ratio),
+                )
+                for si in batch_inds:
+                    pid = sample_prompt_ids[int(si)]
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    selected_prompt_ids.append(int(pid))
+                    if len(selected_prompt_ids) >= int(args.num_prompts):
+                        break
+                if len(selected_prompt_ids) >= int(args.num_prompts):
+                    break
 
     title = f"critic report: {os.path.basename(args.weights_path.rstrip('/'))}"
-    out_parts: List[str] = [_html_header(title)]
+    parts: List[str] = [_html_header(title)]
 
-    out_parts.append('<div class="meta">')
-    out_parts.append(f"weights_path: {html_lib.escape(args.weights_path)}<br>")
-    out_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
-    out_parts.append(f"label_column: {html_lib.escape(args.label_column)}<br>")
-    out_parts.append(f"reward_column: {html_lib.escape(ds.reward_column)}<br>")
-    out_parts.append(f"ablation_type: {html_lib.escape(args.ablation_type)}<br>")
-    out_parts.append(f"supervise_from_trajectory: {int(args.supervise_from_trajectory)}<br>")
-    out_parts.append(f"examples_per_prompt: {int(args.examples_per_prompt)}<br>")
-    out_parts.append(f"max_length: {int(args.max_length)}<br>")
-    out_parts.append(f"distribution_token_id: {int(args.distribution_token_id)}<br>")
-    out_parts.append(f"num_bins: {int(ds.num_bins)}<br>")
-    out_parts.append(f"num_reward_states: {int(ds.num_reward_states)}<br>")
-    out_parts.append(f"num_length_bins: {int(ds.num_length_bins)}<br>")
-    out_parts.append(f"reward_values: {html_lib.escape(str(ds.reward_values))}<br>")
-    if total_steps:
-        out_parts.append(f"sim_total_steps: {int(total_steps)}<br>")
-    out_parts.append("</div>")
+    parts.append('<div class="meta">')
+    parts.append(f"weights_path: {html_lib.escape(args.weights_path)}<br>")
+    parts.append(f"tokenizer_path: {html_lib.escape(tok_src)}<br>")
+    parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
+    parts.append(f"reward_column: {html_lib.escape(reward_col)}<br>")
+    parts.append(f"ablation_type: {html_lib.escape(args.ablation_type)}<br>")
+    parts.append(f"examples_per_prompt: {int(args.examples_per_prompt)}<br>")
+    parts.append(f"max_length: {int(args.max_length)}<br>")
+    parts.append(f"distribution_token_id: {int(args.distribution_token_id)}<br>")
+    parts.append(f"num_bins: {int(num_bins)}<br>")
+    parts.append(f"num_reward_states: {int(num_reward_states)}<br>")
+    parts.append(f"num_length_bins: {int(num_length_bins)}<br>")
+    parts.append(f"reward_values: {html_lib.escape(str(reward_values))}<br>")
+    parts.append(f"selected_prompts: {html_lib.escape(str(selected_prompt_ids))}<br>")
+    parts.append("</div>")
 
     decode_cache: Dict[int, str] = {}
 
-    for item_i, item in enumerate(selected, start=1):
-        sample_idx = item.get("sample_idx", None)
-        pid = int(item["prompt_idx"])
-        step = item.get("step", None)
-        lr = item.get("lr", None)
+    for p_i, pid in enumerate(selected_prompt_ids, start=1):
+        grp = prompt_groups.get(int(pid), None)
+        if grp is None:
+            continue
 
-        if sample_idx is None or not (0 <= int(sample_idx) < len(ds.samples)):
-            si_list = prompt_to_indices.get(pid, [])
-            if not si_list:
-                continue
-            sample_idx = si_list[0]
+        prompt_text = str(grp["prompt"])
+        rollouts: List[Rollout] = list(grp["rollouts"])
 
-        pack = ds.get_packed(int(sample_idx))
-        input_ids_1d: torch.Tensor = pack["input_ids"]
-        traj_meta: List[TrajectoryMeta] = pack["traj_meta"]
+        if int(args.max_rollouts_per_prompt) > 0:
+            rollouts = rollouts[: int(args.max_rollouts_per_prompt)]
 
-        max_traj = int(args.max_trajectories)
-        if max_traj > 0 and len(traj_meta) > max_traj:
-            traj_meta = traj_meta[:max_traj]
+        parts.append("<hr>")
+        parts.append(f"<h2>prompt {p_i} | prompt_idx {int(pid)} | rollouts {len(rollouts)}</h2>")
+        parts.append("<h3>prompt</h3>")
+        parts.append(f"<pre>{html_lib.escape(prompt_text)}</pre>")
 
-        max_tok = int(args.max_tokens_per_traj)
-        if max_tok > 0:
-            new_meta: List[TrajectoryMeta] = []
-            for tm in traj_meta:
-                if len(tm.token_ids) > max_tok:
-                    new_meta.append(
-                        TrajectoryMeta(
-                            local_idx=tm.local_idx,
-                            reward_gt=tm.reward_gt,
-                            supervised=tm.supervised,
-                            token_ids=tm.token_ids[:max_tok],
-                            abs_positions=tm.abs_positions[:max_tok],
-                            truncated=True,
-                        )
-                    )
-                else:
-                    new_meta.append(tm)
-            traj_meta = new_meta
+        parts.append("<h3>rollouts</h3>")
+        parts.append('<div class="grid">')
 
-        pos_set = set()
-        for tm in traj_meta:
-            for p in tm.abs_positions:
-                pos_set.add(int(p))
-        positions = sorted(pos_set)
+        for r_i in range(len(rollouts)):
+            seed_i = (int(args.seed) * 1000003 + int(pid) * 1009 + int(r_i) * 9176) & 0xFFFFFFFF
+            rng = random.Random(int(seed_i))
 
-        pos_to_er = _expected_reward_per_pos(
-            model=model,
-            input_ids_1d=input_ids_1d,
-            positions=positions,
-            distribution_token_id=int(args.distribution_token_id),
-            num_bins=int(ds.num_bins),
-            num_length_bins=int(ds.num_length_bins),
-            reward_values=list(ds.reward_values),
-            device=device,
-            amp_dtype=amp_dtype,
-        )
+            packed = _pack_for_target(
+                tokenizer=tok,
+                prompt_text=prompt_text,
+                rollouts=rollouts,
+                target_idx=int(r_i),
+                max_length=int(args.max_length),
+                ablation_type=str(args.ablation_type),
+                rng=rng,
+            )
 
-        out_parts.append("<hr>")
-        out_parts.append(f"<h2>item {item_i}</h2>")
-        out_parts.append('<div class="meta">')
-        out_parts.append(f"prompt_idx: {pid}<br>")
-        out_parts.append(f"sample_idx: {int(sample_idx)}<br>")
-        if step is not None:
-            out_parts.append(f"step: {int(step)}<br>")
-        if lr is not None:
-            out_parts.append(f"lr: {float(lr):.8f}<br>")
-        out_parts.append("</div>")
+            tgt_token_ids = packed.target_token_ids
+            tgt_positions = packed.target_positions
 
-        out_parts.append("<h3>prompt</h3>")
-        out_parts.append(f'<pre class="prompt">{html_lib.escape(str(pack["prompt"]))}</pre>')
+            if int(args.max_tokens_per_rollout) > 0 and len(tgt_token_ids) > int(args.max_tokens_per_rollout):
+                tgt_token_ids = tgt_token_ids[: int(args.max_tokens_per_rollout)]
+                tgt_positions = tgt_positions[: int(args.max_tokens_per_rollout)]
 
-        out_parts.append("<h3>trajectories</h3>")
-        out_parts.append('<div class="grid">')
+            pos_to_er = _expected_reward_per_pos(
+                model=model,
+                input_ids_1d=packed.input_ids,
+                positions=list(tgt_positions),
+                distribution_token_id=int(args.distribution_token_id),
+                num_bins=int(num_bins),
+                num_length_bins=int(num_length_bins),
+                reward_values=list(reward_values),
+                device=device,
+                amp_dtype=amp_dtype,
+            )
 
-        for tm in traj_meta:
-            er_vals: List[float] = []
+            er_vals = [float(pos_to_er.get(int(p), 0.0)) for p in tgt_positions]
+            mean_er = float(np.mean(er_vals)) if er_vals else 0.0
+
             spans: List[str] = []
-            for tid, ap in zip(tm.token_ids, tm.abs_positions):
+            for tid, ap in zip(tgt_token_ids, tgt_positions):
                 er = float(pos_to_er.get(int(ap), 0.0))
-                er_vals.append(er)
                 s = _decode_token(tok, int(tid), decode_cache)
                 spans.append(
                     f'<span class="tok" style="background-color:{_reward_rgb(er)}" '
-                    f'title="pos {int(ap)} er {er:.4f}">{html_lib.escape(s)}</span>'
+                    f'title="pos {int(ap)} er {er:.4f} tid {int(tid)}">{html_lib.escape(s)}</span>'
                 )
-            er_mean = float(np.mean(er_vals)) if er_vals else 0.0
 
-            hdr = [
-                f"traj {tm.local_idx}",
-                f"gt {tm.reward_gt:.4f}",
-                f"mean {er_mean:.4f}",
-                f"sup {1 if tm.supervised else 0}",
-                f"tok {len(tm.token_ids)}",
-                f"trunc {1 if tm.truncated else 0}",
-            ]
-            out_parts.append('<div class="card">')
-            out_parts.append(f'<div class="hdr">{html_lib.escape(" | ".join(hdr))}</div>')
-            out_parts.append(f'<div class="toks">{"".join(spans)}</div>')
-            out_parts.append("</div>")
+            ctx = packed.context_rollout_indices
+            ctx_str = ",".join(str(int(x)) for x in ctx)
 
-        out_parts.append("</div>")
-
-    out_parts.append(_html_footer())
-
-    out_dir = os.path.dirname(os.path.abspath(args.out_html))
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
-
-    with open(args.out_html, "w", encoding="utf-8") as f:
-        f.write("".join(out_parts))
-
-    print(args.out_html)
-
-
-def main() -> None:
-    args = parse_args()
-
-    pf = pq.ParquetFile(args.data_path)
-    schema_names = set(pf.schema_arrow.names)
-    required = {
-        "prompt_idx",
-        "prompt",
-        "output_token_ids",
-        "critic_model_id",
-        "critic_p_correct",
-        "critic_expected_tokens_remaining",
-    }
-    missing = sorted([c for c in required if c not in schema_names])
-    if missing:
-        raise ValueError(f"Input parquet missing required columns: {missing}")
-
-    arrow_batch_size = max(1, int(args.arrow_batch_size))
-    num_prompts = int(args.num_prompts)
-    if num_prompts <= 0:
-        raise ValueError("--num_prompts must be > 0")
-    max_rollouts_per_prompt = int(args.max_rollouts_per_prompt)
-    if max_rollouts_per_prompt <= 0:
-        raise ValueError("--max_rollouts_per_prompt must be > 0")
-
-    # Infer tokenizer from the first non-null critic_model_id.
-    critic_model_id = None
-    for rb in pf.iter_batches(columns=["critic_model_id"], batch_size=arrow_batch_size):
-        vals = rb.column(rb.schema.get_field_index("critic_model_id")).to_pylist()
-        for v in vals:
-            if v is not None:
-                critic_model_id = str(v)
-                break
-        if critic_model_id is not None:
-            break
-    if critic_model_id is None:
-        raise RuntimeError("No non-null `critic_model_id` found; cannot infer tokenizer.")
-
-    tok = None
-    tok_err: Optional[str] = None
-    try:
-        tok = AutoTokenizer.from_pretrained(critic_model_id, trust_remote_code=bool(args.trust_remote_code))
-        if tok.pad_token_id is None:
-            tok.pad_token_id = tok.eos_token_id
-    except Exception as e:
-        tok_err = repr(e)
-        tok = None
-
-    prompt_filter = None
-    prompt_order = None
-    if args.prompt_idx:
-        prompt_order = {int(pid): i for i, pid in enumerate(args.prompt_idx)}
-        prompt_filter = set(prompt_order.keys())
-
-    cols = ["prompt_idx", "prompt", "output_token_ids", "correct", "critic_p_correct", "critic_expected_tokens_remaining"]
-    cols = [c for c in cols if c in schema_names]
-
-    from collections import OrderedDict
-
-    selected: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
-
-    def _done() -> bool:
-        if len(selected) < num_prompts:
-            return False
-        return all(len(v["rows"]) >= max_rollouts_per_prompt for v in selected.values())
-
-    for rb in pf.iter_batches(columns=cols, batch_size=arrow_batch_size):
-        col = {name: rb.column(rb.schema.get_field_index(name)).to_pylist() for name in rb.schema.names}
-        if not col:
-            continue
-        n = len(next(iter(col.values())))
-        for i in range(n):
-            p_list = col["critic_p_correct"][i]
-            e_list = col["critic_expected_tokens_remaining"][i]
-            if p_list is None or e_list is None:
-                continue
-
-            pid = int(col["prompt_idx"][i])
-            if prompt_filter is not None and pid not in prompt_filter:
-                continue
-
-            if pid not in selected:
-                if len(selected) >= num_prompts:
-                    continue
-                prompt_text = col["prompt"][i]
-                selected[pid] = {"prompt": "" if prompt_text is None else str(prompt_text), "rows": []}
-
-            entry = selected[pid]
-            if len(entry["rows"]) >= max_rollouts_per_prompt:
-                continue
-
-            toks = _to_int_list(col["output_token_ids"][i])
-            p = _pad_or_truncate(_to_float_list(p_list), len(toks))
-            e = _pad_or_truncate(_to_float_list(e_list), len(toks))
-            gt_correct = _safe_float(col.get("correct", [float("nan")] * n)[i]) if "correct" in col else float("nan")
-
-            entry["rows"].append(
-                {
-                    "output_token_ids": toks,
-                    "critic_p_correct": p,
-                    "critic_expected_tokens_remaining": e,
-                    "correct": gt_correct,
-                }
+            parts.append('<div class="card">')
+            parts.append('<div class="hdr">')
+            parts.append(
+                html_lib.escape(
+                    f"rollout {r_i} | gt {rollouts[r_i].reward:.4f} | mean {mean_er:.4f} | "
+                    f"ctx_n {len(ctx)} | ctx [{ctx_str}] | trunc {1 if packed.target_truncated else 0} | tok {len(tgt_token_ids)}"
+                )
             )
+            parts.append("</div>")
+            parts.append(f'<div class="toks">{"".join(spans)}</div>')
+            parts.append("</div>")
 
-            if _done():
-                break
-        if _done():
-            break
+        parts.append("</div>")
 
-    if prompt_order is not None:
-        selected = OrderedDict(sorted(selected.items(), key=lambda kv: prompt_order.get(int(kv[0]), 10**18)))
-
-    # Compute global min/max for log-length coloring across selected tokens.
-    log_lengths: List[float] = []
-    total_lengths: List[float] = []
-    for entry in selected.values():
-        for row in entry["rows"]:
-            toks = row["output_token_ids"]
-            exp_rem = row["critic_expected_tokens_remaining"]
-            for t_i in range(min(len(toks), len(exp_rem))):
-                rem = _safe_float(exp_rem[t_i])
-                if not math.isfinite(rem):
-                    continue
-                total = float(t_i + 1) + float(rem)
-                if not math.isfinite(total) or total < 0.0:
-                    continue
-                total_lengths.append(total)
-                log_lengths.append(math.log1p(total))
-
-    log_min = float(min(log_lengths)) if log_lengths else 0.0
-    log_max = float(max(log_lengths)) if log_lengths else 1.0
-    denom = (log_max - log_min) if (log_max > log_min) else 0.0
-
-    title = f"critic labeled report: {os.path.basename(args.data_path)}"
-    out_parts: List[str] = [_html_header(title)]
-
-    out_parts.append('<div class="meta">')
-    out_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
-    out_parts.append(f"critic_model_id: {html_lib.escape(critic_model_id)}<br>")
-    out_parts.append(f"num_prompts: {int(num_prompts)}<br>")
-    out_parts.append(f"max_rollouts_per_prompt: {int(max_rollouts_per_prompt)}<br>")
-    out_parts.append(f"max_tokens_per_traj: {int(args.max_tokens_per_traj)}<br>")
-    if total_lengths:
-        out_parts.append(f"len_total_min: {float(min(total_lengths)):.2f}<br>")
-        out_parts.append(f"len_total_max: {float(max(total_lengths)):.2f}<br>")
-    out_parts.append(f"log_len_min: {log_min:.6f}<br>")
-    out_parts.append(f"log_len_max: {log_max:.6f}<br>")
-    if tok_err is not None:
-        out_parts.append(f"tokenizer_load_error: {html_lib.escape(tok_err)}<br>")
-        out_parts.append("decoding: token ids only<br>")
-    out_parts.append("</div>")
-
-    decode_cache: Dict[int, str] = {}
-
-    for item_i, (pid, entry) in enumerate(selected.items(), start=1):
-        out_parts.append("<hr>")
-        out_parts.append(f"<h2>item {item_i}</h2>")
-        out_parts.append('<div class="meta">')
-        out_parts.append(f"prompt_idx: {int(pid)}<br>")
-        out_parts.append(f"labeled_rollouts: {len(entry['rows'])}<br>")
-        out_parts.append("</div>")
-
-        out_parts.append("<h3>prompt</h3>")
-        out_parts.append(f'<pre class="prompt">{html_lib.escape(str(entry.get("prompt") or ""))}</pre>')
-
-        out_parts.append("<h3>rollouts</h3>")
-        out_parts.append('<div class="grid">')
-
-        for r_i, row in enumerate(entry["rows"], start=1):
-            toks: List[int] = list(row["output_token_ids"])
-            p_list: List[float] = list(row["critic_p_correct"])
-            e_list: List[float] = list(row["critic_expected_tokens_remaining"])
-            gt_correct = _safe_float(row.get("correct"))
-
-            max_tok = int(args.max_tokens_per_traj)
-            if max_tok > 0:
-                toks = toks[:max_tok]
-                p_list = p_list[:max_tok]
-                e_list = e_list[:max_tok]
-
-            p_arr = np.array([_safe_float(x) for x in p_list], dtype=np.float64)
-            p_mean = float(np.nanmean(p_arr)) if np.any(np.isfinite(p_arr)) else float("nan")
-
-            tot_arr: List[float] = []
-            for t_i, rem in enumerate(e_list):
-                rem_f = _safe_float(rem)
-                if not math.isfinite(rem_f):
-                    tot_arr.append(float("nan"))
-                    continue
-                tot_arr.append(float(t_i + 1) + float(rem_f))
-            tot_np = np.array(tot_arr, dtype=np.float64)
-            tot_mean = float(np.nanmean(tot_np)) if np.any(np.isfinite(tot_np)) else float("nan")
-
-            hdr = [
-                f"rollout {r_i}",
-                ("gt nan" if not math.isfinite(gt_correct) else f"gt {gt_correct:.0f}"),
-                ("p̄ nan" if not math.isfinite(p_mean) else f"p̄ {p_mean:.4f}"),
-                ("L̄ nan" if not math.isfinite(tot_mean) else f"L̄ {tot_mean:.1f}"),
-                f"tok {len(toks)}",
-            ]
-
-            spans: List[str] = []
-            for t_i, tid in enumerate(toks):
-                pc = _safe_float(p_list[t_i]) if t_i < len(p_list) else float("nan")
-                rem = _safe_float(e_list[t_i]) if t_i < len(e_list) else float("nan")
-
-                if math.isfinite(rem):
-                    total = float(t_i + 1) + float(rem)
-                else:
-                    total = float("nan")
-
-                if math.isfinite(total) and total >= 0.0:
-                    logv = math.log1p(total)
-                    norm = (logv - log_min) / denom if denom > 0 else 0.5
-                else:
-                    logv = float("nan")
-                    norm = float("nan")
-
-                pc_col = _p_correct_rgb(pc)
-                len_col = _len_rgb(norm)
-
-                if tok is None:
-                    s = f"<{int(tid)}>"
-                else:
-                    s = _decode_token(tok, int(tid), decode_cache)
-
-                title = f"t {t_i} | p {pc:.4f} | rem {rem:.2f} | total {total:.2f} | log {logv:.4f}"
-                spans.append(
-                    f'<span class="tok" style="--pc:{pc_col}; --len:{len_col};" title="{html_lib.escape(title)}">{html_lib.escape(s)}</span>'
-                )
-
-            out_parts.append('<div class="card">')
-            out_parts.append(f'<div class="hdr">{html_lib.escape(" | ".join(hdr))}</div>')
-            out_parts.append(f'<div class="toks">{"".join(spans)}</div>')
-            out_parts.append("</div>")
-
-        out_parts.append("</div>")
-
-    out_parts.append(_html_footer())
+    parts.append(_html_footer())
 
     out_dir = os.path.dirname(os.path.abspath(args.out_html))
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
 
     with open(args.out_html, "w", encoding="utf-8") as f:
-        f.write("".join(out_parts))
+        f.write("".join(parts))
 
     print(args.out_html)
 

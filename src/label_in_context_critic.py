@@ -2,25 +2,25 @@
 """
 Label a generated Parquet dataset with in-context critic predictions.
 
-For each prompt_idx group, we deterministically shuffle sibling trajectories, build
-the packed in-context sequence exactly like `src/train_in_context_critic.py`
-(currently only supports the `no_ans` ablation), run a forward pass, and extract:
+For each prompt_idx group and each labeled rollout in that group:
+  - Build a packed in-context sequence with the target rollout LAST.
+  - Context consists of as many other rollouts as fit: shuffle siblings, then append
+    (assistant rollout + user feedback) blocks until the next would exceed max_length,
+    while reserving space for the target rollout.
+  - Run the critic once per labeled rollout.
+  - Extract:
+      - critic_p_correct per output token (marginalize over length bins)
+      - critic_expected_tokens_remaining per output token (marginalize over reward bins)
 
-  - p_correct per output token (marginalizing over length bins)
-  - expected remaining tokens per output token (marginalizing over reward bins)
-
-The output Parquet preserves all input columns and appends:
+Output Parquet preserves all input columns and appends:
   - critic_model_id
   - critic_p_correct
   - critic_expected_tokens_remaining
 
-Optionally, you can label only a subset of rollouts per prompt group (selected
-uniformly without replacement with a per-prompt seed). Unlabeled rows are kept
-in the output with null critic columns.
+Unlabeled rows are kept with null critic columns.
 
-This script supports simple data-parallel execution across GPUs by splitting the
-input parquet by contiguous row-group ranges (with minimal overlap so prompt groups
-crossing boundaries are still processed exactly once).
+Data-parallel mode splits by parquet row-group ranges with minimal overlap.
+This assumes prompt_idx groups are contiguous in the parquet.
 """
 
 from __future__ import annotations
@@ -30,9 +30,10 @@ import os
 import sys
 import time
 import traceback
+import random
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, Optional, Set
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -41,8 +42,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-# --- Qwen Specific Control Tokens ---
-# Must match `src/train_in_context_critic.py`.
+# --- Qwen control tokens (must match training) ---
 IM_START_TOKEN_ID = 151644
 IM_END_TOKEN_ID = 151645
 USER_TOKEN_ID = 872
@@ -140,13 +140,13 @@ def parse_args() -> Config:
         default=[0.0, 1.0],
         help="Reward state midpoints (must match training; for correctness: 0 1).",
     )
-    p.add_argument("--shuffle-seed", type=int, default=0, help="Seed for deterministic per-prompt shuffles.")
+    p.add_argument("--shuffle-seed", type=int, default=0, help="Seed for deterministic per-rollout context shuffles.")
     p.add_argument(
         "--label-rollouts-per-prompt",
         type=int,
         default=-1,
         help=(
-            "If >0, label only this many rollouts per prompt_idx group (selected uniformly without replacement). "
+            "If >0, label only this many rollouts per prompt_idx group (sampled without replacement). "
             "If 0, label none. If <0, label all rollouts (default)."
         ),
     )
@@ -161,7 +161,7 @@ def parse_args() -> Config:
         "--ablation-type",
         choices=["no_ans"],
         default="no_ans",
-        help="In-context packing configuration (currently only 'no_ans' supported).",
+        help="In-context packing configuration (only 'no_ans' supported).",
     )
     args = p.parse_args()
 
@@ -258,6 +258,7 @@ def _load_model(model_id: str, *, dtype: torch.dtype, attn_implementation: str) 
         model_id,
         torch_dtype=dtype,
         attn_implementation=attn_implementation,
+        trust_remote_code=True,
     )
     model.eval()
     try:
@@ -274,13 +275,13 @@ def _unwrap_lm_head(model: torch.nn.Module):
     return lm_head
 
 
-def _length_bin_midpoints(length_bins: Sequence[int]) -> List[float]:
-    mids: List[float] = []
-    for i in range(len(length_bins) - 1):
-        lo = float(length_bins[i])
-        hi = float(length_bins[i + 1])
-        mids.append(0.5 * (lo + hi))
-    return mids
+def _get_base_model(model: torch.nn.Module):
+    tgt = model._orig_mod if hasattr(model, "_orig_mod") else model
+    tgt = tgt.module if hasattr(tgt, "module") else tgt
+    for attr in ("model", "transformer", "base_model"):
+        if hasattr(tgt, attr):
+            return getattr(tgt, attr)
+    return None
 
 
 def _create_tokenized_message(role: str, tokenized_content: Sequence[int]) -> List[int]:
@@ -297,31 +298,34 @@ def _create_tokenized_message(role: str, tokenized_content: Sequence[int]) -> Li
     return [IM_START_TOKEN_ID, role_token_id, NEWLINE_TOKEN_ID] + content + [IM_END_TOKEN_ID, NEWLINE_TOKEN_ID]
 
 
+def _length_bin_midpoints(length_bins: Sequence[int]) -> List[float]:
+    mids: List[float] = []
+    for i in range(len(length_bins) - 1):
+        lo = float(length_bins[i])
+        hi = float(length_bins[i + 1])
+        mids.append(0.5 * (lo + hi))
+    return mids
+
+
 @dataclass
 class _Trajectory:
-    row_idx: int  # row index within the current prompt group table
+    row_idx: int
     response_ids: List[int]
     reward: float
 
 
 @dataclass
-class _TrajInfo:
-    traj: _Trajectory
-    traj_content: List[int]
-    header: List[int]
-    footer: List[int]
+class _CtxInfo:
     traj_block: List[int]
-    traj_block_len: int
-    content_plus_footer_len: int
-    reward_tokens_full: List[int]
-    reward_block_len_full: int
+    feedback_block: List[int]
+    traj_content_len: int
 
 
-def _build_infos(trajectories: Sequence[_Trajectory], tokenizer) -> List[_TrajInfo]:
-    infos: List[_TrajInfo] = []
+def _build_ctx_infos(trajectories: Sequence[_Trajectory], tokenizer) -> List[_CtxInfo]:
+    infos: List[_CtxInfo] = []
+    header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
     for traj in trajectories:
         traj_content = list(traj.response_ids)
-        header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
         has_eos = bool(traj_content) and traj_content[-1] == IM_END_TOKEN_ID
         footer = [] if has_eos else [IM_END_TOKEN_ID]
         traj_block = header + traj_content + footer
@@ -329,115 +333,147 @@ def _build_infos(trajectories: Sequence[_Trajectory], tokenizer) -> List[_TrajIn
         content_plus_footer_len = len(traj_content) + len(footer)
         full_feedback_str = f"Reward: {float(traj.reward)}\nLength: {content_plus_footer_len} tokens"
         reward_tokens_full = tokenizer.encode(full_feedback_str, add_special_tokens=False)
-
-        # create_tokenized_message adds 5 tokens around content: IM_START, role, NL, IM_END, NL
-        reward_block_len_full = len(reward_tokens_full) + 5
+        feedback_block = _create_tokenized_message("user", reward_tokens_full)
 
         infos.append(
-            _TrajInfo(
-                traj=traj,
-                traj_content=traj_content,
-                header=header,
-                footer=footer,
+            _CtxInfo(
                 traj_block=traj_block,
-                traj_block_len=len(traj_block),
-                content_plus_footer_len=content_plus_footer_len,
-                reward_tokens_full=reward_tokens_full,
-                reward_block_len_full=reward_block_len_full,
+                feedback_block=feedback_block,
+                traj_content_len=len(traj_content),
             )
         )
     return infos
 
 
-def _choose_suffix_that_fits(
-    infos: Sequence[_TrajInfo],
-    *,
-    prefix_len: int,
-    max_length: int,
-    tokenizer,
-) -> Tuple[List[_TrajInfo], bool]:
+def _truncate_target_content_to_fit(prefix_len: int, target_content: List[int], max_length: int) -> Tuple[List[int], List[int], bool, bool]:
     """
-    Return (included_infos, truncated_last).
+    Returns (trunc_content, footer, truncated, can_fit_min_block).
 
-    Mirrors the suffix-fit logic from `JointDistributionDataset.__getitem__` for
-    the `no_ans` ablation.
+    We always include assistant header; footer is IM_END if trunc_content does not end with IM_END.
+    Positions are computed only for trunc_content (aligned to stored output_token_ids).
     """
-    n = len(infos)
-    if n == 0:
-        return ([], False)
+    header_len = 3  # [IM_START, ASSISTANT, NEWLINE]
+    budget_for_assistant = int(max_length) - int(prefix_len) - int(header_len)
+    if budget_for_assistant <= 0:
+        return ([], [IM_END_TOKEN_ID], True, False)
 
-    assistant_suffix = [0] * (n + 1)
-    full_fb_suffix = [0] * (n + 1)
-    for i in range(n - 1, -1, -1):
-        assistant_suffix[i] = assistant_suffix[i + 1] + infos[i].traj_block_len
-        full_fb_suffix[i] = full_fb_suffix[i + 1]
-        if i != n - 1:
-            full_fb_suffix[i] += infos[i].reward_block_len_full
+    L = len(target_content)
 
-    start_idx = n - 1
-    for s in range(n):
-        total = prefix_len + assistant_suffix[s] + full_fb_suffix[s]
-        if total <= max_length:
-            start_idx = s
+    trunc_len = min(L, budget_for_assistant)
+    while trunc_len > 0:
+        last_is_end = (target_content[trunc_len - 1] == IM_END_TOKEN_ID)
+        footer_len = 0 if last_is_end else 1
+        if trunc_len + footer_len <= budget_for_assistant:
             break
+        trunc_len -= 1
 
-    included = list(infos[start_idx:])
-    truncated_last = False
+    if trunc_len == 0:
+        if 1 <= budget_for_assistant:
+            return ([], [IM_END_TOKEN_ID], True, True)
+        return ([], [IM_END_TOKEN_ID], True, False)
 
-    # If even the last trajectory alone cannot fit, truncate its content to fit.
-    if start_idx == n - 1:
-        last = included[0]
-        budget = max_length - prefix_len
-        min_block = len(last.header) + len(last.footer)
-        if budget < min_block:
-            return ([], False)
+    trunc_content = list(target_content[:trunc_len])
+    last_is_end = trunc_content[-1] == IM_END_TOKEN_ID
+    footer = [] if last_is_end else [IM_END_TOKEN_ID]
+    truncated = trunc_len < L
+    return (trunc_content, footer, truncated, True)
 
-        max_content_len = budget - min_block
-        if max_content_len < 0:
-            max_content_len = 0
 
-        trunc_content = list(last.traj_content[:max_content_len])
-        has_eos = bool(trunc_content) and trunc_content[-1] == IM_END_TOKEN_ID
-        footer = [] if has_eos else [IM_END_TOKEN_ID]
-        traj_block = last.header + trunc_content + footer
+def _pack_target_last(
+    tokenizer,
+    *,
+    prompt: str,
+    trajectories: Sequence[_Trajectory],
+    ctx_infos: Sequence[_CtxInfo],
+    target_idx: int,
+    max_length: int,
+    shuffle_seed: int,
+    prompt_idx: int,
+) -> Tuple[List[int], List[int], int, int]:
+    """
+    Returns (full_input_ids, target_positions, trunc_len, orig_len).
+    target_positions correspond to trunc_content tokens only (exclude appended footer).
+    """
+    prompt_tokens = tokenizer.encode(prompt or "", add_special_tokens=False)
+    prefix = _create_tokenized_message("user", prompt_tokens)
+    prefix_len = len(prefix)
 
-        included = [
-            _TrajInfo(
-                traj=last.traj,
-                traj_content=trunc_content,
-                header=last.header,
-                footer=footer,
-                traj_block=traj_block,
-                traj_block_len=len(traj_block),
-                content_plus_footer_len=len(trunc_content) + len(footer),
-                reward_tokens_full=last.reward_tokens_full,
-                reward_block_len_full=last.reward_block_len_full,
-            )
-        ]
-        truncated_last = True
+    header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
 
-    return (included, truncated_last)
+    target = trajectories[target_idx]
+    target_content_orig = list(target.response_ids)
+    orig_len = len(target_content_orig)
+
+    trunc_content, footer, _truncated, can_fit = _truncate_target_content_to_fit(prefix_len, target_content_orig, max_length)
+    if not can_fit:
+        return (prefix[:max_length], [], 0, orig_len)
+
+    target_block = header + trunc_content + footer
+    fixed_len = prefix_len + len(target_block)
+    if fixed_len > max_length:
+        return (prefix[:max_length], [], 0, orig_len)
+
+    other = [i for i in range(len(trajectories)) if i != target_idx]
+    seed = (int(shuffle_seed) * 1000003 + int(prompt_idx) * 1009 + int(target_idx) * 9176) & 0xFFFFFFFF
+    rng = random.Random(seed)
+    rng.shuffle(other)
+
+    total_len = fixed_len
+    ctx_keep: List[int] = []
+    for j in other:
+        add_len = len(ctx_infos[j].traj_block) + len(ctx_infos[j].feedback_block)
+        if total_len + add_len > max_length:
+            break
+        ctx_keep.append(j)
+        total_len += add_len
+
+    full_input_ids: List[int] = list(prefix)
+    for j in ctx_keep:
+        full_input_ids.extend(ctx_infos[j].traj_block)
+        full_input_ids.extend(ctx_infos[j].feedback_block)
+
+    target_start = len(full_input_ids)
+    full_input_ids.extend(target_block)
+
+    if len(full_input_ids) > max_length:
+        raise RuntimeError(f"Packed length {len(full_input_ids)} > max_length {max_length}")
+
+    target_positions = [target_start + len(header) + i for i in range(len(trunc_content))]
+    return (full_input_ids, target_positions, len(trunc_content), orig_len)
 
 
 @torch.inference_mode()
-def _score_packed_sequence(
+def _predict_for_positions(
     model: torch.nn.Module,
     *,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
+    input_ids: torch.Tensor,        # [1, S]
+    attention_mask: torch.Tensor,   # [1, S]
+    positions: Sequence[int],
     distribution_token_id: int,
     num_bins: int,
     num_length_bins: int,
     correct_reward_index: int,
-    length_midpoints: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Return packed per-position predictions for the joint head.
+    length_midpoints: torch.Tensor,  # [num_length_bins]
+) -> Tuple[List[float], List[float]]:
+    if not positions:
+        return ([], [])
 
-    Output: logits_all of shape [S, num_bins] (batch size 1).
-    """
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, use_cache=False)
-    hidden_states = outputs.hidden_states[-1]  # [1, S, E]
+    base = _get_base_model(model)
+    if base is None:
+        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, output_hidden_states=True, return_dict=True)
+        hidden = out.hidden_states[-1]
+    else:
+        out = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            hidden = out.last_hidden_state
+        elif hasattr(out, "hidden_states") and out.hidden_states is not None:
+            hidden = out.hidden_states[-1]
+        else:
+            raise RuntimeError("Cannot obtain last_hidden_state")
+
+    device = hidden.device
+    pos_t = torch.tensor(list(positions), device=device, dtype=torch.long)
+    h_sel = hidden[0].index_select(0, pos_t)  # [T, E]
 
     lm_head = _unwrap_lm_head(model)
     w = lm_head.weight[distribution_token_id : distribution_token_id + num_bins]
@@ -447,27 +483,7 @@ def _score_packed_sequence(
         else None
     )
 
-    logits_all = F.linear(hidden_states, w, b)[0]  # [S, num_bins]
-    return logits_all
-
-
-def _extract_token_lists(
-    logits_all: torch.Tensor,
-    *,
-    positions: Sequence[int],
-    num_bins: int,
-    num_length_bins: int,
-    correct_reward_index: int,
-    length_midpoints: torch.Tensor,
-) -> Tuple[List[float], List[float]]:
-    """
-    From [S, num_bins] logits, extract per-token p_correct and expected remaining tokens.
-    """
-    if not positions:
-        return ([], [])
-
-    pos_t = torch.tensor(list(positions), device=logits_all.device, dtype=torch.long)
-    logits = logits_all.index_select(0, pos_t)  # [T, num_bins]
+    logits = F.linear(h_sel, w, b).float()  # [T, num_bins]
 
     num_reward_states = num_bins // num_length_bins
     logits_rs = logits.view(-1, num_reward_states, num_length_bins)
@@ -483,146 +499,13 @@ def _extract_token_lists(
     return (p_correct.detach().float().cpu().tolist(), expected_remaining.detach().float().cpu().tolist())
 
 
-def _pack_and_score_prompt_group(
-    model: torch.nn.Module,
-    tokenizer,
-    *,
-    prompt: str,
-    trajectories: Sequence[_Trajectory],
-    max_length: int,
-    shuffle_seed: int,
-    prompt_idx: int,
-    rows_to_label: set[int] | None,
-    distribution_token_id: int,
-    num_bins: int,
-    num_length_bins: int,
-    correct_reward_index: int,
-    length_midpoints: torch.Tensor,
-    autocast_ctx,
-) -> Tuple[List[List[float] | None], List[List[float] | None]]:
-    """
-    Return (p_correct_lists, expected_remaining_lists) aligned to each row's output_token_ids.
-    """
-    # Deterministic shuffle per prompt.
-    import random
-
-    order = list(trajectories)
-    random.Random(int(shuffle_seed) + int(prompt_idx)).shuffle(order)
-
-    # Allocate outputs (per row, aligned to its original output_token_ids length).
-    out_p_correct: List[List[float] | None] = [None for _ in range(len(trajectories))]
-    out_expected: List[List[float] | None] = [None for _ in range(len(trajectories))]
-
-    label_all = rows_to_label is None
-    remaining_to_label: set[int] | None = None if label_all else set(rows_to_label)
-
-    prompt_tokens = tokenizer.encode(prompt or "", add_special_tokens=False)
-    prefix = _create_tokenized_message("user", prompt_tokens)
-    prefix_len = len(prefix)
-
-    # Label all trajectories by scoring one or more suffix packs (minimal number of packs).
-    remaining = list(order)
-    while remaining and (label_all or remaining_to_label):
-        infos = _build_infos(remaining, tokenizer)
-        included_infos, _truncated_last = _choose_suffix_that_fits(
-            infos, prefix_len=prefix_len, max_length=max_length, tokenizer=tokenizer
-        )
-        if not included_infos:
-            # Degenerate: cannot fit even a single assistant header/footer.
-            # Fill NaNs for any trajectories we intended to label to keep alignment.
-            for traj in remaining:
-                if not label_all and remaining_to_label is not None and traj.row_idx not in remaining_to_label:
-                    continue
-                L = len(traj.response_ids)
-                out_p_correct[traj.row_idx] = [float("nan")] * L
-                out_expected[traj.row_idx] = [float("nan")] * L
-            break
-
-        included_row_ids = {info.traj.row_idx for info in included_infos}
-        should_score = label_all or (
-            remaining_to_label is not None and bool(included_row_ids.intersection(remaining_to_label))
-        )
-
-        # Build packed input_ids and capture per-trajectory token positions (aligned to output_token_ids).
-        if should_score:
-            full_input_ids: List[int] = list(prefix)
-            positions_by_row: Dict[int, List[int]] = {}
-
-            for local_idx, info in enumerate(included_infos):
-                current_start = len(full_input_ids)
-                full_input_ids.extend(info.traj_block)
-
-                # Positions correspond to the tokens in traj_content (excluding any appended footer token).
-                tok_positions = [current_start + len(info.header) + i for i in range(len(info.traj_content))]
-                positions_by_row[info.traj.row_idx] = tok_positions
-
-                # Add reward/length feedback only if there is a next trajectory in this pack.
-                if local_idx != (len(included_infos) - 1):
-                    full_input_ids.extend(_create_tokenized_message("user", info.reward_tokens_full))
-
-            if len(full_input_ids) > max_length:
-                raise RuntimeError(
-                    f"Internal error: packed sequence length {len(full_input_ids)} exceeds max_length={max_length}."
-                )
-
-            device = next(model.parameters()).device
-            input_ids_t = torch.tensor(full_input_ids, dtype=torch.long, device=device).unsqueeze(0)
-            attention_mask_t = torch.ones_like(input_ids_t, dtype=torch.long, device=device)
-
-            with autocast_ctx:
-                logits_all = _score_packed_sequence(
-                    model,
-                    input_ids=input_ids_t,
-                    attention_mask=attention_mask_t,
-                    distribution_token_id=distribution_token_id,
-                    num_bins=num_bins,
-                    num_length_bins=num_length_bins,
-                    correct_reward_index=correct_reward_index,
-                    length_midpoints=length_midpoints,
-                )
-
-            # Extract and store outputs for trajectories in this pack.
-            for info in included_infos:
-                row_idx = info.traj.row_idx
-                if not label_all and rows_to_label is not None and row_idx not in rows_to_label:
-                    continue
-
-                L_orig = len(info.traj.response_ids)
-                tok_positions = positions_by_row.get(row_idx, [])
-                p_list, e_list = _extract_token_lists(
-                    logits_all,
-                    positions=tok_positions,
-                    num_bins=num_bins,
-                    num_length_bins=num_length_bins,
-                    correct_reward_index=correct_reward_index,
-                    length_midpoints=length_midpoints,
-                )
-
-                # If we truncated content to fit, positions cover only the prefix; pad the remainder with NaNs.
-                if len(p_list) < L_orig:
-                    pad = [float("nan")] * (L_orig - len(p_list))
-                    p_list = p_list + pad
-                    e_list = e_list + pad
-                out_p_correct[row_idx] = p_list
-                out_expected[row_idx] = e_list
-
-        # Remove processed suffix trajectories from remaining.
-        remaining = [t for t in remaining if t.row_idx not in included_row_ids]
-        if remaining_to_label is not None:
-            remaining_to_label.difference_update(included_row_ids)
-
-    return out_p_correct, out_expected
-
-
 def _row_group_range(num_row_groups: int, *, rank: int, world: int) -> Tuple[int, int]:
     start = (num_row_groups * rank) // world
     end = (num_row_groups * (rank + 1)) // world
     return start, end
 
 
-def _iter_row_groups(
-    pf: pq.ParquetFile, *, start_rg: int, batch_size: int
-) -> Iterable[Tuple[int, pa.RecordBatch]]:
+def _iter_row_groups(pf: pq.ParquetFile, *, start_rg: int, batch_size: int) -> Iterable[Tuple[int, pa.RecordBatch]]:
     for rg in range(start_rg, pf.num_row_groups):
         for rb in pf.iter_batches(row_groups=[rg], batch_size=batch_size):
             yield rg, rb
@@ -701,7 +584,6 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
     start_t = time.perf_counter()
     processed_groups = 0
 
-    # State for building contiguous prompt groups.
     current_prompt_idx = None
     current_group_start_rg = None
     current_batches: List[pa.RecordBatch] = []
@@ -714,11 +596,11 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
             current_batches = []
             return
 
-        # Only process groups whose *first seen* row group lies in this rank's primary range.
         should_process = (current_group_start_rg is not None) and (start_rg <= current_group_start_rg < end_rg)
 
         if should_process:
             table = pa.Table.from_batches(current_batches, schema=pf.schema_arrow)
+
             prompt_vals = table.column(table.schema.get_field_index("prompt")).to_pylist()
             prompt = ""
             for x in prompt_vals:
@@ -731,69 +613,102 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
 
             trajectories: List[_Trajectory] = []
             for i_row, (toks, r) in enumerate(zip(output_token_ids, reward_vals)):
-                if toks is None:
-                    toks_list: List[int] = []
-                else:
-                    toks_list = list(toks)
+                toks_list = list(toks) if toks is not None else []
                 reward = float(r) if r is not None else 0.0
                 reward = max(0.0, min(1.0, reward))
                 trajectories.append(_Trajectory(row_idx=i_row, response_ids=toks_list, reward=reward))
 
-            rows_to_label: set[int] | None
+            n_rows = len(trajectories)
+            ctx_infos = _build_ctx_infos(trajectories, tokenizer)
+
+            rows_to_label: Optional[Set[int]]
             if cfg.label_rollouts_per_prompt < 0:
                 rows_to_label = None
             else:
                 k = int(cfg.label_rollouts_per_prompt)
-                n_rows = len(trajectories)
                 if k <= 0:
                     rows_to_label = set()
                 elif k >= n_rows:
                     rows_to_label = None
                 else:
-                    import random
-
                     rng = random.Random(int(cfg.label_seed) + int(current_prompt_idx))
                     rows_to_label = set(rng.sample(range(n_rows), k))
 
-            p_correct_lists, expected_lists = _pack_and_score_prompt_group(
-                model,
-                tokenizer,
-                prompt=prompt,
-                trajectories=trajectories,
-                max_length=cfg.max_length,
-                shuffle_seed=cfg.shuffle_seed,
-                prompt_idx=int(current_prompt_idx),
-                rows_to_label=rows_to_label,
-                distribution_token_id=cfg.distribution_token_id,
-                num_bins=num_bins,
-                num_length_bins=num_length_bins,
-                correct_reward_index=correct_reward_index,
-                length_midpoints=length_mids,
-                autocast_ctx=autocast_ctx,
-            )
+            out_p_correct: List[Optional[List[float]]] = [None for _ in range(n_rows)]
+            out_expected: List[Optional[List[float]]] = [None for _ in range(n_rows)]
 
-            n_rows = table.num_rows
+            label_all = rows_to_label is None
+
+            for target_idx in range(n_rows):
+                if (not label_all) and (rows_to_label is not None) and (target_idx not in rows_to_label):
+                    continue
+
+                orig_len = len(trajectories[target_idx].response_ids)
+                if orig_len == 0:
+                    out_p_correct[target_idx] = []
+                    out_expected[target_idx] = []
+                    continue
+
+                full_input_ids, target_positions, trunc_len, _orig_len_check = _pack_target_last(
+                    tokenizer,
+                    prompt=prompt,
+                    trajectories=trajectories,
+                    ctx_infos=ctx_infos,
+                    target_idx=target_idx,
+                    max_length=cfg.max_length,
+                    shuffle_seed=cfg.shuffle_seed,
+                    prompt_idx=int(current_prompt_idx),
+                )
+
+                if trunc_len <= 0 or not target_positions:
+                    out_p_correct[target_idx] = [float("nan")] * orig_len
+                    out_expected[target_idx] = [float("nan")] * orig_len
+                    continue
+
+                input_ids_t = torch.tensor(full_input_ids, dtype=torch.long, device=device).unsqueeze(0)
+                attention_mask_t = torch.ones_like(input_ids_t, dtype=torch.long, device=device)
+
+                with autocast_ctx:
+                    p_list, e_list = _predict_for_positions(
+                        model,
+                        input_ids=input_ids_t,
+                        attention_mask=attention_mask_t,
+                        positions=target_positions,
+                        distribution_token_id=cfg.distribution_token_id,
+                        num_bins=num_bins,
+                        num_length_bins=num_length_bins,
+                        correct_reward_index=correct_reward_index,
+                        length_midpoints=length_mids,
+                    )
+
+                if len(p_list) < orig_len:
+                    pad = [float("nan")] * (orig_len - len(p_list))
+                    p_list = p_list + pad
+                    e_list = e_list + pad
+
+                out_p_correct[target_idx] = p_list
+                out_expected[target_idx] = e_list
+
             if rows_to_label is None:
                 model_ids = [cfg.critic_model_id] * n_rows
             else:
-                model_ids = [cfg.critic_model_id if (p_correct_lists[i] is not None) else None for i in range(n_rows)]
+                model_ids = [cfg.critic_model_id if (out_p_correct[i] is not None) else None for i in range(n_rows)]
+
             table = table.append_column("critic_model_id", pa.array(model_ids, type=pa.string()))
-            table = table.append_column("critic_p_correct", pa.array(p_correct_lists, type=pa.list_(pa.float32())))
+            table = table.append_column("critic_p_correct", pa.array(out_p_correct, type=pa.list_(pa.float32())))
             table = table.append_column(
-                "critic_expected_tokens_remaining", pa.array(expected_lists, type=pa.list_(pa.float32()))
+                "critic_expected_tokens_remaining", pa.array(out_expected, type=pa.list_(pa.float32()))
             )
 
             writer.write_table(table, row_group_size=None)
             processed_groups += 1
 
             if cfg.max_groups > 0 and processed_groups >= cfg.max_groups:
-                # Signal early-stop by clearing state and raising a sentinel.
                 current_prompt_idx = None
                 current_group_start_rg = None
                 current_batches = []
                 raise StopIteration
 
-        # Reset state.
         current_prompt_idx = None
         current_group_start_rg = None
         current_batches = []
@@ -804,7 +719,6 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
             if rg >= end_rg:
                 past_primary = True
 
-            # Split record batch into runs of constant prompt_idx.
             prompt_idx_col = rb.column(rb.schema.get_field_index("prompt_idx")).to_pylist()
             n = len(prompt_idx_col)
             i = 0
@@ -829,12 +743,9 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
 
                 i = j
 
-            # If we've passed the primary row-group range and are not inside a group that started in-range,
-            # we can stop (any subsequent groups belong to the next rank).
             if past_primary and current_prompt_idx is None:
                 break
 
-        # Flush trailing group if any.
         flush_group()
     except StopIteration:
         pass
@@ -894,15 +805,15 @@ def main() -> None:
     merged, found, expected = _merge_shards(cfg.out_parquet, dp_size=dp, allow_partial=cfg.allow_partial_merge)
     if not merged:
         if found == 0:
-            print("✗ No shards were produced; check worker errors above.", flush=True)
+            print("No shards produced.", flush=True)
         else:
-            print(f"✗ Shards missing ({found}/{expected}).", flush=True)
+            print(f"Shards missing ({found}/{expected}).", flush=True)
         if any_fail or found != expected:
             sys.exit(1)
         return
 
     suffix = "" if found == expected else f" (PARTIAL: {found}/{expected} shards)"
-    print(f"✓ Wrote {cfg.out_parquet}{suffix}", flush=True)
+    print(f"Wrote {cfg.out_parquet}{suffix}", flush=True)
 
 
 if __name__ == "__main__":
