@@ -2,10 +2,18 @@
 """
 Posterior Policy Distillation (PPD) policy training from pre-generated rollouts.
 
-This script trains a causal LM policy using a Parquet dataset produced by:
+This script trains a causal LM policy from a Parquet dataset produced by:
   1) `src/data.py` (rollout generation; provides `input_ids` + `label_positions`)
   2) `src/label_ref_logprobs.py` (adds `ref_logprobs`)
   3) `src/label_in_context_critic.py` (adds `critic_p_correct`)
+
+To make training fast and simple, you can also run an in-script preprocessing step
+that writes a minimal "train-ready" parquet with ONLY:
+  - `input_ids`
+  - `labels` (same length, -100 where no loss)
+  - `ref_logprobs` (one per output token; suffix-aligned)
+  - `advantages`  (one per output token; suffix-aligned)
+via `--preprocess-out`.
 
 Key idea:
   - Treat stored `ref_logprobs` as log π_old(a_t | s_t) for the sampled tokens.
@@ -23,11 +31,9 @@ Key idea:
   - Optimize the importance-sampling policy-gradient objective on fixed actions:
         L = -E_{x ~ π_old}[ (π_theta/π_old) * A_detached ]
 
-Changes vs original:
-  - Right-truncate input_ids to --max-seq-len (keeps prompt/prefix).
-  - Increase DDP timeout via --ddp-timeout-seconds.
-  - Remove advantage clipping.
-  - Remove KL regularization term.
+Notes:
+  - Preprocessing validates that output tokens form a contiguous suffix so training can use fast slicing.
+  - Training uses a fused cross-entropy path to get per-token logprobs.
 """
 
 from __future__ import annotations
@@ -39,7 +45,7 @@ import os
 import random
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, List, Sequence, Tuple
 
 import pyarrow as pa
@@ -47,6 +53,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
@@ -104,6 +111,15 @@ class Config:
     # NEW
     max_seq_len: int
     ddp_timeout_seconds: int
+
+    # Preprocess / simplified training
+    preprocess_out: str
+    preprocess_only: bool
+    overwrite_preprocess_out: bool
+    max_rows: int
+    preprocess_row_group_size: int
+    columns_labels: str
+    columns_advantages: str
 
 
 def parse_args() -> Config:
@@ -173,6 +189,36 @@ def parse_args() -> Config:
         help="DDP/NCCL process group timeout in seconds.",
     )
 
+    # Preprocess / simplified training
+    p.add_argument(
+        "--preprocess-out",
+        default="",
+        help=(
+            "If set, preprocess --data-path into this parquet containing ONLY: "
+            "input_ids, labels, ref_logprobs, advantages; then train on it."
+        ),
+    )
+    p.add_argument("--preprocess-only", action="store_true", help="Run preprocessing then exit (no training).")
+    p.add_argument(
+        "--overwrite-preprocess-out",
+        action="store_true",
+        help="Allow overwriting an existing --preprocess-out file.",
+    )
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=-1,
+        help="If >0, limit rows processed (preprocess: total rows; train: rows per rank).",
+    )
+    p.add_argument(
+        "--preprocess-row-group-size",
+        type=int,
+        default=1024,
+        help="Target parquet row group size (rows) when writing --preprocess-out.",
+    )
+    p.add_argument("--col-labels", default="labels", help="Column name for labels in preprocessed parquet.")
+    p.add_argument("--col-advantages", default="advantages", help="Column name for advantages in preprocessed parquet.")
+
     args = p.parse_args()
 
     if args.micro_batch_size <= 0:
@@ -191,6 +237,10 @@ def parse_args() -> Config:
         raise ValueError("--max-seq-len must be >= 0")
     if int(args.ddp_timeout_seconds) < 60:
         raise ValueError("--ddp-timeout-seconds must be >= 60")
+    if int(args.max_rows) == 0 or int(args.max_rows) < -1:
+        raise ValueError("--max-rows must be -1 (all) or > 0")
+    if int(args.preprocess_row_group_size) <= 0:
+        raise ValueError("--preprocess-row-group-size must be > 0")
 
     return Config(
         model_id=str(args.model_id),
@@ -228,11 +278,19 @@ def parse_args() -> Config:
         columns_p_correct=str(args.col_p_correct),
         max_seq_len=int(args.max_seq_len),
         ddp_timeout_seconds=int(args.ddp_timeout_seconds),
+
+        preprocess_out=str(args.preprocess_out),
+        preprocess_only=bool(args.preprocess_only),
+        overwrite_preprocess_out=bool(args.overwrite_preprocess_out),
+        max_rows=int(args.max_rows),
+        preprocess_row_group_size=int(args.preprocess_row_group_size),
+        columns_labels=str(args.col_labels),
+        columns_advantages=str(args.col_advantages),
     )
 
 
 def _iter_assigned_batches(
-    pf: pq.ParquetFile, *, rank: int, world: int, batch_size: int
+    pf: pq.ParquetFile, *, rank: int, world: int, batch_size: int, columns: Sequence[str] | None = None
 ) -> Iterable[pa.RecordBatch]:
     """
     Yield record batches assigned to this worker.
@@ -240,12 +298,12 @@ def _iter_assigned_batches(
     """
     if pf.num_row_groups >= world:
         row_groups = [rg for rg in range(pf.num_row_groups) if (rg % world) == rank]
-        yield from pf.iter_batches(batch_size=batch_size, row_groups=row_groups)
+        yield from pf.iter_batches(batch_size=batch_size, row_groups=row_groups, columns=list(columns) if columns else None)
         return
 
     # Fallback: row-wise striding across full file.
     row_offset = 0
-    for batch in pf.iter_batches(batch_size=batch_size):
+    for batch in pf.iter_batches(batch_size=batch_size, columns=list(columns) if columns else None):
         n = batch.num_rows
         take_idx = [i for i in range(n) if ((row_offset + i) % world) == rank]
         row_offset += n
@@ -262,7 +320,15 @@ def _as_list(x):
     return list(x)
 
 
-class ParquetRolloutDataset(IterableDataset):
+class PreprocessedParquetDataset(IterableDataset):
+    """
+    Iterable dataset over a preprocessed parquet file containing:
+      - input_ids
+      - labels (unused at train time; kept for auditability)
+      - ref_logprobs (suffix-aligned, one per output token)
+      - advantages  (suffix-aligned, one per output token)
+    """
+
     def __init__(
         self,
         parquet_path: str,
@@ -272,48 +338,62 @@ class ParquetRolloutDataset(IterableDataset):
         seed: int,
         arrow_batch_size: int,
         shuffle: bool,
+        max_rows: int,
         col_input_ids: str,
-        col_label_positions: str,
+        col_labels: str,
         col_ref_logprobs: str,
-        col_p_correct: str,
+        col_advantages: str,
     ) -> None:
         super().__init__()
-        self.parquet_path = parquet_path
+        self.parquet_path = str(parquet_path)
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.seed = int(seed)
         self.arrow_batch_size = int(arrow_batch_size)
         self.shuffle = bool(shuffle)
+        self.max_rows = int(max_rows)
         self.col_input_ids = str(col_input_ids)
-        self.col_label_positions = str(col_label_positions)
+        self.col_labels = str(col_labels)
         self.col_ref_logprobs = str(col_ref_logprobs)
-        self.col_p_correct = str(col_p_correct)
+        self.col_advantages = str(col_advantages)
         self.epoch = 0
 
         pf = pq.ParquetFile(self.parquet_path)
         names = set(pf.schema_arrow.names)
-        missing = [c for c in [self.col_input_ids, self.col_label_positions, self.col_ref_logprobs, self.col_p_correct] if c not in names]
+        missing = [c for c in [self.col_input_ids, self.col_labels, self.col_ref_logprobs, self.col_advantages] if c not in names]
         if missing:
-            raise ValueError(f"Parquet missing required columns: {missing}. Present columns: {sorted(names)}")
+            raise ValueError(
+                f"Preprocessed parquet missing required columns: {missing}. "
+                f"Present columns: {sorted(names)}. "
+                "If this is a raw rollout parquet, run with --preprocess-out first."
+            )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
     def __iter__(self):
         pf = pq.ParquetFile(self.parquet_path)
-        schema = pf.schema_arrow
-        idx_input = schema.get_field_index(self.col_input_ids)
-        idx_pos = schema.get_field_index(self.col_label_positions)
-        idx_ref = schema.get_field_index(self.col_ref_logprobs)
-        idx_p = schema.get_field_index(self.col_p_correct)
 
         rng = random.Random(self.seed + 1_000_003 * self.epoch + 97 * self.rank)
 
-        for rb in _iter_assigned_batches(pf, rank=self.rank, world=self.world_size, batch_size=self.arrow_batch_size):
+        cols = [self.col_input_ids, self.col_ref_logprobs, self.col_advantages]
+        processed = 0
+
+        for rb in _iter_assigned_batches(
+            pf,
+            rank=self.rank,
+            world=self.world_size,
+            batch_size=self.arrow_batch_size,
+            columns=cols,
+        ):
+            rb_names = list(rb.schema.names)
+            idx_input = rb_names.index(self.col_input_ids)
+            idx_ref = rb_names.index(self.col_ref_logprobs)
+            idx_adv = rb_names.index(self.col_advantages)
+
             input_ids_col = rb.column(idx_input).to_pylist()
-            label_pos_col = rb.column(idx_pos).to_pylist()
             ref_lp_col = rb.column(idx_ref).to_pylist()
-            p_corr_col = rb.column(idx_p).to_pylist()
+            adv_col = rb.column(idx_adv).to_pylist()
 
             n = rb.num_rows
             order = list(range(n))
@@ -321,11 +401,13 @@ class ParquetRolloutDataset(IterableDataset):
                 rng.shuffle(order)
 
             for i in order:
+                if self.max_rows > 0 and processed >= self.max_rows:
+                    return
+                processed += 1
                 yield {
                     "input_ids": _as_list(input_ids_col[i]),
-                    "label_positions": _as_list(label_pos_col[i]),
                     "ref_logprobs": _as_list(ref_lp_col[i]),
-                    "critic_p_correct": _as_list(p_corr_col[i]),
+                    "advantages": _as_list(adv_col[i]),
                 }
 
 
@@ -383,88 +465,228 @@ def _compute_advantages(
     return out
 
 
-def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, max_seq_len: int):
+def _preprocess_parquet(cfg: Config) -> str:
+    """
+    Create a simplified parquet file for fast training.
+
+    Output columns:
+      - input_ids: List[int32]
+      - labels:    List[int32] (same length; -100 for no loss)
+      - ref_logprobs: List[float32] (one per output token; suffix-aligned)
+      - advantages:   List[float32] (one per output token; suffix-aligned)
+    """
+    out_path = str(cfg.preprocess_out or "").strip()
+    if not out_path:
+        raise ValueError("_preprocess_parquet called with empty cfg.preprocess_out")
+
+    in_abs = os.path.abspath(cfg.data_path)
+    out_abs = os.path.abspath(out_path)
+    if in_abs == out_abs:
+        raise ValueError("Refusing to overwrite --data-path; choose a different --preprocess-out.")
+
+    if os.path.exists(out_path) and not cfg.overwrite_preprocess_out:
+        raise FileExistsError(f"--preprocess-out already exists: {out_path} (pass --overwrite-preprocess-out to overwrite)")
+
+    pf = pq.ParquetFile(cfg.data_path)
+    names = set(pf.schema_arrow.names)
+    required_in = [cfg.columns_input_ids, cfg.columns_label_positions, cfg.columns_ref_logprobs, cfg.columns_p_correct]
+    missing = [c for c in required_in if c not in names]
+    if missing:
+        raise ValueError(f"Cannot preprocess: input parquet missing columns: {missing}. Present: {sorted(names)}")
+
+    out_schema = pa.schema(
+        [
+            pa.field(cfg.columns_input_ids, pa.list_(pa.int32())),
+            pa.field(cfg.columns_labels, pa.list_(pa.int32())),
+            pa.field(cfg.columns_ref_logprobs, pa.list_(pa.float32())),
+            pa.field(cfg.columns_advantages, pa.list_(pa.float32())),
+        ]
+    )
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    writer = pq.ParquetWriter(out_path, out_schema)
+
+    processed = 0
+    t0 = time.perf_counter()
+
+    try:
+        for rb in pf.iter_batches(batch_size=cfg.arrow_batch_size, columns=required_in):
+            if cfg.max_rows > 0 and processed >= cfg.max_rows:
+                break
+
+            rb_names = list(rb.schema.names)
+            idx_input = rb_names.index(cfg.columns_input_ids)
+            idx_pos = rb_names.index(cfg.columns_label_positions)
+            idx_ref = rb_names.index(cfg.columns_ref_logprobs)
+            idx_p = rb_names.index(cfg.columns_p_correct)
+
+            input_ids_col = rb.column(idx_input).to_pylist()
+            label_pos_col = rb.column(idx_pos).to_pylist()
+            ref_lp_col = rb.column(idx_ref).to_pylist()
+            p_corr_col = rb.column(idx_p).to_pylist()
+
+            n = rb.num_rows
+            if cfg.max_rows > 0:
+                n = min(n, cfg.max_rows - processed)
+
+            out_input_ids: List[List[int]] = []
+            out_labels: List[List[int]] = []
+            out_ref: List[List[float]] = []
+            out_adv: List[List[float]] = []
+
+            for i in range(n):
+                ids = _as_list(input_ids_col[i])
+                if cfg.max_seq_len and cfg.max_seq_len > 0 and len(ids) > cfg.max_seq_len:
+                    ids = ids[: cfg.max_seq_len]
+                seq_len = len(ids)
+
+                pos_raw = _as_list(label_pos_col[i])
+                pos: List[int] = []
+                for x in pos_raw:
+                    try:
+                        pos.append(int(x))
+                    except Exception:
+                        pos.append(-1)
+
+                old_raw = _as_list(ref_lp_col[i])
+                old_lp: List[float] = []
+                for x in old_raw:
+                    try:
+                        old_lp.append(float(x))
+                    except Exception:
+                        old_lp.append(float("nan"))
+
+                p_raw = _as_list(p_corr_col[i])
+                p_corr_f: List[float] = []
+                for x in p_raw:
+                    try:
+                        p_corr_f.append(float(x))
+                    except Exception:
+                        p_corr_f.append(float("nan"))
+
+                # Common length among per-output lists
+                L0 = min(len(pos), len(old_lp), len(p_corr_f))
+                pos = pos[:L0]
+                old_lp = old_lp[:L0]
+                p_corr_f = p_corr_f[:L0]
+
+                # Keep only tokens whose label_position is inside (possibly truncated) ids
+                keep = [t for t, p in enumerate(pos) if 0 <= int(p) < seq_len]
+                pos = [pos[t] for t in keep]
+                old_lp = [old_lp[t] for t in keep]
+                p_corr_f = [p_corr_f[t] for t in keep]
+
+                # Validate output suffix contiguity so training can use fast slicing.
+                if pos:
+                    prompt_len = int(pos[0])
+                    if prompt_len <= 0:
+                        raise ValueError(
+                            f"Invalid prompt_len={prompt_len} inferred from label_positions; "
+                            "need at least 1 token of context for causal LM logprobs."
+                        )
+                    if int(pos[-1]) != seq_len - 1:
+                        raise ValueError(
+                            f"label_positions do not reach end of input_ids after truncation: "
+                            f"last={int(pos[-1])}, seq_len={seq_len}"
+                        )
+                    for j, p in enumerate(pos):
+                        if int(p) != prompt_len + j:
+                            raise ValueError(
+                                "label_positions are not a contiguous suffix; cannot use fast suffix alignment. "
+                                f"Expected {prompt_len + j} at offset {j}, got {int(p)}."
+                            )
+                else:
+                    prompt_len = seq_len
+
+                adv = _compute_advantages(p_corr_f, tau=float(cfg.adv_smoothing_tau), gae_lambda=float(cfg.gae_lambda))
+                if len(adv) != len(old_lp):
+                    raise ValueError(f"advantages/ref_logprobs length mismatch: {len(adv)} vs {len(old_lp)}")
+
+                if any(not math.isfinite(float(x)) for x in old_lp):
+                    raise ValueError("Found non-finite ref_logprobs after truncation/filtering.")
+                if any(not math.isfinite(float(x)) for x in adv):
+                    raise ValueError("Found non-finite advantages after computation.")
+
+                labels = [-100] * seq_len
+                for p in pos:
+                    if p < 0 or p >= seq_len:
+                        continue
+                    labels[int(p)] = int(ids[int(p)])
+                if seq_len > 0:
+                    labels[0] = -100  # causal LM has no label for position 0
+
+                # Final sanity: output tokens must be the trailing segment.
+                output_len = len(old_lp)
+                if pos and output_len != max(0, seq_len - prompt_len):
+                    raise ValueError(
+                        f"Output length mismatch: len(ref_logprobs)={output_len} but "
+                        f"seq_len={seq_len}, prompt_len={prompt_len} (expected {max(0, seq_len - prompt_len)})."
+                    )
+
+                out_input_ids.append([int(x) for x in ids])
+                out_labels.append([int(x) for x in labels])
+                out_ref.append([float(x) for x in old_lp])
+                out_adv.append([float(x) for x in adv])
+
+            if out_input_ids:
+                table = pa.Table.from_pydict(
+                    {
+                        cfg.columns_input_ids: out_input_ids,
+                        cfg.columns_labels: out_labels,
+                        cfg.columns_ref_logprobs: out_ref,
+                        cfg.columns_advantages: out_adv,
+                    },
+                    schema=out_schema,
+                )
+                writer.write_table(table, row_group_size=int(cfg.preprocess_row_group_size))
+                processed += len(out_input_ids)
+
+        elapsed = time.perf_counter() - t0
+        print(f"[preprocess] wrote {processed} rows to {out_path} in {elapsed:.2f}s", flush=True)
+        return out_path
+    finally:
+        writer.close()
+
+
+def _make_preprocessed_collate_fn(*, pad_token_id: int):
     def collate(rows: List[dict]) -> dict:
         if not rows:
             return {}
 
         max_len = 0
-
         input_ids_list: List[List[int]] = []
-        label_positions: List[List[int]] = []
         ref_logprobs: List[List[float]] = []
         advantages: List[List[float]] = []
+        seq_lens: List[int] = []
+        prompt_lens: List[int] = []
         num_tokens = 0
 
         for r in rows:
-            ids = _as_list(r.get("input_ids"))
+            ids = [int(x) for x in _as_list(r.get("input_ids"))]
+            old_lp = [float(x) for x in _as_list(r.get("ref_logprobs"))]
+            adv = [float(x) for x in _as_list(r.get("advantages"))]
 
-            if max_seq_len and max_seq_len > 0 and len(ids) > max_seq_len:
-                ids = ids[:max_seq_len]
+            if len(old_lp) != len(adv):
+                raise ValueError(f"ref_logprobs/advantages length mismatch: {len(old_lp)} vs {len(adv)}")
 
-            pos_raw = _as_list(r.get("label_positions"))
-            pos: List[int] = []
-            for x in pos_raw:
-                try:
-                    pos.append(int(x))
-                except Exception:
-                    pos.append(-1)
-
-            old_raw = _as_list(r.get("ref_logprobs"))
-            old_lp: List[float] = []
-            for x in old_raw:
-                try:
-                    old_lp.append(float(x))
-                except Exception:
-                    old_lp.append(float("nan"))
-
-            p_corr = _as_list(r.get("critic_p_correct"))
-            p_corr_f: List[float] = []
-            for x in p_corr:
-                try:
-                    p_corr_f.append(float(x))
-                except Exception:
-                    p_corr_f.append(float("nan"))
-
-            # Common length among per-output lists
-            L0 = min(len(pos), len(old_lp), len(p_corr_f))
-            pos = pos[:L0]
-            old_lp = old_lp[:L0]
-            p_corr_f = p_corr_f[:L0]
-
-            # Keep only tokens whose label_position is inside truncated ids
             seq_len = len(ids)
-            keep = [t for t, p in enumerate(pos) if 0 <= int(p) < seq_len]
-            if keep:
-                pos = [pos[t] for t in keep]
-                old_lp = [old_lp[t] for t in keep]
-                p_corr_f = [p_corr_f[t] for t in keep]
-            else:
-                pos = []
-                old_lp = []
-                p_corr_f = []
+            out_len = len(old_lp)
+            prompt_len = seq_len - out_len
 
-            adv = _compute_advantages(p_corr_f, tau=tau, gae_lambda=gae_lambda)
+            if prompt_len < 0:
+                raise ValueError(f"Invalid row: len(input_ids)={seq_len} < len(ref_logprobs)={out_len}")
+            if out_len > 0 and prompt_len <= 0:
+                raise ValueError("Need at least 1 prompt token when training on output tokens (prompt_len must be > 0).")
+            if seq_len > 0 and ids[0] < 0:
+                raise ValueError("input_ids contains a negative token id.")
 
             input_ids_list.append(ids)
-            label_positions.append(pos)
             ref_logprobs.append(old_lp)
             advantages.append(adv)
-
-            max_len = max(max_len, len(ids))
-
-            # Count trainable tokens (matches _compute_policy_loss filtering)
-            for t in range(min(len(pos), len(old_lp), len(adv))):
-                a = float(adv[t])
-                if not math.isfinite(a):
-                    continue
-                o = float(old_lp[t])
-                if not math.isfinite(o):
-                    continue
-                p = int(pos[t])
-                if p <= 0 or p >= seq_len:
-                    continue
-                num_tokens += 1
+            seq_lens.append(seq_len)
+            prompt_lens.append(prompt_len)
+            max_len = max(max_len, seq_len)
+            num_tokens += out_len
 
         input_ids = torch.full((len(rows), max_len), int(pad_token_id), dtype=torch.long)
         attention_mask = torch.zeros((len(rows), max_len), dtype=torch.long)
@@ -478,7 +700,8 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, max_se
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "label_positions": label_positions,
+            "seq_lens": seq_lens,
+            "prompt_lens": prompt_lens,
             "ref_logprobs": ref_logprobs,
             "advantages": advantages,
             "num_tokens": int(num_tokens),
@@ -514,52 +737,86 @@ def _lr_schedule(
     return float(min_lr + cosine * (base_lr - min_lr))
 
 
-def _compute_policy_loss(
+def _compute_policy_loss_aligned_suffix(
     *,
     token_logprobs: torch.Tensor,  # [B, S-1]
-    attention_mask: torch.Tensor,  # [B, S]
-    label_positions: Sequence[Sequence[int]],
+    seq_lens: Sequence[int],
+    prompt_lens: Sequence[int],
     ref_logprobs: Sequence[Sequence[float]],
     advantages: Sequence[Sequence[float]],
     ppo_clip_range: float,
 ) -> Tuple[torch.Tensor, dict]:
+    """
+    Fast path for the common case where output tokens are a contiguous suffix.
+
+    For each row:
+      - prompt_len = len(input_ids) - len(ref_logprobs)
+      - output token positions are [prompt_len .. seq_len-1]
+      - token_logprobs[:, t-1] corresponds to log p(x_t | x_<t)
+    """
     device = token_logprobs.device
-    bsz = token_logprobs.shape[0]
+    bsz = int(token_logprobs.shape[0])
 
-    flat_b: List[int] = []
-    flat_s: List[int] = []
-    flat_old: List[float] = []
-    flat_adv: List[float] = []
+    # Grad-connected accumulator for the loss.
+    policy_sum = token_logprobs.sum() * 0.0
+    kl_sum = token_logprobs.sum() * 0.0
+    adv_sum = token_logprobs.sum() * 0.0
+    adv_abs_sum = token_logprobs.sum() * 0.0
+    ratio_sum = token_logprobs.sum() * 0.0
+    clip_count = token_logprobs.new_zeros((), dtype=torch.float32)
 
-    lengths = attention_mask.sum(dim=1).tolist()
+    tokens = 0
 
     for i in range(bsz):
-        seq_len = int(lengths[i])
-        pos = list(label_positions[i] or [])
-        old = list(ref_logprobs[i] or [])
-        adv = list(advantages[i] or [])
-        L = min(len(pos), len(old), len(adv))
+        out_len = len(ref_logprobs[i] or [])
+        if out_len == 0:
+            continue
 
-        for t in range(L):
-            a = float(adv[t])
-            if not (a == a):  # NaN
-                continue
-            o = float(old[t])
-            if not math.isfinite(o):
-                continue
+        seq_len = int(seq_lens[i])
+        prompt_len = int(prompt_lens[i])
 
-            p = int(pos[t])
-            if p <= 0 or p >= seq_len:
-                continue
-            if p - 1 >= token_logprobs.shape[1]:
-                continue
+        start = prompt_len - 1
+        end = start + out_len
 
-            flat_b.append(i)
-            flat_s.append(p - 1)
-            flat_old.append(o)
-            flat_adv.append(a)
+        if start < 0:
+            raise ValueError(f"Invalid prompt_len={prompt_len} for seq_len={seq_len} (need prompt_len>=1 when out_len>0).")
+        if end > (seq_len - 1) or end > int(token_logprobs.shape[1]):
+            raise ValueError(
+                f"Suffix slice out of range: start={start}, end={end}, seq_len={seq_len}, token_logprobs_Sm1={int(token_logprobs.shape[1])}"
+            )
 
-    if not flat_b:
+        new_lp = token_logprobs[i, start:end].to(torch.float32)
+        old_lp = torch.tensor(ref_logprobs[i], device=device, dtype=torch.float32)
+        adv_t = torch.tensor(advantages[i], device=device, dtype=torch.float32)
+
+        if old_lp.numel() != new_lp.numel() or adv_t.numel() != new_lp.numel():
+            raise ValueError(
+                f"Length mismatch for row {i}: new_lp={int(new_lp.numel())} old_lp={int(old_lp.numel())} adv={int(adv_t.numel())}"
+            )
+
+        log_ratio = new_lp - old_lp
+        ratio = torch.exp(log_ratio)
+
+        if ppo_clip_range and ppo_clip_range > 0.0:
+            lo = 1.0 - float(ppo_clip_range)
+            hi = 1.0 + float(ppo_clip_range)
+            clipped = (ratio > hi) | (ratio < lo)
+            clip_count = clip_count + clipped.to(torch.float32).sum()
+            ratio_used = torch.clamp(ratio, lo, hi)
+        else:
+            ratio_used = ratio
+
+        adv_final = (adv_t - log_ratio).detach()
+        policy_tokens = -(ratio_used * adv_final)
+
+        policy_sum = policy_sum + policy_tokens.sum()
+        kl_sum = kl_sum + (old_lp - new_lp).sum()
+        adv_sum = adv_sum + adv_final.sum()
+        adv_abs_sum = adv_abs_sum + adv_final.abs().sum()
+        ratio_sum = ratio_sum + ratio.sum()
+        tokens += int(new_lp.numel())
+
+    if tokens == 0:
         zero = token_logprobs.sum() * 0.0
         z = zero.detach()
         return zero, {
@@ -572,40 +829,24 @@ def _compute_policy_loss(
             "ratio_mean": z,
         }
 
-    b_idx = torch.tensor(flat_b, device=device, dtype=torch.long)
-    s_idx = torch.tensor(flat_s, device=device, dtype=torch.long)
-    new_lp = token_logprobs[b_idx, s_idx].to(torch.float32)
-    old_lp = torch.tensor(flat_old, device=device, dtype=torch.float32)
-    adv_t = torch.tensor(flat_adv, device=device, dtype=torch.float32)
-
-    log_ratio = new_lp - old_lp
-    ratio = torch.exp(log_ratio)
-
-    if ppo_clip_range and ppo_clip_range > 0.0:
-        ratio_clipped = torch.clamp(ratio, 1.0 - ppo_clip_range, 1.0 + ppo_clip_range)
-        clip_frac = ((ratio > (1.0 + ppo_clip_range)) | (ratio < (1.0 - ppo_clip_range))).to(torch.float32).mean()
-        ratio_used = ratio_clipped
-    else:
-        clip_frac = ratio.new_tensor(0.0)
-        ratio_used = ratio
-
-    adv_final = (adv_t - log_ratio).detach()
-
-    policy_loss = -(ratio_used * adv_final).mean()
-    total = policy_loss
-
-    approx_kl = (old_lp - new_lp).mean()
+    denom = float(tokens)
+    loss = policy_sum / denom
+    approx_kl = kl_sum / denom
+    adv_mean = adv_sum / denom
+    adv_abs_mean = adv_abs_sum / denom
+    ratio_mean = ratio_sum / denom
+    clip_frac = (clip_count / denom) if (ppo_clip_range and ppo_clip_range > 0.0) else clip_count * 0.0
 
     metrics = {
-        "policy_loss": policy_loss.detach(),
+        "policy_loss": loss.detach(),
         "approx_kl": approx_kl.detach(),
         "clip_frac": clip_frac.detach(),
-        "tokens": int(new_lp.numel()),
-        "adv_mean": adv_final.mean().detach(),
-        "adv_abs_mean": adv_final.abs().mean().detach(),
-        "ratio_mean": ratio.mean().detach(),
+        "tokens": int(tokens),
+        "adv_mean": adv_mean.detach(),
+        "adv_abs_mean": adv_abs_mean.detach(),
+        "ratio_mean": ratio_mean.detach(),
     }
-    return total, metrics
+    return loss, metrics
 
 
 def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
@@ -668,25 +909,21 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     if cfg.compile_mode != "none":
         model = torch.compile(model, mode=cfg.compile_mode)
 
-    dataset = ParquetRolloutDataset(
+    dataset = PreprocessedParquetDataset(
         cfg.data_path,
         rank=rank,
         world_size=world_size,
         seed=cfg.seed,
         arrow_batch_size=cfg.arrow_batch_size,
         shuffle=True,
+        max_rows=cfg.max_rows,
         col_input_ids=cfg.columns_input_ids,
-        col_label_positions=cfg.columns_label_positions,
+        col_labels=cfg.columns_labels,
         col_ref_logprobs=cfg.columns_ref_logprobs,
-        col_p_correct=cfg.columns_p_correct,
+        col_advantages=cfg.columns_advantages,
     )
 
-    collate_fn = _make_collate_fn(
-        pad_token_id=int(tokenizer.pad_token_id),
-        tau=float(cfg.adv_smoothing_tau),
-        gae_lambda=float(cfg.gae_lambda),
-        max_seq_len=int(cfg.max_seq_len),
-    )
+    collate_fn = _make_preprocessed_collate_fn(pad_token_id=int(tokenizer.pad_token_id))
 
     loader = DataLoader(
         dataset,
@@ -709,6 +946,8 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
             total_rows = 0
 
         if total_rows > 0:
+            if cfg.max_rows and cfg.max_rows > 0:
+                total_rows = min(total_rows, int(cfg.max_rows) * int(world_size))
             est_microbatches = (total_rows // max(1, world_size * cfg.micro_batch_size)) * cfg.num_epochs
             est_updates = max(1, est_microbatches // max(1, cfg.grad_accum_steps))
             total_steps = int(est_updates)
@@ -816,16 +1055,20 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                     logits = outputs.logits  # [B, S, V]
 
-                    shift_logits = logits[:, :-1, :]
-                    shift_labels = input_ids[:, 1:]
-                    logit_target = shift_logits.gather(2, shift_labels.unsqueeze(-1)).squeeze(-1)
-                    logsumexp = torch.logsumexp(shift_logits, dim=-1)
-                    token_logprobs = logit_target - logsumexp  # [B, S-1]
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = input_ids[:, 1:].contiguous()
+                    bsz, seqlen_minus1, vocab = shift_logits.shape
+                    flat_nll = F.cross_entropy(
+                        shift_logits.view(-1, vocab),
+                        shift_labels.view(-1),
+                        reduction="none",
+                    )
+                    token_logprobs = (-flat_nll).view(bsz, seqlen_minus1)  # [B, S-1]
 
-                    loss, metrics = _compute_policy_loss(
+                    loss, metrics = _compute_policy_loss_aligned_suffix(
                         token_logprobs=token_logprobs,
-                        attention_mask=attention_mask,
-                        label_positions=batch["label_positions"],
+                        seq_lens=batch["seq_lens"],
+                        prompt_lens=batch["prompt_lens"],
                         ref_logprobs=batch["ref_logprobs"],
                         advantages=batch["advantages"],
                         ppo_clip_range=cfg.ppo_clip_range,
@@ -955,6 +1198,12 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
 def main() -> None:
     cfg = parse_args()
+
+    if cfg.preprocess_out:
+        out_path = _preprocess_parquet(cfg)
+        if cfg.preprocess_only:
+            return
+        cfg = replace(cfg, data_path=out_path)
 
     ngpus = torch.cuda.device_count()
     if cfg.dp_size and cfg.dp_size > 0:
