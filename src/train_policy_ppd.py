@@ -23,15 +23,11 @@ Key idea:
   - Optimize the importance-sampling policy-gradient objective on fixed actions:
         L = -E_{x ~ π_old}[ (π_theta/π_old) * A_detached ]
 
-Optional KL regularization:
-  - Since only reference action logprobs are available (not full ref logits),
-    we add a simple, always-nonnegative estimator:
-        kl_term = exp(d) - 1 - d,  where d = logπ_theta - logπ_old
-    whose expectation under π_old equals KL(π_old || π_theta).
-
-Notes on stability:
-  - DDP/NCCL watchdog timeouts typically indicate one rank got stuck on a long/slow batch.
-  - This script enforces a max sequence length cap (left-truncate by default) and increases DDP timeout.
+Changes vs original:
+  - Right-truncate input_ids to --max-seq-len (keeps prompt/prefix).
+  - Increase DDP timeout via --ddp-timeout-seconds.
+  - Remove advantage clipping.
+  - Remove KL regularization term.
 """
 
 from __future__ import annotations
@@ -107,9 +103,8 @@ class Config:
     columns_ref_logprobs: str
     columns_p_correct: str
 
-    # NEW: training-time safety caps / DDP stability
+    # NEW
     max_seq_len: int
-    truncate_side: str  # "left" or "right"
     ddp_timeout_seconds: int
 
 
@@ -152,8 +147,8 @@ def parse_args() -> Config:
     )
     p.add_argument("--adv-smoothing-tau", type=float, default=0.1)
     p.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda (gamma is fixed to 1).")
-    p.add_argument("--adv-clip", type=float, default=0.0, help="If >0, clamp SUCCESS advantages to [-adv-clip, adv-clip].")
-    p.add_argument("--kl-coef", type=float, default=0.0, help="Optional KL regularization coefficient (0 disables).")
+    p.add_argument("--adv-clip", type=float, default=0.0, help="Ignored (advantage clipping removed).")
+    p.add_argument("--kl-coef", type=float, default=0.0, help="Ignored (KL term removed).")
 
     # Logging / saving
     p.add_argument("--log-every", type=int, default=10)
@@ -168,24 +163,18 @@ def parse_args() -> Config:
     p.add_argument("--col-ref-logprobs", default="ref_logprobs")
     p.add_argument("--col-p-correct", default="critic_p_correct")
 
-    # NEW: stability caps (defaults chosen so you do not need to change your launch)
+    # NEW
     p.add_argument(
         "--max-seq-len",
         type=int,
-        default=8192,
-        help="If >0, truncate input_ids to at most this many tokens during training (default: 8192).",
-    )
-    p.add_argument(
-        "--truncate-side",
-        choices=["left", "right"],
-        default="left",
-        help="How to truncate when input is longer than --max-seq-len. 'left' keeps the tail (default).",
+        default=32768,
+        help="If >0, truncate input_ids on the RIGHT to at most this many tokens (keeps prompt/prefix).",
     )
     p.add_argument(
         "--ddp-timeout-seconds",
         type=int,
         default=7200,
-        help="DDP/NCCL process group timeout in seconds (default: 7200).",
+        help="DDP/NCCL process group timeout in seconds.",
     )
 
     args = p.parse_args()
@@ -202,10 +191,8 @@ def parse_args() -> Config:
         raise ValueError("--adv-smoothing-tau must be > 0")
     if not (0.0 <= float(args.gae_lambda) <= 1.0):
         raise ValueError("--gae-lambda must be in [0, 1]")
-    if int(args.max_seq_len) == 0:
-        pass
-    elif int(args.max_seq_len) < 256:
-        raise ValueError("--max-seq-len must be 0 (disable) or >= 256")
+    if int(args.max_seq_len) < 0:
+        raise ValueError("--max-seq-len must be >= 0")
     if int(args.ddp_timeout_seconds) < 60:
         raise ValueError("--ddp-timeout-seconds must be >= 60")
 
@@ -246,7 +233,6 @@ def parse_args() -> Config:
         columns_ref_logprobs=str(args.col_ref_logprobs),
         columns_p_correct=str(args.col_p_correct),
         max_seq_len=int(args.max_seq_len),
-        truncate_side=str(args.truncate_side),
         ddp_timeout_seconds=int(args.ddp_timeout_seconds),
     )
 
@@ -263,6 +249,7 @@ def _iter_assigned_batches(
         yield from pf.iter_batches(batch_size=batch_size, row_groups=row_groups)
         return
 
+    # Fallback: row-wise striding across full file.
     row_offset = 0
     for batch in pf.iter_batches(batch_size=batch_size):
         n = batch.num_rows
@@ -352,14 +339,14 @@ def _compute_advantages(
     p_correct: Sequence[float], *, tau: float, gae_lambda: float, adv_clip: float
 ) -> List[float]:
     """
-    Compute per-token SUCCESS advantages from critic p_correct values.
+    Compute per-token GAE advantages from critic p_correct values.
 
-    Define logP_t = log((p_t + tau)/(1+tau)).
-    With gamma=1, deltas are:
-        delta_t = logP_t - logP_{t-1}  (t>=1)
-    Then GAE:
-        A_success[t] = delta_t + lambda * A_success[t+1]  (backwards; t>=1)
-        A_success[0] = 0
+    V_t = log((p_t + tau)/(1+tau))
+    delta_t = V_t - V_{t-1} (t>=1)
+    A_t = delta_t + lambda * A_{t+1} (backwards; t>=1)
+    A_0 = 0
+
+    Note: adv_clip is ignored (advantage clipping removed).
     """
     values: List[float] = []
     for p in p_correct:
@@ -401,41 +388,29 @@ def _compute_advantages(
         gae = delta + lam * gae
         out[t] = float(gae)
 
-    if adv_clip and adv_clip > 0.0:
-        clip = float(adv_clip)
-        for i, a in enumerate(out):
-            if not math.isfinite(a):
-                continue
-            if a > clip:
-                out[i] = clip
-            elif a < -clip:
-                out[i] = -clip
-
     return out
 
 
-def _make_collate_fn(
-    *,
-    pad_token_id: int,
-    tau: float,
-    gae_lambda: float,
-    adv_clip: float,
-    max_seq_len: int,
-    truncate_side: str,
-):
+def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_clip: float, max_seq_len: int):
     def collate(rows: List[dict]) -> dict:
         if not rows:
             return {}
 
         max_len = 0
-        proc_rows: List[dict] = []
+
+        input_ids_list: List[List[int]] = []
+        label_positions: List[List[int]] = []
+        ref_logprobs: List[List[float]] = []
+        advantages: List[List[float]] = []
+        num_tokens = 0
 
         for r in rows:
             ids = _as_list(r.get("input_ids"))
-            pos_raw = _as_list(r.get("label_positions"))
-            old_raw = _as_list(r.get("ref_logprobs"))
-            p_corr_raw = _as_list(r.get("critic_p_correct"))
 
+            if max_seq_len and max_seq_len > 0 and len(ids) > max_seq_len:
+                ids = ids[:max_seq_len]
+
+            pos_raw = _as_list(r.get("label_positions"))
             pos: List[int] = []
             for x in pos_raw:
                 try:
@@ -443,6 +418,7 @@ def _make_collate_fn(
                 except Exception:
                     pos.append(-1)
 
+            old_raw = _as_list(r.get("ref_logprobs"))
             old_lp: List[float] = []
             for x in old_raw:
                 try:
@@ -450,105 +426,69 @@ def _make_collate_fn(
                 except Exception:
                     old_lp.append(float("nan"))
 
-            p_corr: List[float] = []
-            for x in p_corr_raw:
+            p_corr = _as_list(r.get("critic_p_correct"))
+            p_corr_f: List[float] = []
+            for x in p_corr:
                 try:
-                    p_corr.append(float(x))
+                    p_corr_f.append(float(x))
                 except Exception:
-                    p_corr.append(float("nan"))
+                    p_corr_f.append(float("nan"))
 
-            L = min(len(pos), len(old_lp), len(p_corr))
-            pos = pos[:L]
-            old_lp = old_lp[:L]
-            p_corr = p_corr[:L]
+            # Common length among per-output lists
+            L0 = min(len(pos), len(old_lp), len(p_corr_f))
+            pos = pos[:L0]
+            old_lp = old_lp[:L0]
+            p_corr_f = p_corr_f[:L0]
 
-            adv_full = _compute_advantages(p_corr, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)[:L]
+            # Keep only tokens whose label_position is inside truncated ids
+            seq_len = len(ids)
+            keep = [t for t, p in enumerate(pos) if 0 <= int(p) < seq_len]
+            if keep:
+                pos = [pos[t] for t in keep]
+                old_lp = [old_lp[t] for t in keep]
+                p_corr_f = [p_corr_f[t] for t in keep]
+            else:
+                pos = []
+                old_lp = []
+                p_corr_f = []
 
-            # NEW: cap sequence length (truncate ids; shift/filter per-output arrays via label_positions)
-            if max_seq_len and max_seq_len > 0 and len(ids) > max_seq_len:
-                if truncate_side == "left":
-                    offset = len(ids) - max_seq_len
-                    ids_trunc = ids[offset:]
-                    window_start = offset
-                else:
-                    offset = 0
-                    ids_trunc = ids[:max_seq_len]
-                    window_start = 0
+            adv = _compute_advantages(p_corr_f, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)
 
-                window_end = window_start + len(ids_trunc)
-
-                keep_idx: List[int] = []
-                pos_new: List[int] = []
-                for t, p in enumerate(pos):
-                    if p is None:
-                        continue
-                    p_i = int(p)
-                    if window_start <= p_i < window_end:
-                        keep_idx.append(t)
-                        pos_new.append(p_i - window_start)
-
-                old_lp = [old_lp[t] for t in keep_idx]
-                adv_full = [adv_full[t] for t in keep_idx]
-                pos = pos_new
-                ids = ids_trunc
-
-            max_len = max(max_len, len(ids))
-            proc_rows.append(
-                {
-                    "input_ids": ids,
-                    "label_positions": pos,
-                    "ref_logprobs": old_lp,
-                    "advantages": adv_full,  # A_success only (already aligned to kept label_positions)
-                }
-            )
-
-        input_ids = torch.full((len(proc_rows), max_len), int(pad_token_id), dtype=torch.long)
-        attention_mask = torch.zeros((len(proc_rows), max_len), dtype=torch.long)
-
-        label_positions: List[List[int]] = []
-        ref_logprobs: List[List[float]] = []
-        advantages: List[List[float]] = []
-        num_tokens = 0
-
-        for i, r in enumerate(proc_rows):
-            ids = _as_list(r.get("input_ids"))
-            if ids:
-                t = torch.tensor(ids, dtype=torch.long)
-                input_ids[i, : t.numel()] = t
-                attention_mask[i, : t.numel()] = 1
-
-            pos = list(r.get("label_positions") or [])
-            old_lp = list(r.get("ref_logprobs") or [])
-            adv = list(r.get("advantages") or [])
-
-            L = min(len(pos), len(old_lp), len(adv))
-            pos = pos[:L]
-            old_lp = old_lp[:L]
-            adv = adv[:L]
-
+            input_ids_list.append(ids)
             label_positions.append(pos)
             ref_logprobs.append(old_lp)
             advantages.append(adv)
 
-            seq_len = len(ids)
-            for t_idx in range(L):
-                a = float(adv[t_idx])
+            max_len = max(max_len, len(ids))
+
+            # Count trainable tokens (matches _compute_policy_loss filtering)
+            for t in range(min(len(pos), len(old_lp), len(adv))):
+                a = float(adv[t])
                 if not math.isfinite(a):
                     continue
-                o = float(old_lp[t_idx])
+                o = float(old_lp[t])
                 if not math.isfinite(o):
                     continue
-                p = int(pos[t_idx])
+                p = int(pos[t])
                 if p <= 0 or p >= seq_len:
                     continue
                 num_tokens += 1
+
+        input_ids = torch.full((len(rows), max_len), int(pad_token_id), dtype=torch.long)
+        attention_mask = torch.zeros((len(rows), max_len), dtype=torch.long)
+
+        for i, ids in enumerate(input_ids_list):
+            if ids:
+                t = torch.tensor(ids, dtype=torch.long)
+                input_ids[i, : t.numel()] = t
+                attention_mask[i, : t.numel()] = 1
 
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "label_positions": label_positions,
             "ref_logprobs": ref_logprobs,
-            "advantages": advantages,  # A_success only
+            "advantages": advantages,
             "num_tokens": int(num_tokens),
         }
 
@@ -588,8 +528,8 @@ def _compute_policy_loss(
     attention_mask: torch.Tensor,  # [B, S]
     label_positions: Sequence[Sequence[int]],
     ref_logprobs: Sequence[Sequence[float]],
-    advantages: Sequence[Sequence[float]],  # A_success only
-    ratio_clip_range: float,  # if >0, clamp ratio to [1-eps,1+eps]
+    advantages: Sequence[Sequence[float]],
+    ppo_clip_range: float,
     kl_coef: float,
 ) -> Tuple[torch.Tensor, dict]:
     device = token_logprobs.device
@@ -598,7 +538,7 @@ def _compute_policy_loss(
     flat_b: List[int] = []
     flat_s: List[int] = []
     flat_old: List[float] = []
-    flat_adv_success: List[float] = []
+    flat_adv: List[float] = []
 
     lengths = attention_mask.sum(dim=1).tolist()
 
@@ -610,8 +550,8 @@ def _compute_policy_loss(
         L = min(len(pos), len(old), len(adv))
 
         for t in range(L):
-            a_s = float(adv[t])
-            if not (a_s == a_s):  # NaN
+            a = float(adv[t])
+            if not (a == a):  # NaN
                 continue
             o = float(old[t])
             if not math.isfinite(o):
@@ -626,7 +566,7 @@ def _compute_policy_loss(
             flat_b.append(i)
             flat_s.append(p - 1)
             flat_old.append(o)
-            flat_adv_success.append(a_s)
+            flat_adv.append(a)
 
     if not flat_b:
         zero = token_logprobs.sum() * 0.0
@@ -640,38 +580,33 @@ def _compute_policy_loss(
             "adv_mean": z,
             "adv_abs_mean": z,
             "ratio_mean": z,
-            "ratio_used_mean": z,
         }
 
     b_idx = torch.tensor(flat_b, device=device, dtype=torch.long)
     s_idx = torch.tensor(flat_s, device=device, dtype=torch.long)
-
     new_lp = token_logprobs[b_idx, s_idx].to(torch.float32)
     old_lp = torch.tensor(flat_old, device=device, dtype=torch.float32)
-    adv_success = torch.tensor(flat_adv_success, device=device, dtype=torch.float32)
+    adv_t = torch.tensor(flat_adv, device=device, dtype=torch.float32)
 
     log_ratio = new_lp - old_lp
     ratio = torch.exp(log_ratio)
 
-    eps = float(ratio_clip_range)
-    if eps and eps > 0.0:
-        ratio_used = torch.clamp(ratio, 1.0 - eps, 1.0 + eps)
-        clip_frac = ((ratio > (1.0 + eps)) | (ratio < (1.0 - eps))).to(torch.float32).mean()
+    if ppo_clip_range and ppo_clip_range > 0.0:
+        ratio_clipped = torch.clamp(ratio, 1.0 - ppo_clip_range, 1.0 + ppo_clip_range)
+        clip_frac = ((ratio > (1.0 + ppo_clip_range)) | (ratio < (1.0 - ppo_clip_range))).to(torch.float32).mean()
+        ratio_used = ratio_clipped
     else:
+        clip_frac = ratio.new_tensor(0.0)
         ratio_used = ratio
-        clip_frac = ratio_used.new_tensor(0.0)
 
-    adv_final = (adv_success - log_ratio).detach()
+    adv_final = (adv_t - log_ratio).detach()
 
     policy_loss = -(ratio_used * adv_final).mean()
 
-    if kl_coef and kl_coef > 0.0:
-        kl_term = torch.exp(log_ratio) - 1.0 - log_ratio
-        kl_loss = float(kl_coef) * kl_term.mean()
-    else:
-        kl_loss = policy_loss * 0.0
+    # KL term removed (kl_coef ignored)
+    kl_loss = policy_loss * 0.0
 
-    total = policy_loss + kl_loss
+    total = policy_loss
 
     approx_kl = (old_lp - new_lp).mean()
 
@@ -684,7 +619,6 @@ def _compute_policy_loss(
         "adv_mean": adv_final.mean().detach(),
         "adv_abs_mean": adv_final.abs().mean().detach(),
         "ratio_mean": ratio.mean().detach(),
-        "ratio_used_mean": ratio_used.mean().detach(),
     }
     return total, metrics
 
@@ -744,7 +678,7 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
     model.to(device)
     if distributed:
-        model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+        model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
 
     if cfg.compile_mode != "none":
         model = torch.compile(model, mode=cfg.compile_mode)
@@ -768,7 +702,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
         gae_lambda=float(cfg.gae_lambda),
         adv_clip=float(cfg.adv_clip),
         max_seq_len=int(cfg.max_seq_len),
-        truncate_side=str(cfg.truncate_side),
     )
 
     loader = DataLoader(
@@ -803,7 +736,7 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
         try:
             import wandb  # type: ignore
 
-            run_name = cfg.wandb_name or f"pg_{int(time.time())}"
+            run_name = cfg.wandb_name or f"ppd_{int(time.time())}"
             wb = wandb
             wb.init(
                 project=cfg.wandb_project,
@@ -811,11 +744,9 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                 config={
                     "model_id": cfg.model_id,
                     "data_path": cfg.data_path,
-                    "ratio_clip_range": cfg.ppo_clip_range,
+                    "ppo_clip_range": cfg.ppo_clip_range,
                     "adv_smoothing_tau": cfg.adv_smoothing_tau,
                     "gae_lambda": cfg.gae_lambda,
-                    "adv_clip": cfg.adv_clip,
-                    "kl_coef": cfg.kl_coef,
                     "micro_batch_size": cfg.micro_batch_size,
                     "grad_accum_steps": cfg.grad_accum_steps,
                     "learning_rate": cfg.learning_rate,
@@ -830,7 +761,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     "max_steps": cfg.max_steps,
                     "num_epochs": cfg.num_epochs,
                     "max_seq_len": cfg.max_seq_len,
-                    "truncate_side": cfg.truncate_side,
                     "ddp_timeout_seconds": cfg.ddp_timeout_seconds,
                 },
             )
@@ -847,16 +777,13 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     global_step = 0
     accum = 0
     t0 = time.perf_counter()
-
     step_tokens_local = 0
     step_policy_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_kl_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_approx_kl_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_clip_frac_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_adv_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_adv_abs_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_ratio_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_ratio_used_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
 
     def save_checkpoint(step: int):
         if not master:
@@ -917,7 +844,7 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         label_positions=batch["label_positions"],
                         ref_logprobs=batch["ref_logprobs"],
                         advantages=batch["advantages"],
-                        ratio_clip_range=cfg.ppo_clip_range,
+                        ppo_clip_range=cfg.ppo_clip_range,
                         kl_coef=cfg.kl_coef,
                     )
                     loss = loss / float(cfg.grad_accum_steps)
@@ -928,13 +855,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                 step_tokens_local += tok
                 tok_f = float(tok)
                 step_policy_loss_sum = step_policy_loss_sum + metrics["policy_loss"].to(torch.float32) * tok_f
-                step_kl_loss_sum = step_kl_loss_sum + metrics["kl_loss"].to(torch.float32) * tok_f
                 step_approx_kl_sum = step_approx_kl_sum + metrics["approx_kl"].to(torch.float32) * tok_f
                 step_clip_frac_sum = step_clip_frac_sum + metrics["clip_frac"].to(torch.float32) * tok_f
                 step_adv_mean_sum = step_adv_mean_sum + metrics["adv_mean"].to(torch.float32) * tok_f
                 step_adv_abs_mean_sum = step_adv_abs_mean_sum + metrics["adv_abs_mean"].to(torch.float32) * tok_f
                 step_ratio_mean_sum = step_ratio_mean_sum + metrics["ratio_mean"].to(torch.float32) * tok_f
-                step_ratio_used_mean_sum = step_ratio_used_mean_sum + metrics["ratio_used_mean"].to(torch.float32) * tok_f
 
                 update = (accum % cfg.grad_accum_steps) == 0
                 if update:
@@ -947,13 +872,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         optimizer.zero_grad(set_to_none=True)
                         step_tokens_local = 0
                         step_policy_loss_sum.zero_()
-                        step_kl_loss_sum.zero_()
                         step_approx_kl_sum.zero_()
                         step_clip_frac_sum.zero_()
                         step_adv_mean_sum.zero_()
                         step_adv_abs_mean_sum.zero_()
                         step_ratio_mean_sum.zero_()
-                        step_ratio_used_mean_sum.zero_()
                         continue
 
                     if cfg.grad_clip and cfg.grad_clip > 0:
@@ -978,13 +901,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         sums = torch.stack(
                             [
                                 step_policy_loss_sum,
-                                step_kl_loss_sum,
                                 step_approx_kl_sum,
                                 step_clip_frac_sum,
                                 step_adv_mean_sum,
                                 step_adv_abs_mean_sum,
                                 step_ratio_mean_sum,
-                                step_ratio_used_mean_sum,
                             ]
                         )
                         if distributed:
@@ -992,13 +913,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                         denom = float(max(1, step_tokens_global))
                         mean_policy_loss = sums[0] / denom
-                        mean_kl_loss = sums[1] / denom
-                        mean_approx_kl = sums[2] / denom
-                        mean_clip_frac = sums[3] / denom
-                        mean_adv = sums[4] / denom
-                        mean_adv_abs = sums[5] / denom
-                        mean_ratio = sums[6] / denom
-                        mean_ratio_used = sums[7] / denom
+                        mean_approx_kl = sums[1] / denom
+                        mean_clip_frac = sums[2] / denom
+                        mean_adv = sums[3] / denom
+                        mean_adv_abs = sums[4] / denom
+                        mean_ratio = sums[5] / denom
 
                     if master and do_log:
                         elapsed = time.perf_counter() - t0
@@ -1007,13 +926,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                             "train/lr": lr,
                             "train/tokens": int(step_tokens_global),
                             "train/policy_loss": float(mean_policy_loss.item()),
-                            "train/kl_loss": float(mean_kl_loss.item()),
                             "train/approx_kl": float(mean_approx_kl.item()),
                             "train/clip_frac": float(mean_clip_frac.item()),
                             "train/adv_mean": float(mean_adv.item()),
                             "train/adv_abs_mean": float(mean_adv_abs.item()),
                             "train/ratio_mean": float(mean_ratio.item()),
-                            "train/ratio_used_mean": float(mean_ratio_used.item()),
                             "train/elapsed_s": elapsed,
                         }
                         print(
@@ -1030,13 +947,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                     step_tokens_local = 0
                     step_policy_loss_sum.zero_()
-                    step_kl_loss_sum.zero_()
                     step_approx_kl_sum.zero_()
                     step_clip_frac_sum.zero_()
                     step_adv_mean_sum.zero_()
                     step_adv_abs_mean_sum.zero_()
                     step_ratio_mean_sum.zero_()
-                    step_ratio_used_mean_sum.zero_()
 
                     if cfg.max_steps and cfg.max_steps > 0 and global_step >= cfg.max_steps:
                         break
