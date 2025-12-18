@@ -38,7 +38,6 @@ data_path="/home/rohin/icl_value/data/icl_value_training_adaptivemath_data_qwen1
 weights_path="models/token_correctness_critic_from_8_with_32"
 learning_rate=1e-4
 label_column="correct"
-correctness_label_smoothing=0.1
 batch_size=1
 num_epochs=1
 wandb_project="new_joint_critic"
@@ -60,7 +59,6 @@ echo "  Output: $weights_path"
 echo "  Ablation: $ablation_type"
 echo "  Supervise From Trajectory: $supervise_from_trajectory"
 echo "  Examples/Prompt: $examples_per_prompt"
-echo "  Label Smoothing: $correctness_label_smoothing"
 echo "=================================================="
 
 python3 -u src/train_in_context_token_critic.py \
@@ -69,7 +67,6 @@ python3 -u src/train_in_context_token_critic.py \
     --weights_path "$weights_path" \
     --learning_rate $learning_rate \
     --label-column "$label_column" \
-    --correctness_label_smoothing $correctness_label_smoothing \
     --batch_size $batch_size \
     --num_epochs $num_epochs \
     --wandb_project "$wandb_project" \
@@ -81,4 +78,3 @@ python3 -u src/train_in_context_token_critic.py \
 exit_code=${PIPESTATUS[0]}
 echo "Done. Exit code: $exit_code"
 exit $exit_code
-

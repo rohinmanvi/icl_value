@@ -10,7 +10,6 @@ Training supervision matches `train_in_context_critic.py` (same packed multi-tra
 with in-context feedback), except:
   - Only correctness is predicted (no length/cost target).
   - Loss is BCE-with-logits on the logit of the actually-taken next token at each supervised state.
-  - Correctness label smoothing defaults to 0.1 with targets {0 -> 0.1, 1 -> 0.9}.
 """
 
 from __future__ import annotations
@@ -341,7 +340,7 @@ def _last_hidden_state(tgt, input_ids: torch.Tensor) -> torch.Tensor:
     return out.last_hidden_state
 
 
-def compute_loss(model, batch, correctness_label_smoothing: float):
+def compute_loss(model, batch):
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
 
@@ -376,12 +375,7 @@ def compute_loss(model, batch, correctness_label_smoothing: float):
     action_ids = torch.tensor(flat_a, device=device)
 
     y_raw = torch.tensor(flat_y, device=device, dtype=torch.float32)
-    if correctness_label_smoothing:
-        if correctness_label_smoothing < 0.0 or correctness_label_smoothing > 0.5:
-            raise ValueError("--correctness_label_smoothing must be in [0, 0.5].")
-        y = y_raw * (1.0 - 2.0 * correctness_label_smoothing) + correctness_label_smoothing
-    else:
-        y = y_raw
+    y = y_raw
 
     lm_head = tgt.lm_head if hasattr(tgt, "lm_head") else tgt.get_output_embeddings()
     h = hidden_states[b_idx, s_idx, :]  # [N, E]
@@ -436,7 +430,6 @@ def train(
     grad_clip: float,
     wandb_project: str,
     dist_backend: str,
-    correctness_label_smoothing: float,
     max_steps: int = -1,
 ):
     distributed = int(os.environ.get("RANK", -1)) != -1
@@ -478,7 +471,6 @@ def train(
                 "max_steps": max_steps,
                 "ablation_type": dataset.ablation_type,
                 "supervise_from_trajectory": dataset.supervise_from_trajectory,
-                "correctness_label_smoothing": correctness_label_smoothing,
             },
         )
 
@@ -522,7 +514,7 @@ def train(
                 model.require_backward_grad_sync = update
 
             with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=getattr(torch, dtype)):
-                loss, metrics = compute_loss(model, batch, correctness_label_smoothing)
+                loss, metrics = compute_loss(model, batch)
                 loss_scaled = loss / gradient_accumulation_steps
 
             scaler.scale(loss_scaled).backward()
@@ -646,7 +638,6 @@ def main_worker(local_rank, world_size, cfg):
         1.0,
         cfg.wandb_project,
         cfg.dist_backend,
-        cfg.correctness_label_smoothing,
         cfg.max_steps,
     )
 
@@ -664,13 +655,6 @@ def parse_args():
         choices=["auto", "correct", "value"],
         default="correct",
         help="Which column to use for correctness supervision. 'auto' prefers 'correct' if present.",
-    )
-
-    p.add_argument(
-        "--correctness_label_smoothing",
-        type=float,
-        default=0.1,
-        help="Binary label smoothing (targets: 0->s, 1->1-s). Set 0 to disable.",
     )
 
     p.add_argument(
@@ -711,4 +695,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
