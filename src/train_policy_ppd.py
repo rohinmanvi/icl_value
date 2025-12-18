@@ -28,11 +28,16 @@ Optional KL regularization:
     we add a simple, always-nonnegative estimator:
         kl_term = exp(d) - 1 - d,  where d = logπ_theta - logπ_old
     whose expectation under π_old equals KL(π_old || π_theta).
+
+Notes on stability:
+  - DDP/NCCL watchdog timeouts typically indicate one rank got stuck on a long/slow batch.
+  - This script enforces a max sequence length cap (left-truncate by default) and increases DDP timeout.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import math
 import os
 import random
@@ -102,6 +107,11 @@ class Config:
     columns_ref_logprobs: str
     columns_p_correct: str
 
+    # NEW: training-time safety caps / DDP stability
+    max_seq_len: int
+    truncate_side: str  # "left" or "right"
+    ddp_timeout_seconds: int
+
 
 def parse_args() -> Config:
     p = argparse.ArgumentParser()
@@ -119,9 +129,9 @@ def parse_args() -> Config:
     # Training schedule
     p.add_argument("--num-epochs", type=int, default=1, help="Number of dataset passes (best-effort under DDP).")
     p.add_argument("--max-steps", type=int, default=-1, help="If >0, stop after this many optimizer steps.")
-    p.add_argument("--learning-rate", type=float, default=3e-5)
+    p.add_argument("--learning-rate", type=float, default=1e-6)
     p.add_argument("--min-learning-rate", type=float, default=0.0)
-    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--warmup-ratio", type=float, default=0.0)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
@@ -158,6 +168,26 @@ def parse_args() -> Config:
     p.add_argument("--col-ref-logprobs", default="ref_logprobs")
     p.add_argument("--col-p-correct", default="critic_p_correct")
 
+    # NEW: stability caps (defaults chosen so you do not need to change your launch)
+    p.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=8192,
+        help="If >0, truncate input_ids to at most this many tokens during training (default: 8192).",
+    )
+    p.add_argument(
+        "--truncate-side",
+        choices=["left", "right"],
+        default="left",
+        help="How to truncate when input is longer than --max-seq-len. 'left' keeps the tail (default).",
+    )
+    p.add_argument(
+        "--ddp-timeout-seconds",
+        type=int,
+        default=7200,
+        help="DDP/NCCL process group timeout in seconds (default: 7200).",
+    )
+
     args = p.parse_args()
 
     if args.micro_batch_size <= 0:
@@ -172,6 +202,12 @@ def parse_args() -> Config:
         raise ValueError("--adv-smoothing-tau must be > 0")
     if not (0.0 <= float(args.gae_lambda) <= 1.0):
         raise ValueError("--gae-lambda must be in [0, 1]")
+    if int(args.max_seq_len) == 0:
+        pass
+    elif int(args.max_seq_len) < 256:
+        raise ValueError("--max-seq-len must be 0 (disable) or >= 256")
+    if int(args.ddp_timeout_seconds) < 60:
+        raise ValueError("--ddp-timeout-seconds must be >= 60")
 
     return Config(
         model_id=str(args.model_id),
@@ -209,6 +245,9 @@ def parse_args() -> Config:
         columns_label_positions=str(args.col_label_positions),
         columns_ref_logprobs=str(args.col_ref_logprobs),
         columns_p_correct=str(args.col_p_correct),
+        max_seq_len=int(args.max_seq_len),
+        truncate_side=str(args.truncate_side),
+        ddp_timeout_seconds=int(args.ddp_timeout_seconds),
     )
 
 
@@ -224,7 +263,6 @@ def _iter_assigned_batches(
         yield from pf.iter_batches(batch_size=batch_size, row_groups=row_groups)
         return
 
-    # Fallback: row-wise striding across full file.
     row_offset = 0
     for batch in pf.iter_batches(batch_size=batch_size):
         n = batch.num_rows
@@ -273,11 +311,7 @@ class ParquetRolloutDataset(IterableDataset):
 
         pf = pq.ParquetFile(self.parquet_path)
         names = set(pf.schema_arrow.names)
-        missing = [
-            c
-            for c in [self.col_input_ids, self.col_label_positions, self.col_ref_logprobs, self.col_p_correct]
-            if c not in names
-        ]
+        missing = [c for c in [self.col_input_ids, self.col_label_positions, self.col_ref_logprobs, self.col_p_correct] if c not in names]
         if missing:
             raise ValueError(f"Parquet missing required columns: {missing}. Present columns: {sorted(names)}")
 
@@ -326,11 +360,6 @@ def _compute_advantages(
     Then GAE:
         A_success[t] = delta_t + lambda * A_success[t+1]  (backwards; t>=1)
         A_success[0] = 0
-
-    NOTE: This function returns ONLY A_success.
-    The full distillation-style advantage is formed later as:
-        A = A_success - (logπ_theta - logπ_old)
-    and is detached before optimization.
     """
     values: List[float] = []
     for p in p_correct:
@@ -385,28 +414,28 @@ def _compute_advantages(
     return out
 
 
-def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_clip: float):
+def _make_collate_fn(
+    *,
+    pad_token_id: int,
+    tau: float,
+    gae_lambda: float,
+    adv_clip: float,
+    max_seq_len: int,
+    truncate_side: str,
+):
     def collate(rows: List[dict]) -> dict:
         if not rows:
             return {}
 
-        max_len = max(len(r["input_ids"]) for r in rows)
-        input_ids = torch.full((len(rows), max_len), int(pad_token_id), dtype=torch.long)
-        attention_mask = torch.zeros((len(rows), max_len), dtype=torch.long)
+        max_len = 0
+        proc_rows: List[dict] = []
 
-        label_positions: List[List[int]] = []
-        ref_logprobs: List[List[float]] = []
-        advantages: List[List[float]] = []
-        num_tokens = 0
-
-        for i, r in enumerate(rows):
+        for r in rows:
             ids = _as_list(r.get("input_ids"))
-            if ids:
-                t = torch.tensor(ids, dtype=torch.long)
-                input_ids[i, : t.numel()] = t
-                attention_mask[i, : t.numel()] = 1
-
             pos_raw = _as_list(r.get("label_positions"))
+            old_raw = _as_list(r.get("ref_logprobs"))
+            p_corr_raw = _as_list(r.get("critic_p_correct"))
+
             pos: List[int] = []
             for x in pos_raw:
                 try:
@@ -414,7 +443,6 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_cl
                 except Exception:
                     pos.append(-1)
 
-            old_raw = _as_list(r.get("ref_logprobs"))
             old_lp: List[float] = []
             for x in old_raw:
                 try:
@@ -422,29 +450,95 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_cl
                 except Exception:
                     old_lp.append(float("nan"))
 
-            p_corr = _as_list(r.get("critic_p_correct"))
+            p_corr: List[float] = []
+            for x in p_corr_raw:
+                try:
+                    p_corr.append(float(x))
+                except Exception:
+                    p_corr.append(float("nan"))
 
-            # Keep alignment by truncating all per-output lists to a common length.
             L = min(len(pos), len(old_lp), len(p_corr))
             pos = pos[:L]
             old_lp = old_lp[:L]
             p_corr = p_corr[:L]
 
+            adv_full = _compute_advantages(p_corr, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)[:L]
+
+            # NEW: cap sequence length (truncate ids; shift/filter per-output arrays via label_positions)
+            if max_seq_len and max_seq_len > 0 and len(ids) > max_seq_len:
+                if truncate_side == "left":
+                    offset = len(ids) - max_seq_len
+                    ids_trunc = ids[offset:]
+                    window_start = offset
+                else:
+                    offset = 0
+                    ids_trunc = ids[:max_seq_len]
+                    window_start = 0
+
+                window_end = window_start + len(ids_trunc)
+
+                keep_idx: List[int] = []
+                pos_new: List[int] = []
+                for t, p in enumerate(pos):
+                    if p is None:
+                        continue
+                    p_i = int(p)
+                    if window_start <= p_i < window_end:
+                        keep_idx.append(t)
+                        pos_new.append(p_i - window_start)
+
+                old_lp = [old_lp[t] for t in keep_idx]
+                adv_full = [adv_full[t] for t in keep_idx]
+                pos = pos_new
+                ids = ids_trunc
+
+            max_len = max(max_len, len(ids))
+            proc_rows.append(
+                {
+                    "input_ids": ids,
+                    "label_positions": pos,
+                    "ref_logprobs": old_lp,
+                    "advantages": adv_full,  # A_success only (already aligned to kept label_positions)
+                }
+            )
+
+        input_ids = torch.full((len(proc_rows), max_len), int(pad_token_id), dtype=torch.long)
+        attention_mask = torch.zeros((len(proc_rows), max_len), dtype=torch.long)
+
+        label_positions: List[List[int]] = []
+        ref_logprobs: List[List[float]] = []
+        advantages: List[List[float]] = []
+        num_tokens = 0
+
+        for i, r in enumerate(proc_rows):
+            ids = _as_list(r.get("input_ids"))
+            if ids:
+                t = torch.tensor(ids, dtype=torch.long)
+                input_ids[i, : t.numel()] = t
+                attention_mask[i, : t.numel()] = 1
+
+            pos = list(r.get("label_positions") or [])
+            old_lp = list(r.get("ref_logprobs") or [])
+            adv = list(r.get("advantages") or [])
+
+            L = min(len(pos), len(old_lp), len(adv))
+            pos = pos[:L]
+            old_lp = old_lp[:L]
+            adv = adv[:L]
+
             label_positions.append(pos)
             ref_logprobs.append(old_lp)
-            adv = _compute_advantages(p_corr, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)[:L]
             advantages.append(adv)
 
-            # Count trainable tokens (matches the filtering logic in _compute_policy_loss, excluding new logprobs).
             seq_len = len(ids)
-            for t in range(L):
-                a = float(adv[t])
+            for t_idx in range(L):
+                a = float(adv[t_idx])
                 if not math.isfinite(a):
                     continue
-                o = float(old_lp[t])
+                o = float(old_lp[t_idx])
                 if not math.isfinite(o):
                     continue
-                p = int(pos[t])
+                p = int(pos[t_idx])
                 if p <= 0 or p >= seq_len:
                     continue
                 num_tokens += 1
@@ -552,14 +646,10 @@ def _compute_policy_loss(
     b_idx = torch.tensor(flat_b, device=device, dtype=torch.long)
     s_idx = torch.tensor(flat_s, device=device, dtype=torch.long)
 
-    # log π_theta(a|s)
     new_lp = token_logprobs[b_idx, s_idx].to(torch.float32)
-    # log π_old(a|s)
     old_lp = torch.tensor(flat_old, device=device, dtype=torch.float32)
-    # A_success (from critic + GAE)
     adv_success = torch.tensor(flat_adv_success, device=device, dtype=torch.float32)
 
-    # log ratio and ratio
     log_ratio = new_lp - old_lp
     ratio = torch.exp(log_ratio)
 
@@ -571,15 +661,10 @@ def _compute_policy_loss(
         ratio_used = ratio
         clip_frac = ratio_used.new_tensor(0.0)
 
-    # Distillation-style reverse-KL advantage decomposition (DETACHED):
-    # A = A_success - (logπ_theta - logπ_old)
     adv_final = (adv_success - log_ratio).detach()
 
-    # Importance-sampling policy gradient loss:
-    # loss = -E_q[ (p/q) * A_detached ]
     policy_loss = -(ratio_used * adv_final).mean()
 
-    # Optional KL(π_old || π_theta) estimator from sampled actions:
     if kl_coef and kl_coef > 0.0:
         kl_term = torch.exp(log_ratio) - 1.0 - log_ratio
         kl_loss = float(kl_coef) * kl_term.mean()
@@ -619,19 +704,20 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
         torch.cuda.set_device(device)
 
     if distributed:
-        dist.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+        dist.init_process_group(
+            backend="nccl" if device.type == "cuda" else "gloo",
+            timeout=datetime.timedelta(seconds=int(cfg.ddp_timeout_seconds)),
+        )
 
     rank = int(os.environ.get("RANK", "0"))
     master = rank == 0
 
-    # Seed
     torch.manual_seed(int(cfg.seed) + rank)
     random.seed(int(cfg.seed) + rank)
 
     if master:
         os.makedirs(cfg.output_dir, exist_ok=True)
 
-    # Tokenizer / Model
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
@@ -663,7 +749,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     if cfg.compile_mode != "none":
         model = torch.compile(model, mode=cfg.compile_mode)
 
-    # Dataset / DataLoader
     dataset = ParquetRolloutDataset(
         cfg.data_path,
         rank=rank,
@@ -682,6 +767,8 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
         tau=float(cfg.adv_smoothing_tau),
         gae_lambda=float(cfg.gae_lambda),
         adv_clip=float(cfg.adv_clip),
+        max_seq_len=int(cfg.max_seq_len),
+        truncate_side=str(cfg.truncate_side),
     )
 
     loader = DataLoader(
@@ -693,13 +780,11 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
         collate_fn=collate_fn,
     )
 
-    # Optimizer
     params = [p for p in _unwrap_model(model).parameters() if p.requires_grad]
     optimizer = AdamW(params, lr=cfg.learning_rate, betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay)
 
     total_steps = int(cfg.max_steps) if cfg.max_steps and cfg.max_steps > 0 else 0
     if total_steps == 0 and cfg.num_epochs > 0:
-        # Best-effort estimate for scheduling only (training loop still uses sync StopIteration).
         try:
             pf = pq.ParquetFile(cfg.data_path)
             total_rows = int(pf.metadata.num_rows) if pf.metadata is not None else 0
@@ -713,7 +798,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
     warmup_steps = int(float(cfg.warmup_ratio) * float(total_steps)) if total_steps > 0 else 0
 
-    # Optional W&B
     wb = None
     if master and cfg.wandb_project:
         try:
@@ -745,6 +829,9 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     "world_size": world_size,
                     "max_steps": cfg.max_steps,
                     "num_epochs": cfg.num_epochs,
+                    "max_seq_len": cfg.max_seq_len,
+                    "truncate_side": cfg.truncate_side,
+                    "ddp_timeout_seconds": cfg.ddp_timeout_seconds,
                 },
             )
         except Exception:
@@ -757,9 +844,10 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
         autocast_ctx = nullcontext()
 
-    global_step = 0  # optimizer steps
+    global_step = 0
     accum = 0
     t0 = time.perf_counter()
+
     step_tokens_local = 0
     step_policy_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_kl_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
