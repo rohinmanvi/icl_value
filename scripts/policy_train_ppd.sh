@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=defq
-#SBATCH --job-name=icl_policy_ppd
+#SBATCH --job-name=data_icl_policy_ppd
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
@@ -40,10 +40,10 @@ output_dir="models/policy_ppd_qwen17b_tau01"
 dp_size=8
 micro_batch_size=1
 grad_accum_steps=1
-learning_rate=1e-6
-ppo_clip_range=0.2
+learning_rate=3e-5
+ppo_clip_range=0.0
 adv_smoothing_tau=0.1
-gae_lambda=0.95
+gae_lambda=0.99
 adv_clip=0.0
 kl_coef=0.0
 max_steps=-1

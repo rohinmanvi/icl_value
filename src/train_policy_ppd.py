@@ -119,9 +119,9 @@ def parse_args() -> Config:
     # Training schedule
     p.add_argument("--num-epochs", type=int, default=1, help="Number of dataset passes (best-effort under DDP).")
     p.add_argument("--max-steps", type=int, default=-1, help="If >0, stop after this many optimizer steps.")
-    p.add_argument("--learning-rate", type=float, default=1e-6)
+    p.add_argument("--learning-rate", type=float, default=3e-5)
     p.add_argument("--min-learning-rate", type=float, default=0.0)
-    p.add_argument("--warmup-ratio", type=float, default=0.0)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.95)
