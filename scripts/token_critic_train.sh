@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=defq
-#SBATCH --job-name=zip_token_critic_train
+#SBATCH --job-name=data_token_critic
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=defq
-#SBATCH --job-name=zip_joint_data
+#SBATCH --job-name=data_joint
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
