@@ -44,8 +44,6 @@ learning_rate=3e-5
 ppo_clip_range=0.0
 adv_smoothing_tau=0.1
 gae_lambda=0.99
-adv_clip=0.0
-kl_coef=0.0
 max_steps=-1
 
 echo "Starting offline PPD policy training:"
@@ -59,8 +57,6 @@ echo "  LR:          $learning_rate"
 echo "  PPO clip:    $ppo_clip_range"
 echo "  Tau:         $adv_smoothing_tau"
 echo "  GAE lambda:  $gae_lambda"
-echo "  Adv clip:    $adv_clip"
-echo "  KL coef:     $kl_coef"
 echo "  Max steps:   $max_steps"
 echo "  Start time:  $(date)"
 
@@ -75,8 +71,6 @@ python3 -u src/train_policy_ppd.py \
   --ppo-clip-range $ppo_clip_range \
   --adv-smoothing-tau $adv_smoothing_tau \
   --gae-lambda $gae_lambda \
-  --adv-clip $adv_clip \
-  --kl-coef $kl_coef \
   --max-steps $max_steps \
   --dtype bfloat16 \
   --attn-implementation flash_attention_2 \
@@ -85,4 +79,3 @@ python3 -u src/train_policy_ppd.py \
 exit_code=${PIPESTATUS[0]}
 echo "Training completed with exit code: $exit_code at $(date)"
 exit $exit_code
-

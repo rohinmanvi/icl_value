@@ -91,8 +91,6 @@ class Config:
     ppo_clip_range: float
     adv_smoothing_tau: float
     gae_lambda: float
-    adv_clip: float
-    kl_coef: float
     log_every: int
     save_every: int
     master_port: str
@@ -147,15 +145,13 @@ def parse_args() -> Config:
     )
     p.add_argument("--adv-smoothing-tau", type=float, default=0.1)
     p.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda (gamma is fixed to 1).")
-    p.add_argument("--adv-clip", type=float, default=0.0, help="Ignored (advantage clipping removed).")
-    p.add_argument("--kl-coef", type=float, default=0.0, help="Ignored (KL term removed).")
 
     # Logging / saving
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--save-every", type=int, default=0, help="If >0, save every N optimizer steps on rank 0.")
     p.add_argument("--master-port", default="29500")
     p.add_argument("--wandb-project", default="", help="If set, log to Weights & Biases (rank 0 only).")
-    p.add_argument("--wandb-name", default="", help="Optional W&B run name.")
+    p.add_argument("--wandb-name", default="ppd_policy", help="Optional W&B run name.")
 
     # Column names (keep flexible)
     p.add_argument("--col-input-ids", default="input_ids")
@@ -221,8 +217,6 @@ def parse_args() -> Config:
         ppo_clip_range=float(args.ppo_clip_range),
         adv_smoothing_tau=float(args.adv_smoothing_tau),
         gae_lambda=float(args.gae_lambda),
-        adv_clip=float(args.adv_clip),
-        kl_coef=float(args.kl_coef),
         log_every=int(args.log_every),
         save_every=int(args.save_every),
         master_port=str(args.master_port),
@@ -336,7 +330,7 @@ class ParquetRolloutDataset(IterableDataset):
 
 
 def _compute_advantages(
-    p_correct: Sequence[float], *, tau: float, gae_lambda: float, adv_clip: float
+    p_correct: Sequence[float], *, tau: float, gae_lambda: float
 ) -> List[float]:
     """
     Compute per-token GAE advantages from critic p_correct values.
@@ -345,8 +339,6 @@ def _compute_advantages(
     delta_t = V_t - V_{t-1} (t>=1)
     A_t = delta_t + lambda * A_{t+1} (backwards; t>=1)
     A_0 = 0
-
-    Note: adv_clip is ignored (advantage clipping removed).
     """
     values: List[float] = []
     for p in p_correct:
@@ -391,7 +383,7 @@ def _compute_advantages(
     return out
 
 
-def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_clip: float, max_seq_len: int):
+def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, max_seq_len: int):
     def collate(rows: List[dict]) -> dict:
         if not rows:
             return {}
@@ -452,7 +444,7 @@ def _make_collate_fn(*, pad_token_id: int, tau: float, gae_lambda: float, adv_cl
                 old_lp = []
                 p_corr_f = []
 
-            adv = _compute_advantages(p_corr_f, tau=tau, gae_lambda=gae_lambda, adv_clip=adv_clip)
+            adv = _compute_advantages(p_corr_f, tau=tau, gae_lambda=gae_lambda)
 
             input_ids_list.append(ids)
             label_positions.append(pos)
@@ -530,7 +522,6 @@ def _compute_policy_loss(
     ref_logprobs: Sequence[Sequence[float]],
     advantages: Sequence[Sequence[float]],
     ppo_clip_range: float,
-    kl_coef: float,
 ) -> Tuple[torch.Tensor, dict]:
     device = token_logprobs.device
     bsz = token_logprobs.shape[0]
@@ -573,7 +564,6 @@ def _compute_policy_loss(
         z = zero.detach()
         return zero, {
             "policy_loss": z,
-            "kl_loss": z,
             "approx_kl": z,
             "clip_frac": z,
             "tokens": 0,
@@ -602,17 +592,12 @@ def _compute_policy_loss(
     adv_final = (adv_t - log_ratio).detach()
 
     policy_loss = -(ratio_used * adv_final).mean()
-
-    # KL term removed (kl_coef ignored)
-    kl_loss = policy_loss * 0.0
-
     total = policy_loss
 
     approx_kl = (old_lp - new_lp).mean()
 
     metrics = {
         "policy_loss": policy_loss.detach(),
-        "kl_loss": kl_loss.detach(),
         "approx_kl": approx_kl.detach(),
         "clip_frac": clip_frac.detach(),
         "tokens": int(new_lp.numel()),
@@ -700,7 +685,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
         pad_token_id=int(tokenizer.pad_token_id),
         tau=float(cfg.adv_smoothing_tau),
         gae_lambda=float(cfg.gae_lambda),
-        adv_clip=float(cfg.adv_clip),
         max_seq_len=int(cfg.max_seq_len),
     )
 
@@ -845,7 +829,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         ref_logprobs=batch["ref_logprobs"],
                         advantages=batch["advantages"],
                         ppo_clip_range=cfg.ppo_clip_range,
-                        kl_coef=cfg.kl_coef,
                     )
                     loss = loss / float(cfg.grad_accum_steps)
 
