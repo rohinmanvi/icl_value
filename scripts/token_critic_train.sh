@@ -36,7 +36,7 @@ conda activate zip
 model_id="Qwen/Qwen3-1.7B"
 data_path="/home/rohin/icl_value/data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
 weights_path="models/token_correctness_critic_from_8_with_32"
-learning_rate=1e-4
+learning_rate=3e-5
 label_column="correct"
 batch_size=1
 num_epochs=1
