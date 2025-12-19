@@ -790,7 +790,7 @@ def _compute_policy_loss_from_hidden_suffix(
     lm_head: torch.nn.Module,
     ppo_clip_range: float,
     logprob_chunk_size: int,
-) -> Tuple[torch.Tensor, dict]:
+) -> Tuple[torch.Tensor, int]:
     """
     Fast path for the common case where output tokens are a contiguous suffix.
 
@@ -812,11 +812,6 @@ def _compute_policy_loss_from_hidden_suffix(
 
     # Grad-connected accumulator for the loss.
     policy_sum = hidden_states.sum() * 0.0
-    kl_sum = hidden_states.sum() * 0.0
-    adv_sum = hidden_states.sum() * 0.0
-    adv_abs_sum = hidden_states.sum() * 0.0
-    ratio_sum = hidden_states.sum() * 0.0
-    clip_count = hidden_states.new_zeros((), dtype=torch.float32)
 
     tokens = 0
 
@@ -869,8 +864,6 @@ def _compute_policy_loss_from_hidden_suffix(
             if ppo_clip_range and ppo_clip_range > 0.0:
                 lo = 1.0 - float(ppo_clip_range)
                 hi = 1.0 + float(ppo_clip_range)
-                clipped = (ratio > hi) | (ratio < lo)
-                clip_count = clip_count + clipped.to(torch.float32).sum()
                 ratio_used = torch.clamp(ratio, lo, hi)
             else:
                 ratio_used = ratio
@@ -879,10 +872,6 @@ def _compute_policy_loss_from_hidden_suffix(
             policy_tokens = -(ratio_used * adv_final)
 
             policy_sum = policy_sum + policy_tokens.sum()
-            kl_sum = kl_sum + (old_lp - new_lp).sum()
-            adv_sum = adv_sum + adv_final.sum()
-            adv_abs_sum = adv_abs_sum + adv_final.abs().sum()
-            ratio_sum = ratio_sum + ratio.sum()
             tokens += int(new_lp.numel())
 
     if tokens == 0:
@@ -890,35 +879,12 @@ def _compute_policy_loss_from_hidden_suffix(
         zero = zero + weight.sum() * 0.0
         if bias is not None:
             zero = zero + bias.sum() * 0.0
-        z = zero.detach()
-        return zero, {
-            "policy_loss": z,
-            "approx_kl": z,
-            "clip_frac": z,
-            "tokens": 0,
-            "adv_mean": z,
-            "adv_abs_mean": z,
-            "ratio_mean": z,
-        }
+        return zero, 0
 
     denom = float(tokens)
     loss = policy_sum / denom
-    approx_kl = kl_sum / denom
-    adv_mean = adv_sum / denom
-    adv_abs_mean = adv_abs_sum / denom
-    ratio_mean = ratio_sum / denom
-    clip_frac = (clip_count / denom) if (ppo_clip_range and ppo_clip_range > 0.0) else clip_count * 0.0
 
-    metrics = {
-        "policy_loss": loss.detach(),
-        "approx_kl": approx_kl.detach(),
-        "clip_frac": clip_frac.detach(),
-        "tokens": int(tokens),
-        "adv_mean": adv_mean.detach(),
-        "adv_abs_mean": adv_abs_mean.detach(),
-        "ratio_mean": ratio_mean.detach(),
-    }
-    return loss, metrics
+    return loss, int(tokens)
 
 
 def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
@@ -1081,11 +1047,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     t0 = time.perf_counter()
     step_tokens_local = 0
     step_policy_loss_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_approx_kl_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_clip_frac_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_adv_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_adv_abs_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
-    step_ratio_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_max_seq_local = 0
     step_max_out_local = 0
 
@@ -1146,7 +1107,7 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                 with autocast_ctx:
                     hidden_states = model(input_ids=input_ids, attention_mask=attention_mask)
 
-                    loss, metrics = _compute_policy_loss_from_hidden_suffix(
+                    loss_unscaled, tok = _compute_policy_loss_from_hidden_suffix(
                         hidden_states=hidden_states,
                         input_ids=input_ids,
                         seq_lens=batch["seq_lens"],
@@ -1157,19 +1118,13 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         ppo_clip_range=cfg.ppo_clip_range,
                         logprob_chunk_size=cfg.logprob_chunk_size,
                     )
-                    loss = loss / float(cfg.grad_accum_steps)
+                    loss = loss_unscaled / float(cfg.grad_accum_steps)
 
                 loss.backward()
 
-                tok = int(metrics["tokens"]) if isinstance(metrics["tokens"], int) else int(metrics["tokens"].item())
                 step_tokens_local += tok
                 tok_f = float(tok)
-                step_policy_loss_sum = step_policy_loss_sum + metrics["policy_loss"].to(torch.float32) * tok_f
-                step_approx_kl_sum = step_approx_kl_sum + metrics["approx_kl"].to(torch.float32) * tok_f
-                step_clip_frac_sum = step_clip_frac_sum + metrics["clip_frac"].to(torch.float32) * tok_f
-                step_adv_mean_sum = step_adv_mean_sum + metrics["adv_mean"].to(torch.float32) * tok_f
-                step_adv_abs_mean_sum = step_adv_abs_mean_sum + metrics["adv_abs_mean"].to(torch.float32) * tok_f
-                step_ratio_mean_sum = step_ratio_mean_sum + metrics["ratio_mean"].to(torch.float32) * tok_f
+                step_policy_loss_sum = step_policy_loss_sum + loss_unscaled.detach().to(torch.float32) * tok_f
 
                 update = (accum % cfg.grad_accum_steps) == 0
                 if update:
@@ -1182,11 +1137,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         optimizer.zero_grad(set_to_none=True)
                         step_tokens_local = 0
                         step_policy_loss_sum.zero_()
-                        step_approx_kl_sum.zero_()
-                        step_clip_frac_sum.zero_()
-                        step_adv_mean_sum.zero_()
-                        step_adv_abs_mean_sum.zero_()
-                        step_ratio_mean_sum.zero_()
                         step_max_seq_local = 0
                         step_max_out_local = 0
                         continue
@@ -1212,28 +1162,13 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     if do_log:
                         step_max_seq_t = torch.tensor(step_max_seq_local, device=device, dtype=torch.long)
                         step_max_out_t = torch.tensor(step_max_out_local, device=device, dtype=torch.long)
-                        sums = torch.stack(
-                            [
-                                step_policy_loss_sum,
-                                step_approx_kl_sum,
-                                step_clip_frac_sum,
-                                step_adv_mean_sum,
-                                step_adv_abs_mean_sum,
-                                step_ratio_mean_sum,
-                            ]
-                        )
                         if distributed:
-                            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(step_policy_loss_sum, op=dist.ReduceOp.SUM)
                             dist.all_reduce(step_max_seq_t, op=dist.ReduceOp.MAX)
                             dist.all_reduce(step_max_out_t, op=dist.ReduceOp.MAX)
 
                         denom = float(max(1, step_tokens_global))
-                        mean_policy_loss = sums[0] / denom
-                        mean_approx_kl = sums[1] / denom
-                        mean_clip_frac = sums[2] / denom
-                        mean_adv = sums[3] / denom
-                        mean_adv_abs = sums[4] / denom
-                        mean_ratio = sums[5] / denom
+                        mean_policy_loss = step_policy_loss_sum / denom
 
                     if master and do_log:
                         elapsed = time.perf_counter() - t0
@@ -1242,18 +1177,12 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                             "train/lr": lr,
                             "train/tokens": int(step_tokens_global),
                             "train/policy_loss": float(mean_policy_loss.item()),
-                            "train/approx_kl": float(mean_approx_kl.item()),
-                            "train/clip_frac": float(mean_clip_frac.item()),
-                            "train/adv_mean": float(mean_adv.item()),
-                            "train/adv_abs_mean": float(mean_adv_abs.item()),
-                            "train/ratio_mean": float(mean_ratio.item()),
                             "train/max_seq_len": int(step_max_seq_t.item()),
                             "train/max_out_len": int(step_max_out_t.item()),
                             "train/elapsed_s": elapsed,
                         }
                         print(
                             f"[step {global_step}] loss={log_dict['train/policy_loss']:.6f} "
-                            f"kl={log_dict['train/approx_kl']:.6f} clip={log_dict['train/clip_frac']:.3f} "
                             f"tokens={int(step_tokens_global)} maxS={log_dict['train/max_seq_len']} "
                             f"maxOut={log_dict['train/max_out_len']} lr={lr:.3e}",
                             flush=True,
@@ -1266,11 +1195,6 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                     step_tokens_local = 0
                     step_policy_loss_sum.zero_()
-                    step_approx_kl_sum.zero_()
-                    step_clip_frac_sum.zero_()
-                    step_adv_mean_sum.zero_()
-                    step_adv_abs_mean_sum.zero_()
-                    step_ratio_mean_sum.zero_()
                     step_max_seq_local = 0
                     step_max_out_local = 0
 
