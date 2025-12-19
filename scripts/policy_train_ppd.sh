@@ -41,44 +41,21 @@ dp_size=8
 micro_batch_size=1
 grad_accum_steps=1
 learning_rate=3e-5
-ppo_clip_range=0.0
 adv_smoothing_tau=0.1
 gae_lambda=0.99
 max_seq_len=32768
 max_rows=-1  # set to >0 for quick end-to-end tests
-preprocess_row_group_size=64
 logprob_chunk_size=512
 max_steps=-1
 
-base_name="$(basename "${data_path%.parquet}")"
-preprocess_out="data/preprocessed/${base_name}_ppd_tau${adv_smoothing_tau}_lam${gae_lambda}_maxlen${max_seq_len}.parquet"
-
-if [[ -f "$preprocess_out" ]]; then
-  echo "Found preprocessed dataset:"
-  echo "  $preprocess_out"
-  train_data_path="$preprocess_out"
-  preprocess_args=()
-else
-  echo "No preprocessed dataset found; will preprocess to:"
-  echo "  $preprocess_out"
-  mkdir -p "$(dirname "$preprocess_out")"
-  train_data_path="$data_path"
-  preprocess_args=(
-    --preprocess-out "$preprocess_out"
-    --preprocess-row-group-size "$preprocess_row_group_size"
-  )
-fi
-
 echo "Starting offline PPD policy training:"
 echo "  Model:       $model_id"
-echo "  Data:        $train_data_path"
-echo "  Preprocess:  $preprocess_out"
+echo "  Data:        $data_path"
 echo "  Output dir:  $output_dir"
 echo "  DP size:     $dp_size"
 echo "  Micro batch: $micro_batch_size"
 echo "  Grad accum:  $grad_accum_steps"
 echo "  LR:          $learning_rate"
-echo "  PPO clip:    $ppo_clip_range"
 echo "  Tau:         $adv_smoothing_tau"
 echo "  GAE lambda:  $gae_lambda"
 echo "  Max seq len: $max_seq_len"
@@ -89,19 +66,17 @@ echo "  Start time:  $(date)"
 
 python3 -u src/train_policy_ppd.py \
   --model-id "$model_id" \
-  --data-path "$train_data_path" \
+  --data-path "$data_path" \
   --output-dir "$output_dir" \
   --dp-size $dp_size \
   --micro-batch-size $micro_batch_size \
   --grad-accum-steps $grad_accum_steps \
   --learning-rate $learning_rate \
-  --ppo-clip-range $ppo_clip_range \
   --adv-smoothing-tau $adv_smoothing_tau \
   --gae-lambda $gae_lambda \
   --max-seq-len $max_seq_len \
   --max-rows $max_rows \
   --logprob-chunk-size $logprob_chunk_size \
-  "${preprocess_args[@]}" \
   --max-steps $max_steps \
   --dtype bfloat16 \
   --attn-implementation flash_attention_2 \
