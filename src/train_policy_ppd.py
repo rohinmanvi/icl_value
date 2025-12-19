@@ -120,6 +120,7 @@ class Config:
     preprocess_row_group_size: int
     columns_labels: str
     columns_advantages: str
+    logprob_chunk_size: int
 
 
 def parse_args() -> Config:
@@ -218,6 +219,12 @@ def parse_args() -> Config:
     )
     p.add_argument("--col-labels", default="labels", help="Column name for labels in preprocessed parquet.")
     p.add_argument("--col-advantages", default="advantages", help="Column name for advantages in preprocessed parquet.")
+    p.add_argument(
+        "--logprob-chunk-size",
+        type=int,
+        default=512,
+        help="Compute policy logprobs in chunks of this many output tokens to reduce peak memory at long contexts.",
+    )
 
     args = p.parse_args()
 
@@ -241,6 +248,8 @@ def parse_args() -> Config:
         raise ValueError("--max-rows must be -1 (all) or > 0")
     if int(args.preprocess_row_group_size) <= 0:
         raise ValueError("--preprocess-row-group-size must be > 0")
+    if int(args.logprob_chunk_size) <= 0:
+        raise ValueError("--logprob-chunk-size must be > 0")
 
     return Config(
         model_id=str(args.model_id),
@@ -286,6 +295,7 @@ def parse_args() -> Config:
         preprocess_row_group_size=int(args.preprocess_row_group_size),
         columns_labels=str(args.col_labels),
         columns_advantages=str(args.col_advantages),
+        logprob_chunk_size=int(args.logprob_chunk_size),
     )
 
 
@@ -716,6 +726,38 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return tgt
 
 
+class _BackboneOnlyCausalLM(torch.nn.Module):
+    """
+    Wrap a HF AutoModelForCausalLM but only run the backbone (no full-vocab logits).
+
+    This avoids materializing [B, S, V] logits at long sequence lengths, which is both
+    slow and can exceed kernel indexing limits for large (S*V).
+    """
+
+    def __init__(self, hf_model: torch.nn.Module):
+        super().__init__()
+        self.hf_model = hf_model
+
+        base = None
+        prefix = getattr(hf_model, "base_model_prefix", None)
+        if isinstance(prefix, str) and prefix:
+            base = getattr(hf_model, prefix, None)
+        if base is None:
+            base = getattr(hf_model, "model", None)
+        if base is None:
+            base = getattr(hf_model, "transformer", None)
+        if base is None:
+            raise ValueError("Could not locate base transformer on the provided HF causal LM.")
+        self.base_model = base
+
+    def forward(self, *, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        out = self.base_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
+        # BaseModelOutputWithPastAndCrossAttentions-compatible
+        if hasattr(out, "last_hidden_state"):
+            return out.last_hidden_state
+        return out[0]
+
+
 def _lr_schedule(
     step: int,
     *,
@@ -737,14 +779,17 @@ def _lr_schedule(
     return float(min_lr + cosine * (base_lr - min_lr))
 
 
-def _compute_policy_loss_aligned_suffix(
+def _compute_policy_loss_from_hidden_suffix(
     *,
-    token_logprobs: torch.Tensor,  # [B, S-1]
+    hidden_states: torch.Tensor,  # [B, S, H]
+    input_ids: torch.Tensor,  # [B, S]
     seq_lens: Sequence[int],
     prompt_lens: Sequence[int],
     ref_logprobs: Sequence[Sequence[float]],
     advantages: Sequence[Sequence[float]],
+    lm_head: torch.nn.Module,
     ppo_clip_range: float,
+    logprob_chunk_size: int,
 ) -> Tuple[torch.Tensor, dict]:
     """
     Fast path for the common case where output tokens are a contiguous suffix.
@@ -752,18 +797,26 @@ def _compute_policy_loss_aligned_suffix(
     For each row:
       - prompt_len = len(input_ids) - len(ref_logprobs)
       - output token positions are [prompt_len .. seq_len-1]
-      - token_logprobs[:, t-1] corresponds to log p(x_t | x_<t)
+      - logits from hidden_states[:, t-1] predict token x_t
     """
-    device = token_logprobs.device
-    bsz = int(token_logprobs.shape[0])
+    device = hidden_states.device
+    bsz = int(hidden_states.shape[0])
+
+    # Unwrap possible torch.compile and/or DDP wrappers for lm_head access
+    tgt = lm_head._orig_mod if hasattr(lm_head, "_orig_mod") else lm_head
+    tgt = tgt.module if hasattr(tgt, "module") else tgt
+    weight = tgt.weight
+    bias = tgt.bias if hasattr(tgt, "bias") else None
+    if bias is not None and not isinstance(bias, torch.Tensor):
+        bias = None
 
     # Grad-connected accumulator for the loss.
-    policy_sum = token_logprobs.sum() * 0.0
-    kl_sum = token_logprobs.sum() * 0.0
-    adv_sum = token_logprobs.sum() * 0.0
-    adv_abs_sum = token_logprobs.sum() * 0.0
-    ratio_sum = token_logprobs.sum() * 0.0
-    clip_count = token_logprobs.new_zeros((), dtype=torch.float32)
+    policy_sum = hidden_states.sum() * 0.0
+    kl_sum = hidden_states.sum() * 0.0
+    adv_sum = hidden_states.sum() * 0.0
+    adv_abs_sum = hidden_states.sum() * 0.0
+    ratio_sum = hidden_states.sum() * 0.0
+    clip_count = hidden_states.new_zeros((), dtype=torch.float32)
 
     tokens = 0
 
@@ -775,49 +828,68 @@ def _compute_policy_loss_aligned_suffix(
         seq_len = int(seq_lens[i])
         prompt_len = int(prompt_lens[i])
 
-        start = prompt_len - 1
-        end = start + out_len
+        # Need hidden at positions that predict the output tokens.
+        h_start = prompt_len - 1
+        h_end = h_start + out_len
 
-        if start < 0:
+        if h_start < 0:
             raise ValueError(f"Invalid prompt_len={prompt_len} for seq_len={seq_len} (need prompt_len>=1 when out_len>0).")
-        if end > (seq_len - 1) or end > int(token_logprobs.shape[1]):
+        if (prompt_len + out_len) != seq_len:
             raise ValueError(
-                f"Suffix slice out of range: start={start}, end={end}, seq_len={seq_len}, token_logprobs_Sm1={int(token_logprobs.shape[1])}"
+                f"Suffix alignment mismatch: prompt_len({prompt_len}) + out_len({out_len}) != seq_len({seq_len})."
+            )
+        if h_end > (seq_len - 1) or h_end > int(hidden_states.shape[1] - 1):
+            raise ValueError(
+                f"Suffix hidden slice out of range: start={h_start}, end={h_end}, seq_len={seq_len}, hidden_S={int(hidden_states.shape[1])}"
             )
 
-        new_lp = token_logprobs[i, start:end].to(torch.float32)
-        old_lp = torch.tensor(ref_logprobs[i], device=device, dtype=torch.float32)
-        adv_t = torch.tensor(advantages[i], device=device, dtype=torch.float32)
+        old_lp_full = torch.tensor(ref_logprobs[i], device=device, dtype=torch.float32)
+        adv_full = torch.tensor(advantages[i], device=device, dtype=torch.float32)
 
-        if old_lp.numel() != new_lp.numel() or adv_t.numel() != new_lp.numel():
-            raise ValueError(
-                f"Length mismatch for row {i}: new_lp={int(new_lp.numel())} old_lp={int(old_lp.numel())} adv={int(adv_t.numel())}"
-            )
+        h = hidden_states[i, h_start:h_end, :]  # [out_len, H]
+        y = input_ids[i, prompt_len:seq_len]  # [out_len]
 
-        log_ratio = new_lp - old_lp
-        ratio = torch.exp(log_ratio)
+        if int(h.shape[0]) != out_len or int(y.numel()) != out_len:
+            raise ValueError(f"Internal slice mismatch for row {i}: h={tuple(h.shape)} y={int(y.numel())} out_len={out_len}")
 
-        if ppo_clip_range and ppo_clip_range > 0.0:
-            lo = 1.0 - float(ppo_clip_range)
-            hi = 1.0 + float(ppo_clip_range)
-            clipped = (ratio > hi) | (ratio < lo)
-            clip_count = clip_count + clipped.to(torch.float32).sum()
-            ratio_used = torch.clamp(ratio, lo, hi)
-        else:
-            ratio_used = ratio
+        for j in range(0, out_len, int(logprob_chunk_size)):
+            j2 = min(out_len, j + int(logprob_chunk_size))
+            h_chunk = h[j:j2]
+            y_chunk = y[j:j2]
+            old_lp = old_lp_full[j:j2]
+            adv_t = adv_full[j:j2]
 
-        adv_final = (adv_t - log_ratio).detach()
-        policy_tokens = -(ratio_used * adv_final)
+            logits = F.linear(h_chunk, weight, bias)  # [chunk, V]
+            nll = F.cross_entropy(logits, y_chunk, reduction="none")
+            new_lp = (-nll).to(torch.float32)
 
-        policy_sum = policy_sum + policy_tokens.sum()
-        kl_sum = kl_sum + (old_lp - new_lp).sum()
-        adv_sum = adv_sum + adv_final.sum()
-        adv_abs_sum = adv_abs_sum + adv_final.abs().sum()
-        ratio_sum = ratio_sum + ratio.sum()
-        tokens += int(new_lp.numel())
+            log_ratio = new_lp - old_lp
+            ratio = torch.exp(log_ratio)
+
+            if ppo_clip_range and ppo_clip_range > 0.0:
+                lo = 1.0 - float(ppo_clip_range)
+                hi = 1.0 + float(ppo_clip_range)
+                clipped = (ratio > hi) | (ratio < lo)
+                clip_count = clip_count + clipped.to(torch.float32).sum()
+                ratio_used = torch.clamp(ratio, lo, hi)
+            else:
+                ratio_used = ratio
+
+            adv_final = (adv_t - log_ratio).detach()
+            policy_tokens = -(ratio_used * adv_final)
+
+            policy_sum = policy_sum + policy_tokens.sum()
+            kl_sum = kl_sum + (old_lp - new_lp).sum()
+            adv_sum = adv_sum + adv_final.sum()
+            adv_abs_sum = adv_abs_sum + adv_final.abs().sum()
+            ratio_sum = ratio_sum + ratio.sum()
+            tokens += int(new_lp.numel())
 
     if tokens == 0:
-        zero = token_logprobs.sum() * 0.0
+        zero = hidden_states.sum() * 0.0
+        zero = zero + weight.sum() * 0.0
+        if bias is not None:
+            zero = zero + bias.sum() * 0.0
         z = zero.detach()
         return zero, {
             "policy_loss": z,
@@ -888,26 +960,32 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     if device.type != "cuda" and attn_impl == "flash_attention_2":
         attn_impl = "sdpa"
 
-    model = AutoModelForCausalLM.from_pretrained(
+    hf_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_id,
         torch_dtype=cfg.dtype,
         attn_implementation=attn_impl,
         trust_remote_code=True,
     )
     try:
-        model.config.use_cache = False
+        hf_model.config.use_cache = False
     except Exception:
         pass
 
     if cfg.gradient_checkpointing:
-        model.gradient_checkpointing_enable()
+        hf_model.gradient_checkpointing_enable()
 
-    model.to(device)
+    hf_model.to(device)
+
+    model: torch.nn.Module = _BackboneOnlyCausalLM(hf_model).to(device)
     if distributed:
         model = DDP(model, device_ids=[device] if device.type == "cuda" else None)
 
     if cfg.compile_mode != "none":
         model = torch.compile(model, mode=cfg.compile_mode)
+
+    lm_head = _unwrap_model(model).hf_model.get_output_embeddings()
+    if lm_head is None:
+        raise ValueError("Model has no output embeddings; cannot compute token logprobs.")
 
     dataset = PreprocessedParquetDataset(
         cfg.data_path,
@@ -985,6 +1063,7 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     "num_epochs": cfg.num_epochs,
                     "max_seq_len": cfg.max_seq_len,
                     "ddp_timeout_seconds": cfg.ddp_timeout_seconds,
+                    "logprob_chunk_size": cfg.logprob_chunk_size,
                 },
             )
         except Exception:
@@ -1007,13 +1086,15 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
     step_adv_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_adv_abs_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
     step_ratio_mean_sum = torch.zeros((), device=device, dtype=torch.float32)
+    step_max_seq_local = 0
+    step_max_out_local = 0
 
     def save_checkpoint(step: int):
         if not master:
             return
         out_dir = cfg.output_dir
         tgt = _unwrap_model(model)
-        tgt.save_pretrained(out_dir)
+        tgt.hf_model.save_pretrained(out_dir)
         tokenizer.save_pretrained(out_dir)
         if master:
             with open(os.path.join(out_dir, "training_state.txt"), "w", encoding="utf-8") as f:
@@ -1048,30 +1129,33 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                 accum += 1
 
+                try:
+                    seq_max = max(int(x) for x in (batch.get("seq_lens") or []))
+                except ValueError:
+                    seq_max = 0
+                try:
+                    out_max = max(int(s) - int(p) for s, p in zip(batch.get("seq_lens") or [], batch.get("prompt_lens") or []))
+                except ValueError:
+                    out_max = 0
+                step_max_seq_local = max(step_max_seq_local, int(seq_max))
+                step_max_out_local = max(step_max_out_local, int(out_max))
+
                 input_ids = batch["input_ids"].to(device, non_blocking=True)
                 attention_mask = batch["attention_mask"].to(device, non_blocking=True)
 
                 with autocast_ctx:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-                    logits = outputs.logits  # [B, S, V]
+                    hidden_states = model(input_ids=input_ids, attention_mask=attention_mask)
 
-                    shift_logits = logits[:, :-1, :].contiguous()
-                    shift_labels = input_ids[:, 1:].contiguous()
-                    bsz, seqlen_minus1, vocab = shift_logits.shape
-                    flat_nll = F.cross_entropy(
-                        shift_logits.view(-1, vocab),
-                        shift_labels.view(-1),
-                        reduction="none",
-                    )
-                    token_logprobs = (-flat_nll).view(bsz, seqlen_minus1)  # [B, S-1]
-
-                    loss, metrics = _compute_policy_loss_aligned_suffix(
-                        token_logprobs=token_logprobs,
+                    loss, metrics = _compute_policy_loss_from_hidden_suffix(
+                        hidden_states=hidden_states,
+                        input_ids=input_ids,
                         seq_lens=batch["seq_lens"],
                         prompt_lens=batch["prompt_lens"],
                         ref_logprobs=batch["ref_logprobs"],
                         advantages=batch["advantages"],
+                        lm_head=lm_head,
                         ppo_clip_range=cfg.ppo_clip_range,
+                        logprob_chunk_size=cfg.logprob_chunk_size,
                     )
                     loss = loss / float(cfg.grad_accum_steps)
 
@@ -1103,6 +1187,8 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         step_adv_mean_sum.zero_()
                         step_adv_abs_mean_sum.zero_()
                         step_ratio_mean_sum.zero_()
+                        step_max_seq_local = 0
+                        step_max_out_local = 0
                         continue
 
                     if cfg.grad_clip and cfg.grad_clip > 0:
@@ -1124,6 +1210,8 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
 
                     do_log = (global_step % max(1, cfg.log_every) == 0)
                     if do_log:
+                        step_max_seq_t = torch.tensor(step_max_seq_local, device=device, dtype=torch.long)
+                        step_max_out_t = torch.tensor(step_max_out_local, device=device, dtype=torch.long)
                         sums = torch.stack(
                             [
                                 step_policy_loss_sum,
@@ -1136,6 +1224,8 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                         )
                         if distributed:
                             dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(step_max_seq_t, op=dist.ReduceOp.MAX)
+                            dist.all_reduce(step_max_out_t, op=dist.ReduceOp.MAX)
 
                         denom = float(max(1, step_tokens_global))
                         mean_policy_loss = sums[0] / denom
@@ -1157,12 +1247,15 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                             "train/adv_mean": float(mean_adv.item()),
                             "train/adv_abs_mean": float(mean_adv_abs.item()),
                             "train/ratio_mean": float(mean_ratio.item()),
+                            "train/max_seq_len": int(step_max_seq_t.item()),
+                            "train/max_out_len": int(step_max_out_t.item()),
                             "train/elapsed_s": elapsed,
                         }
                         print(
                             f"[step {global_step}] loss={log_dict['train/policy_loss']:.6f} "
                             f"kl={log_dict['train/approx_kl']:.6f} clip={log_dict['train/clip_frac']:.3f} "
-                            f"tokens={int(step_tokens_global)} lr={lr:.3e}",
+                            f"tokens={int(step_tokens_global)} maxS={log_dict['train/max_seq_len']} "
+                            f"maxOut={log_dict['train/max_out_len']} lr={lr:.3e}",
                             flush=True,
                         )
                         if wb is not None:
@@ -1178,6 +1271,8 @@ def _train_worker(local_rank: int, world_size: int, cfg: Config) -> None:
                     step_adv_mean_sum.zero_()
                     step_adv_abs_mean_sum.zero_()
                     step_ratio_mean_sum.zero_()
+                    step_max_seq_local = 0
+                    step_max_out_local = 0
 
                     if cfg.max_steps and cfg.max_steps > 0 and global_step >= cfg.max_steps:
                         break

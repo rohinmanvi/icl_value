@@ -47,6 +47,7 @@ gae_lambda=0.99
 max_seq_len=32768
 max_rows=-1  # set to >0 for quick end-to-end tests
 preprocess_row_group_size=64
+logprob_chunk_size=512
 max_steps=-1
 
 base_name="$(basename "${data_path%.parquet}")"
@@ -81,6 +82,7 @@ echo "  PPO clip:    $ppo_clip_range"
 echo "  Tau:         $adv_smoothing_tau"
 echo "  GAE lambda:  $gae_lambda"
 echo "  Max seq len: $max_seq_len"
+echo "  Logprob chunk: $logprob_chunk_size"
 echo "  Max rows:    $max_rows"
 echo "  Max steps:   $max_steps"
 echo "  Start time:  $(date)"
@@ -98,6 +100,7 @@ python3 -u src/train_policy_ppd.py \
   --gae-lambda $gae_lambda \
   --max-seq-len $max_seq_len \
   --max-rows $max_rows \
+  --logprob-chunk-size $logprob_chunk_size \
   "${preprocess_args[@]}" \
   --max-steps $max_steps \
   --dtype bfloat16 \
