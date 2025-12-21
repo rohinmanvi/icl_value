@@ -184,7 +184,7 @@ def _is_finite(x: float) -> bool:
     return isinstance(x, (int, float)) and math.isfinite(float(x))
 
 
-def _compute_advantages(p_correct: Sequence[float], *, tau: float, gae_lambda: float, adv_clip: float) -> Tuple[List[float], List[float]]:
+def _compute_advantages(p_correct: Sequence[float], *, gae_lambda: float, adv_clip: float) -> Tuple[List[float], List[float]]:
     values: List[float] = []
     for p in p_correct:
         try:
@@ -199,7 +199,7 @@ def _compute_advantages(p_correct: Sequence[float], *, tau: float, gae_lambda: f
             p_f = 0.0
         elif p_f > 1.0:
             p_f = 1.0
-        values.append(math.log((p_f + float(tau)) / (1.0 + float(tau))))
+        values.append(p_f)
 
     n = len(values)
     if n == 0:
@@ -475,7 +475,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--length-bins", type=int, nargs="+", default=[0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768])
     p.add_argument("--reward-values", type=float, nargs="+", default=[0.0, 1.0])
 
-    p.add_argument("--adv-smoothing-tau", type=float, default=0.1)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--adv-clip", type=float, default=0.0)
 
@@ -730,7 +729,6 @@ def main() -> None:
     parts.append(f"distribution_token_id: {int(args.distribution_token_id)}<br>")
     parts.append(f"length_bins: {html_lib.escape(str(length_bins))}<br>")
     parts.append(f"reward_values: {html_lib.escape(str(reward_values))}<br>")
-    parts.append(f"adv_smoothing_tau: {float(args.adv_smoothing_tau)}<br>")
     parts.append(f"gae_lambda: {float(args.gae_lambda)}<br>")
     parts.append(f"adv_clip: {float(args.adv_clip)}<br>")
     parts.append(f"use_parquet_p_correct: {1 if bool(args.use_parquet_p_correct) else 0}<br>")
@@ -800,7 +798,6 @@ def main() -> None:
 
             adv, vals = _compute_advantages(
                 p_corr,
-                tau=float(args.adv_smoothing_tau),
                 gae_lambda=float(args.gae_lambda),
                 adv_clip=float(args.adv_clip),
             )
