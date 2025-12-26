@@ -19,7 +19,7 @@ import time
 import traceback
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -34,6 +34,12 @@ NEW_COLUMNS = (
     ("ref_logprobs", pa.list_(pa.float32())),
     ("ref_logprob_sum", pa.float32()),
     ("ref_logprob_mean", pa.float32()),
+)
+
+# Candidate columns for policy distillation (only added when --min-p is set)
+CANDIDATE_COLUMNS = (
+    ("candidate_ids", pa.list_(pa.list_(pa.int32()))),       # [num_positions][num_candidates]
+    ("candidate_logprobs", pa.list_(pa.list_(pa.float32()))), # [num_positions][num_candidates]
 )
 
 
@@ -60,6 +66,7 @@ class Config:
     attn_implementation: str
     allow_partial_merge: bool
     max_rows: int
+    min_p: float  # If > 0, extract candidate tokens passing min_p filter
 
 
 def parse_args() -> Config:
@@ -87,6 +94,16 @@ def parse_args() -> Config:
         help="If set, merge whatever shard outputs exist; otherwise require all dp shards.",
     )
     p.add_argument("--max-rows", type=int, default=-1, help="If >0, stop after scoring this many rows per worker.")
+    p.add_argument(
+        "--min-p",
+        type=float,
+        default=0.05,
+        help=(
+            "If >0, extract candidate tokens at each position where p(token) >= min_p * max_p. "
+            "Adds candidate_ids and candidate_logprobs columns for policy distillation. "
+            "Typical value: 0.05"
+        ),
+    )
     args = p.parse_args()
 
     in_abs = os.path.abspath(args.in_parquet)
@@ -107,6 +124,10 @@ def parse_args() -> Config:
     if arrow_batch_size <= 0:
         raise ValueError("--arrow-batch-size must be >= 1")
 
+    min_p = float(args.min_p)
+    if min_p < 0.0 or min_p >= 1.0:
+        raise ValueError("--min-p must be in [0, 1)")
+
     return Config(
         model_id=args.model_id,
         in_parquet=args.in_parquet,
@@ -118,6 +139,7 @@ def parse_args() -> Config:
         attn_implementation=str(args.attn_implementation),
         allow_partial_merge=bool(args.allow_partial_merge),
         max_rows=int(args.max_rows),
+        min_p=min_p,
     )
 
 
@@ -158,16 +180,19 @@ def _ensure_required_columns(schema: pa.Schema) -> None:
             )
 
 
-def _add_new_columns_to_schema(schema: pa.Schema) -> pa.Schema:
+def _add_new_columns_to_schema(schema: pa.Schema, *, include_candidates: bool = False) -> pa.Schema:
     names = set(schema.names)
-    for col, _typ in NEW_COLUMNS:
+    all_columns = list(NEW_COLUMNS)
+    if include_candidates:
+        all_columns.extend(CANDIDATE_COLUMNS)
+    for col, _typ in all_columns:
         if col in names:
             raise ValueError(
                 f"Input parquet already has column '{col}'. "
                 "Write to a new --out-parquet (or remove the existing columns first)."
             )
     out = schema
-    for col, typ in NEW_COLUMNS:
+    for col, typ in all_columns:
         out = out.append(pa.field(col, typ))
     return out
 
@@ -239,17 +264,65 @@ def _pad_batch(
     return input_ids, attention_mask, lengths
 
 
+def _extract_candidates_at_positions(
+    log_probs: torch.Tensor,  # [B, S, V] or [S, V]
+    *,
+    min_p: float,
+    valid_mask: torch.Tensor,  # [B, S] or [S] - True for valid positions
+) -> List[List[Tuple[List[int], List[float]]]]:
+    """
+    Extract candidate tokens at each position using min_p filtering.
+
+    For each position, a token is a candidate if p(token) >= min_p * max_p(position).
+
+    Returns: List[List[Tuple[List[int], List[float]]]]
+        Outer list: batch dimension
+        Middle list: sequence positions
+        Inner tuple: (candidate_token_ids, candidate_log_probs)
+    """
+    if log_probs.dim() == 2:
+        log_probs = log_probs.unsqueeze(0)
+        valid_mask = valid_mask.unsqueeze(0)
+
+    B, S, V = log_probs.shape
+    probs = log_probs.exp()  # [B, S, V]
+    max_probs = probs.max(dim=-1, keepdim=True).values  # [B, S, 1]
+    threshold = min_p * max_probs  # [B, S, 1]
+
+    results: List[List[Tuple[List[int], List[float]]]] = []
+
+    for b in range(B):
+        seq_results: List[Tuple[List[int], List[float]]] = []
+        for s in range(S):
+            if not valid_mask[b, s]:
+                seq_results.append(([], []))
+                continue
+
+            mask = probs[b, s] >= threshold[b, s, 0]
+            indices = mask.nonzero(as_tuple=True)[0]
+            cand_ids = indices.tolist()
+            cand_lps = log_probs[b, s, indices].tolist()
+            seq_results.append((cand_ids, cand_lps))
+        results.append(seq_results)
+
+    return results
+
+
 @torch.inference_mode()
 def _score_minibatch(
     model: torch.nn.Module,
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-) -> torch.Tensor:
+    min_p: float = 0.0,
+) -> Tuple[torch.Tensor, Optional[List[List[Tuple[List[int], List[float]]]]]]:
     """
     Return per-token logprobs for the *next token* labels.
 
     Output shape: [B, S-1] where logprobs[b, t-1] = log p(x_t | x_<t).
+
+    If min_p > 0, also returns candidate tokens at each position:
+        List[List[Tuple[List[int], List[float]]]] - [B][S-1][(cand_ids, cand_lps)]
     """
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     logits = outputs.logits  # [B, S, V]
@@ -257,17 +330,25 @@ def _score_minibatch(
     shift_labels = input_ids[:, 1:].contiguous()
 
     bsz, seqlen_minus1, vocab = shift_logits.shape
-    flat_loss = F.cross_entropy(
-        shift_logits.view(-1, vocab),
-        shift_labels.view(-1),
-        reduction="none",
-    )
-    logprobs = (-flat_loss).view(bsz, seqlen_minus1)
+
+    # Compute log probs for all tokens (needed for candidates)
+    log_probs = F.log_softmax(shift_logits.float(), dim=-1)  # [B, S-1, V]
+
+    # Extract actual token logprobs
+    logprobs = log_probs.gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)  # [B, S-1]
 
     # Mask out padded labels (positions where the target token is padding).
     label_mask = attention_mask[:, 1:].to(torch.bool)
     logprobs = torch.where(label_mask, logprobs, torch.full_like(logprobs, float("nan")))
-    return logprobs
+
+    # Extract candidates if requested
+    candidates = None
+    if min_p > 0.0:
+        candidates = _extract_candidates_at_positions(
+            log_probs, min_p=min_p, valid_mask=label_mask
+        )
+
+    return logprobs, candidates
 
 
 def _gather_logprobs(
@@ -275,7 +356,7 @@ def _gather_logprobs(
     *,
     input_lengths: Sequence[int],
     label_positions: Sequence[Sequence[int]],
-) -> tuple[List[List[float]], List[float], List[float]]:
+) -> Tuple[List[List[float]], List[float], List[float]]:
     """
     Convert [B, S-1] token logprobs into per-row lists aligned to label_positions.
     """
@@ -311,6 +392,55 @@ def _gather_logprobs(
         out_sums.append(s)
         out_means.append(float(s / len(row_lp)))
     return out_lists, out_sums, out_means
+
+
+def _gather_candidates(
+    candidates: List[List[Tuple[List[int], List[float]]]],
+    *,
+    input_lengths: Sequence[int],
+    label_positions: Sequence[Sequence[int]],
+) -> Tuple[List[List[List[int]]], List[List[List[float]]]]:
+    """
+    Extract candidates at label_positions from the full [B][S-1] candidate list.
+
+    Returns:
+        candidate_ids: List[List[List[int]]] - [B][num_label_positions][num_candidates]
+        candidate_logprobs: List[List[List[float]]] - [B][num_label_positions][num_candidates]
+    """
+    out_ids: List[List[List[int]]] = []
+    out_lps: List[List[List[float]]] = []
+
+    for i, cand_seq in enumerate(candidates):
+        seq_len = int(input_lengths[i])
+        positions = list(label_positions[i])
+
+        if not positions:
+            out_ids.append([])
+            out_lps.append([])
+            continue
+
+        row_ids: List[List[int]] = []
+        row_lps: List[List[float]] = []
+
+        for pos in positions:
+            if not isinstance(pos, int):
+                pos = int(pos)
+            # pos is the label position (1-indexed for token at that position)
+            # candidates are stored at index pos-1 (0-indexed, shifted like logprobs)
+            cand_idx = pos - 1
+            if cand_idx < 0 or cand_idx >= len(cand_seq):
+                # Out of range - append empty
+                row_ids.append([])
+                row_lps.append([])
+            else:
+                ids, lps = cand_seq[cand_idx]
+                row_ids.append(ids)
+                row_lps.append(lps)
+
+        out_ids.append(row_ids)
+        out_lps.append(row_lps)
+
+    return out_ids, out_lps
 
 
 def _load_tokenizer(model_id: str):
@@ -349,7 +479,8 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
 
     pf = pq.ParquetFile(cfg.in_parquet)
     _ensure_required_columns(pf.schema_arrow)
-    out_schema = _add_new_columns_to_schema(pf.schema_arrow)
+    include_candidates = cfg.min_p > 0.0
+    out_schema = _add_new_columns_to_schema(pf.schema_arrow, include_candidates=include_candidates)
 
     os.makedirs(os.path.dirname(cfg.out_parquet) or ".", exist_ok=True)
     shard_path = f"{cfg.out_parquet}.part{local_rank}"
@@ -377,6 +508,8 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
             ref_logprobs_all: List[List[float]] = []
             ref_sum_all: List[float] = []
             ref_mean_all: List[float] = []
+            candidate_ids_all: List[List[List[int]]] = []
+            candidate_lps_all: List[List[List[float]]] = []
 
             for start in range(0, n_rows, cfg.batch_size):
                 end = min(n_rows, start + cfg.batch_size)
@@ -395,10 +528,15 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                         ref_logprobs_all.append([])
                         ref_sum_all.append(0.0)
                         ref_mean_all.append(float("nan"))
+                        if include_candidates:
+                            candidate_ids_all.append([])
+                            candidate_lps_all.append([])
                     continue
 
                 with autocast_ctx:
-                    token_logprobs = _score_minibatch(model, input_ids=input_ids_t, attention_mask=attention_mask_t)
+                    token_logprobs, candidates = _score_minibatch(
+                        model, input_ids=input_ids_t, attention_mask=attention_mask_t, min_p=cfg.min_p
+                    )
 
                 lp_lists, lp_sums, lp_means = _gather_logprobs(
                     token_logprobs, input_lengths=lengths, label_positions=mb_label_positions
@@ -406,6 +544,13 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                 ref_logprobs_all.extend(lp_lists)
                 ref_sum_all.extend(lp_sums)
                 ref_mean_all.extend(lp_means)
+
+                if include_candidates and candidates is not None:
+                    cand_ids, cand_lps = _gather_candidates(
+                        candidates, input_lengths=lengths, label_positions=mb_label_positions
+                    )
+                    candidate_ids_all.extend(cand_ids)
+                    candidate_lps_all.extend(cand_lps)
 
             # Truncate if max_rows cuts mid-batch.
             if cfg.max_rows > 0:
@@ -415,12 +560,25 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                     ref_logprobs_all = ref_logprobs_all[:remaining]
                     ref_sum_all = ref_sum_all[:remaining]
                     ref_mean_all = ref_mean_all[:remaining]
+                    if include_candidates:
+                        candidate_ids_all = candidate_ids_all[:remaining]
+                        candidate_lps_all = candidate_lps_all[:remaining]
                     n_rows = remaining
 
             rb = rb.append_column("ref_model_id", pa.array([cfg.model_id] * n_rows, type=pa.string()))
             rb = rb.append_column("ref_logprobs", pa.array(ref_logprobs_all, type=pa.list_(pa.float32())))
             rb = rb.append_column("ref_logprob_sum", pa.array(ref_sum_all, type=pa.float32()))
             rb = rb.append_column("ref_logprob_mean", pa.array(ref_mean_all, type=pa.float32()))
+
+            if include_candidates:
+                rb = rb.append_column(
+                    "candidate_ids",
+                    pa.array(candidate_ids_all, type=pa.list_(pa.list_(pa.int32())))
+                )
+                rb = rb.append_column(
+                    "candidate_logprobs",
+                    pa.array(candidate_lps_all, type=pa.list_(pa.list_(pa.float32())))
+                )
 
             writer.write_table(pa.Table.from_batches([rb], schema=out_schema))
             processed += n_rows
@@ -486,13 +644,15 @@ def main() -> None:
     if ngpus == 0 and dp != 1:
         raise RuntimeError("No CUDA devices visible; run with --dp-size 1 for CPU scoring.")
 
+    min_p_info = f"  min_p:    {cfg.min_p} (extracting candidates)\n" if cfg.min_p > 0 else ""
     print(
         f"Scoring parquet with reference model:\n"
         f"  model_id: {cfg.model_id}\n"
         f"  in:       {cfg.in_parquet}\n"
         f"  out:      {cfg.out_parquet}\n"
         f"  dp_size:  {dp}\n"
-        f"  batch:    {cfg.batch_size} (arrow batch {cfg.arrow_batch_size})\n",
+        f"  batch:    {cfg.batch_size} (arrow batch {cfg.arrow_batch_size})\n"
+        f"{min_p_info}",
         flush=True,
     )
 

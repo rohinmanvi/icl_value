@@ -56,6 +56,67 @@ NEW_COLUMNS = (
     ("critic_expected_tokens_remaining", pa.list_(pa.float32())),
 )
 
+# Additional columns for candidate Q-value evaluation
+CANDIDATE_Q_COLUMNS = (
+    ("candidate_q_values", pa.list_(pa.list_(pa.float32()))),  # [num_positions][num_candidates]
+)
+
+
+# ---------------------------------------------------------------------------
+# KV Cache Helpers
+# ---------------------------------------------------------------------------
+
+def _slice_kv_cache(
+    past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+    end: int,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+    """
+    Slice KV cache to [0:end] along the sequence dimension.
+
+    Args:
+        past_key_values: Tuple of (key, value) pairs, one per layer.
+            Each key/value has shape [batch, num_heads, seq_len, head_dim].
+        end: End index for slicing (exclusive).
+
+    Returns:
+        Sliced KV cache with seq_len = end.
+    """
+    if end <= 0:
+        # Return empty cache structure
+        return tuple(
+            (k[:, :, :0, :], v[:, :, :0, :])
+            for k, v in past_key_values
+        )
+    return tuple(
+        (k[:, :, :end, :], v[:, :, :end, :])
+        for k, v in past_key_values
+    )
+
+
+def _expand_kv_cache(
+    past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
+    batch_size: int,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+    """
+    Expand KV cache batch dimension from 1 to batch_size via broadcasting.
+
+    This uses expand() which creates a view without copying memory.
+
+    Args:
+        past_key_values: Tuple of (key, value) pairs with batch_size=1.
+        batch_size: Target batch size.
+
+    Returns:
+        Expanded KV cache with the new batch size.
+    """
+    return tuple(
+        (
+            k.expand(batch_size, -1, -1, -1),
+            v.expand(batch_size, -1, -1, -1),
+        )
+        for k, v in past_key_values
+    )
+
 
 def _dtype_from_str(s: str) -> torch.dtype:
     s = (s or "").lower().strip()
@@ -222,24 +283,34 @@ def parse_args() -> Config:
     )
 
 
-def _ensure_required_columns(schema: pa.Schema, *, label_column: str) -> None:
+def _ensure_required_columns(schema: pa.Schema, *, label_column: str, require_candidates: bool = False) -> None:
     names = set(schema.names)
     required = {"prompt_idx", "prompt", "output_token_ids", label_column}
+    if require_candidates:
+        required.add("candidate_ids")
     missing = [c for c in required if c not in names]
     if missing:
         raise ValueError(f"Input parquet missing required columns: {missing}")
 
 
-def _add_new_columns_to_schema(schema: pa.Schema) -> pa.Schema:
+def _has_candidate_columns(schema: pa.Schema) -> bool:
+    """Check if the schema has candidate_ids column for Q-value evaluation."""
+    return "candidate_ids" in set(schema.names)
+
+
+def _add_new_columns_to_schema(schema: pa.Schema, *, include_candidate_q: bool = False) -> pa.Schema:
     names = set(schema.names)
-    for col, _typ in NEW_COLUMNS:
+    all_columns = list(NEW_COLUMNS)
+    if include_candidate_q:
+        all_columns.extend(CANDIDATE_Q_COLUMNS)
+    for col, _typ in all_columns:
         if col in names:
             raise ValueError(
                 f"Input parquet already has column '{col}'. "
                 "Write to a new --out-parquet (or remove the existing columns first)."
             )
     out = schema
-    for col, typ in NEW_COLUMNS:
+    for col, typ in all_columns:
         out = out.append(pa.field(col, typ))
     return out
 
@@ -499,6 +570,151 @@ def _predict_for_positions(
     return (p_correct.detach().float().cpu().tolist(), expected_remaining.detach().float().cpu().tolist())
 
 
+@torch.inference_mode()
+def _predict_with_kv_cache(
+    model: torch.nn.Module,
+    *,
+    input_ids: torch.Tensor,        # [1, S]
+    attention_mask: torch.Tensor,   # [1, S]
+    positions: Sequence[int],
+    candidate_ids: Sequence[Sequence[int]],  # [num_positions][num_candidates]
+    distribution_token_id: int,
+    num_bins: int,
+    num_length_bins: int,
+    correct_reward_index: int,
+    length_midpoints: torch.Tensor,  # [num_length_bins]
+) -> Tuple[List[float], List[float], List[List[float]]]:
+    """
+    Predict P(correct) for actual tokens AND evaluate Q-values for candidates.
+
+    Uses KV caching for efficiency:
+    1. Run full sequence once to get KV cache + hidden states for actual tokens
+    2. For each position, slice KV cache and evaluate all candidates in a batch
+
+    Returns:
+        p_correct: List[float] - P(correct) for actual tokens at each position
+        expected_remaining: List[float] - Expected tokens remaining at each position
+        candidate_q_values: List[List[float]] - Q-values for each candidate at each position
+    """
+    if not positions:
+        return ([], [], [])
+
+    device = input_ids.device
+    seq_len = input_ids.shape[1]
+
+    # Step 1: Run full sequence with KV cache enabled
+    base = _get_base_model(model)
+    if base is None:
+        out = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        hidden = out.hidden_states[-1]
+        past_key_values = out.past_key_values
+    else:
+        out = base(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            return_dict=True,
+        )
+        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            hidden = out.last_hidden_state
+        elif hasattr(out, "hidden_states") and out.hidden_states is not None:
+            hidden = out.hidden_states[-1]
+        else:
+            raise RuntimeError("Cannot obtain last_hidden_state")
+        past_key_values = out.past_key_values
+
+    # Step 2: Extract predictions for actual tokens (same as before)
+    pos_t = torch.tensor(list(positions), device=device, dtype=torch.long)
+    h_sel = hidden[0].index_select(0, pos_t)  # [T, E]
+
+    lm_head = _unwrap_lm_head(model)
+    w = lm_head.weight[distribution_token_id : distribution_token_id + num_bins]
+    b = (
+        lm_head.bias[distribution_token_id : distribution_token_id + num_bins]
+        if hasattr(lm_head, "bias") and lm_head.bias is not None
+        else None
+    )
+
+    logits = F.linear(h_sel, w, b).float()  # [T, num_bins]
+
+    num_reward_states = num_bins // num_length_bins
+    logits_rs = logits.view(-1, num_reward_states, num_length_bins)
+
+    logits_reward = torch.logsumexp(logits_rs, dim=2)  # [T, num_reward_states]
+    probs_reward = torch.softmax(logits_reward, dim=1)
+    p_correct = probs_reward[:, int(correct_reward_index)]
+
+    logits_length = torch.logsumexp(logits_rs, dim=1)  # [T, num_length_bins]
+    probs_length = torch.softmax(logits_length, dim=1)
+    expected_remaining = (probs_length * length_midpoints.unsqueeze(0)).sum(dim=1)
+
+    p_correct_list = p_correct.detach().float().cpu().tolist()
+    expected_remaining_list = expected_remaining.detach().float().cpu().tolist()
+
+    # Step 3: Evaluate candidates at each position using KV cache
+    candidate_q_values: List[List[float]] = []
+
+    for pos_idx, (pos, cands) in enumerate(zip(positions, candidate_ids)):
+        if not cands:
+            candidate_q_values.append([])
+            continue
+
+        K = len(cands)
+
+        # Slice KV cache to prefix [0:pos] (everything before this position)
+        # pos is the absolute position in the full sequence
+        sliced_kv = _slice_kv_cache(past_key_values, end=pos)
+
+        # Expand for batch of K candidates (broadcast, no memory copy)
+        expanded_kv = _expand_kv_cache(sliced_kv, batch_size=K)
+
+        # Create input for candidates: [K, 1]
+        cand_input = torch.tensor(cands, dtype=torch.long, device=device).unsqueeze(1)
+
+        # Forward pass with candidates
+        if base is None:
+            cand_out = model(
+                input_ids=cand_input,
+                past_key_values=expanded_kv,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            cand_hidden = cand_out.hidden_states[-1]  # [K, 1, E]
+        else:
+            cand_out = base(
+                input_ids=cand_input,
+                past_key_values=expanded_kv,
+                use_cache=False,
+                return_dict=True,
+            )
+            if hasattr(cand_out, "last_hidden_state") and cand_out.last_hidden_state is not None:
+                cand_hidden = cand_out.last_hidden_state
+            elif hasattr(cand_out, "hidden_states") and cand_out.hidden_states is not None:
+                cand_hidden = cand_out.hidden_states[-1]
+            else:
+                raise RuntimeError("Cannot obtain last_hidden_state for candidates")
+
+        # Extract Q-values (P(correct)) for each candidate
+        cand_h = cand_hidden.squeeze(1)  # [K, E]
+        cand_logits = F.linear(cand_h, w, b).float()  # [K, num_bins]
+
+        cand_logits_rs = cand_logits.view(-1, num_reward_states, num_length_bins)
+        cand_logits_reward = torch.logsumexp(cand_logits_rs, dim=2)  # [K, num_reward_states]
+        cand_probs_reward = torch.softmax(cand_logits_reward, dim=1)
+        cand_q = cand_probs_reward[:, int(correct_reward_index)]  # [K]
+
+        candidate_q_values.append(cand_q.detach().float().cpu().tolist())
+
+    return (p_correct_list, expected_remaining_list, candidate_q_values)
+
+
 def _row_group_range(num_row_groups: int, *, rank: int, world: int) -> Tuple[int, int]:
     start = (num_row_groups * rank) // world
     end = (num_row_groups * (rank + 1)) // world
@@ -566,7 +782,8 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
 
     pf = pq.ParquetFile(cfg.in_parquet)
     _ensure_required_columns(pf.schema_arrow, label_column=cfg.label_column)
-    out_schema = _add_new_columns_to_schema(pf.schema_arrow)
+    has_candidates = _has_candidate_columns(pf.schema_arrow)
+    out_schema = _add_new_columns_to_schema(pf.schema_arrow, include_candidate_q=has_candidates)
 
     start_rg, end_rg = _row_group_range(pf.num_row_groups, rank=local_rank, world=world)
     read_start_rg = max(0, start_rg - 1)
@@ -611,6 +828,18 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
             output_token_ids = table.column(table.schema.get_field_index("output_token_ids")).to_pylist()
             reward_vals = table.column(table.schema.get_field_index(cfg.label_column)).to_pylist()
 
+            # Load candidate_ids if available
+            row_candidate_ids: Optional[List[List[List[int]]]] = None
+            if has_candidates:
+                cand_col = table.column(table.schema.get_field_index("candidate_ids")).to_pylist()
+                row_candidate_ids = []
+                for cands in cand_col:
+                    if cands is None:
+                        row_candidate_ids.append([])
+                    else:
+                        # cands is List[List[int]] - candidates per position
+                        row_candidate_ids.append([list(c) if c else [] for c in cands])
+
             trajectories: List[_Trajectory] = []
             for i_row, (toks, r) in enumerate(zip(output_token_ids, reward_vals)):
                 toks_list = list(toks) if toks is not None else []
@@ -636,6 +865,7 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
 
             out_p_correct: List[Optional[List[float]]] = [None for _ in range(n_rows)]
             out_expected: List[Optional[List[float]]] = [None for _ in range(n_rows)]
+            out_q_values: List[Optional[List[List[float]]]] = [None for _ in range(n_rows)] if has_candidates else []
 
             label_all = rows_to_label is None
 
@@ -647,6 +877,8 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                 if orig_len == 0:
                     out_p_correct[target_idx] = []
                     out_expected[target_idx] = []
+                    if has_candidates:
+                        out_q_values[target_idx] = []
                     continue
 
                 full_input_ids, target_positions, trunc_len, _orig_len_check = _pack_target_last(
@@ -663,31 +895,62 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
                 if trunc_len <= 0 or not target_positions:
                     out_p_correct[target_idx] = [float("nan")] * orig_len
                     out_expected[target_idx] = [float("nan")] * orig_len
+                    if has_candidates:
+                        # Fill with empty lists for each position
+                        out_q_values[target_idx] = [[] for _ in range(orig_len)]
                     continue
 
                 input_ids_t = torch.tensor(full_input_ids, dtype=torch.long, device=device).unsqueeze(0)
                 attention_mask_t = torch.ones_like(input_ids_t, dtype=torch.long, device=device)
 
                 with autocast_ctx:
-                    p_list, e_list = _predict_for_positions(
-                        model,
-                        input_ids=input_ids_t,
-                        attention_mask=attention_mask_t,
-                        positions=target_positions,
-                        distribution_token_id=cfg.distribution_token_id,
-                        num_bins=num_bins,
-                        num_length_bins=num_length_bins,
-                        correct_reward_index=correct_reward_index,
-                        length_midpoints=length_mids,
-                    )
+                    if has_candidates and row_candidate_ids is not None:
+                        # Get candidates for this trajectory, truncated to match target_positions
+                        traj_candidates = row_candidate_ids[target_idx]
+                        # Truncate candidates to match the number of positions we're evaluating
+                        traj_candidates = traj_candidates[:len(target_positions)]
+                        # Pad with empty lists if needed
+                        while len(traj_candidates) < len(target_positions):
+                            traj_candidates.append([])
+
+                        p_list, e_list, q_list = _predict_with_kv_cache(
+                            model,
+                            input_ids=input_ids_t,
+                            attention_mask=attention_mask_t,
+                            positions=target_positions,
+                            candidate_ids=traj_candidates,
+                            distribution_token_id=cfg.distribution_token_id,
+                            num_bins=num_bins,
+                            num_length_bins=num_length_bins,
+                            correct_reward_index=correct_reward_index,
+                            length_midpoints=length_mids,
+                        )
+                    else:
+                        p_list, e_list = _predict_for_positions(
+                            model,
+                            input_ids=input_ids_t,
+                            attention_mask=attention_mask_t,
+                            positions=target_positions,
+                            distribution_token_id=cfg.distribution_token_id,
+                            num_bins=num_bins,
+                            num_length_bins=num_length_bins,
+                            correct_reward_index=correct_reward_index,
+                            length_midpoints=length_mids,
+                        )
+                        q_list = None
 
                 if len(p_list) < orig_len:
                     pad = [float("nan")] * (orig_len - len(p_list))
                     p_list = p_list + pad
                     e_list = e_list + pad
+                    if has_candidates and q_list is not None:
+                        # Pad q_list with empty lists for truncated positions
+                        q_list = q_list + [[] for _ in range(orig_len - len(q_list))]
 
                 out_p_correct[target_idx] = p_list
                 out_expected[target_idx] = e_list
+                if has_candidates:
+                    out_q_values[target_idx] = q_list if q_list is not None else [[] for _ in range(orig_len)]
 
             if rows_to_label is None:
                 model_ids = [cfg.critic_model_id] * n_rows
@@ -699,6 +962,10 @@ def _worker(local_rank: int, world: int, cfg: Config) -> None:
             table = table.append_column(
                 "critic_expected_tokens_remaining", pa.array(out_expected, type=pa.list_(pa.float32()))
             )
+            if has_candidates:
+                table = table.append_column(
+                    "candidate_q_values", pa.array(out_q_values, type=pa.list_(pa.list_(pa.float32())))
+                )
 
             writer.write_table(table, row_group_size=None)
             processed_groups += 1
@@ -773,6 +1040,11 @@ def main() -> None:
     if ngpus == 0 and dp != 1:
         raise RuntimeError("No CUDA devices visible; run with --dp-size 1 for CPU scoring.")
 
+    # Check if input has candidate columns for Q-value evaluation
+    pf_check = pq.ParquetFile(cfg.in_parquet)
+    has_candidates = _has_candidate_columns(pf_check.schema_arrow)
+    candidate_info = "  candidate_q:     enabled (using KV cache)\n" if has_candidates else ""
+
     print(
         f"Scoring parquet with in-context critic:\n"
         f"  critic_model_id: {cfg.critic_model_id}\n"
@@ -784,7 +1056,8 @@ def main() -> None:
         f"  reward_values:   {cfg.reward_values}\n"
         f"  shuffle_seed:    {cfg.shuffle_seed}\n"
         f"  label_per_prompt: {cfg.label_rollouts_per_prompt}\n"
-        f"  label_seed:      {cfg.label_seed}\n",
+        f"  label_seed:      {cfg.label_seed}\n"
+        f"{candidate_info}",
         flush=True,
     )
 
