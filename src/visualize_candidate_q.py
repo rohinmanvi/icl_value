@@ -13,6 +13,8 @@ import argparse
 import html as html_lib
 import os
 import random
+import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -538,15 +540,23 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _print_progress(msg: str, end: str = "\n") -> None:
+    """Print progress message with timestamp."""
+    timestamp = time.strftime("%H:%M:%S")
+    print(f"[{timestamp}] {msg}", end=end, flush=True)
+
+
 def main() -> None:
     args = parse_args()
+    script_start = time.time()
 
     torch.manual_seed(int(args.seed))
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     amp_dtype = _torch_dtype(args.dtype)
 
-    print(f"Loading critic model from {args.critic_path}...")
+    _print_progress(f"Loading critic model from {args.critic_path}...")
+    model_load_start = time.time()
     model_kwargs: Dict[str, Any] = {"torch_dtype": amp_dtype, "trust_remote_code": True}
     if args.attn_implementation and args.attn_implementation != "auto":
         model_kwargs["attn_implementation"] = args.attn_implementation
@@ -554,11 +564,14 @@ def main() -> None:
     critic_model = AutoModelForCausalLM.from_pretrained(args.critic_path, **model_kwargs)
     critic_model.to(device)
     critic_model.eval()
+    _print_progress(f"  Critic model loaded in {time.time() - model_load_start:.1f}s")
 
-    print(f"Loading reference model from {args.ref_path}...")
+    _print_progress(f"Loading reference model from {args.ref_path}...")
+    model_load_start = time.time()
     ref_model = AutoModelForCausalLM.from_pretrained(args.ref_path, **model_kwargs)
     ref_model.to(device)
     ref_model.eval()
+    _print_progress(f"  Reference model loaded in {time.time() - model_load_start:.1f}s")
 
     tok_src = args.tokenizer_path if args.tokenizer_path else args.ref_path
     tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
@@ -566,6 +579,7 @@ def main() -> None:
         tok.pad_token_id = tok.eos_token_id
 
     # Load data
+    _print_progress(f"Loading data from {args.data_path}...")
     pf = pq.ParquetFile(args.data_path)
     names = set(pf.schema_arrow.names)
 
@@ -595,12 +609,21 @@ def main() -> None:
         prompt_groups[int(pid)] = {"prompt": prompt_text, "rollouts": ro}
 
     prompt_ids_sorted = sorted(prompt_groups.keys())
+    _print_progress(f"  Loaded {len(prompt_groups)} prompts, {len(df)} total rollouts")
 
     # Select prompts
     if args.prompt_idx and len(args.prompt_idx) > 0:
         selected_prompt_ids = [int(pid) for pid in args.prompt_idx if int(pid) in prompt_groups]
     else:
         selected_prompt_ids = prompt_ids_sorted[: args.num_prompts]
+
+    # Count total rollouts to process
+    total_rollouts = sum(
+        min(len(prompt_groups[pid]["rollouts"]), args.max_rollouts_per_prompt) if args.max_rollouts_per_prompt > 0
+        else len(prompt_groups[pid]["rollouts"])
+        for pid in selected_prompt_ids if pid in prompt_groups
+    )
+    _print_progress(f"Will process {len(selected_prompt_ids)} prompts, {total_rollouts} rollouts")
 
     # Critic config
     if reward_col == "correct":
@@ -629,6 +652,10 @@ def main() -> None:
     parts.append("</div>")
 
     decode_cache: Dict[int, str] = {}
+    processed_rollouts = 0
+    processing_start = time.time()
+
+    _print_progress("Starting processing...")
 
     for p_i, pid in enumerate(selected_prompt_ids, start=1):
         grp = prompt_groups.get(int(pid), None)
@@ -641,6 +668,8 @@ def main() -> None:
         if int(args.max_rollouts_per_prompt) > 0:
             rollouts = rollouts[: int(args.max_rollouts_per_prompt)]
 
+        _print_progress(f"Prompt {p_i}/{len(selected_prompt_ids)} (idx={pid}): {len(rollouts)} rollouts")
+
         parts.append("<hr>")
         parts.append(f"<h2>prompt {p_i} | prompt_idx {int(pid)} | rollouts {len(rollouts)}</h2>")
         parts.append("<h3>prompt</h3>")
@@ -650,7 +679,8 @@ def main() -> None:
         parts.append('<div class="grid">')
 
         for r_i in range(len(rollouts)):
-            print(f"  Processing prompt {pid}, rollout {r_i}...")
+            rollout_start = time.time()
+            processed_rollouts += 1
 
             seed_i = (int(args.seed) * 1000003 + int(pid) * 1009 + int(r_i) * 9176) & 0xFFFFFFFF
             rng = random.Random(int(seed_i))
@@ -704,6 +734,14 @@ def main() -> None:
                     device=device,
                 )
 
+            rollout_time = time.time() - rollout_start
+            avg_cands = np.mean([len(c) for c in candidates_per_pos]) if candidates_per_pos else 0
+            _print_progress(
+                f"  Rollout {r_i+1}/{len(rollouts)}: {len(tgt_positions)} tokens, "
+                f"{avg_cands:.1f} avg candidates, {rollout_time:.2f}s "
+                f"[{processed_rollouts}/{total_rollouts}]"
+            )
+
             mean_q = float(np.mean(actual_q_values)) if actual_q_values else 0.0
 
             # Generate token spans with tooltips
@@ -747,7 +785,12 @@ def main() -> None:
     with open(args.out_html, "w", encoding="utf-8") as f:
         f.write("".join(parts))
 
-    print(f"Wrote {args.out_html}")
+    total_time = time.time() - script_start
+    _print_progress(
+        f"Done! Wrote {args.out_html}\n"
+        f"  Processed {processed_rollouts} rollouts in {total_time:.1f}s "
+        f"({total_time/max(processed_rollouts,1):.2f}s/rollout)"
+    )
 
 
 if __name__ == "__main__":
