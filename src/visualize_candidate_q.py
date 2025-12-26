@@ -10,6 +10,7 @@ For each position in a trajectory:
 from __future__ import annotations
 
 import argparse
+import gc
 import html as html_lib
 import os
 import random
@@ -85,14 +86,16 @@ def _slice_kv_cache(past_key_values: DynamicCache, end: int) -> DynamicCache:
 
 
 def _expand_kv_cache(past_key_values: DynamicCache, batch_size: int) -> DynamicCache:
-    """Expand KV cache batch dimension from 1 to batch_size via broadcasting."""
+    """Expand KV cache batch dimension from 1 to batch_size via cloning."""
     new_cache = DynamicCache()
     for layer_idx in range(len(past_key_values.key_cache)):
         k = past_key_values.key_cache[layer_idx]
         v = past_key_values.value_cache[layer_idx]
+        # Use expand + contiguous to create actual copies (not views)
+        # This prevents the model from modifying the original cache
         new_cache.update(
-            k.expand(batch_size, -1, -1, -1),
-            v.expand(batch_size, -1, -1, -1),
+            k.expand(batch_size, -1, -1, -1).contiguous(),
+            v.expand(batch_size, -1, -1, -1).contiguous(),
             layer_idx,
         )
     return new_cache
@@ -265,6 +268,22 @@ def _evaluate_q_values_with_kv_cache(
         # Sort by Q-value descending
         pos_results.sort(key=lambda x: -x[2])
         candidate_results.append(pos_results)
+
+        # Cleanup intermediate caches to free memory
+        del sliced_kv, expanded_kv, cand_input, cand_out, cand_hidden, cand_h
+        del cand_logits, cand_logits_rs, cand_logits_reward, cand_probs_reward
+
+        # Periodic GPU memory cleanup (every 100 positions)
+        if pos_idx % 100 == 99:
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    # Cleanup main cache
+    del past_key_values, hidden, out
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     return (actual_q, candidate_results)
 
@@ -780,6 +799,12 @@ def main() -> None:
             parts.append("</div>")
             parts.append(f'<div class="toks">{"".join(spans)}</div>')
             parts.append("</div>")
+
+            # Free GPU memory after each rollout
+            del input_ids_t, candidates_per_pos, actual_q_values, candidate_results
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         parts.append("</div>")
 
