@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import DynamicCache
 
 # Qwen chat token ids
 IM_START_TOKEN_ID = 151644
@@ -67,28 +68,34 @@ def _get_base_model(m: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# KV Cache Helpers (same as label_in_context_critic.py)
+# KV Cache Helpers (using DynamicCache API)
 # ---------------------------------------------------------------------------
 
-def _slice_kv_cache(
-    past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
-    end: int,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+def _slice_kv_cache(past_key_values: DynamicCache, end: int) -> DynamicCache:
     """Slice KV cache to [0:end] along the sequence dimension."""
-    if end <= 0:
-        return tuple((k[:, :, :0, :], v[:, :, :0, :]) for k, v in past_key_values)
-    return tuple((k[:, :, :end, :], v[:, :, :end, :]) for k, v in past_key_values)
+    new_cache = DynamicCache()
+    for layer_idx in range(len(past_key_values.key_cache)):
+        k = past_key_values.key_cache[layer_idx]
+        v = past_key_values.value_cache[layer_idx]
+        if end <= 0:
+            new_cache.update(k[:, :, :0, :], v[:, :, :0, :], layer_idx)
+        else:
+            new_cache.update(k[:, :, :end, :], v[:, :, :end, :], layer_idx)
+    return new_cache
 
 
-def _expand_kv_cache(
-    past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor], ...],
-    batch_size: int,
-) -> Tuple[Tuple[torch.Tensor, torch.Tensor], ...]:
+def _expand_kv_cache(past_key_values: DynamicCache, batch_size: int) -> DynamicCache:
     """Expand KV cache batch dimension from 1 to batch_size via broadcasting."""
-    return tuple(
-        (k.expand(batch_size, -1, -1, -1), v.expand(batch_size, -1, -1, -1))
-        for k, v in past_key_values
-    )
+    new_cache = DynamicCache()
+    for layer_idx in range(len(past_key_values.key_cache)):
+        k = past_key_values.key_cache[layer_idx]
+        v = past_key_values.value_cache[layer_idx]
+        new_cache.update(
+            k.expand(batch_size, -1, -1, -1),
+            v.expand(batch_size, -1, -1, -1),
+            layer_idx,
+        )
+    return new_cache
 
 
 # ---------------------------------------------------------------------------
