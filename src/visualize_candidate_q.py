@@ -10,7 +10,6 @@ For each position in a trajectory:
 from __future__ import annotations
 
 import argparse
-import gc
 import html as html_lib
 import os
 import random
@@ -72,6 +71,44 @@ def _get_base_model(m: Any) -> Any:
 # KV Cache Helpers (using DynamicCache API)
 # ---------------------------------------------------------------------------
 
+class ReadOnlyCache(DynamicCache):
+    """A cache wrapper that ignores update() calls, making it read-only.
+
+    This allows using .expand() views without the model corrupting them
+    when it calls cache.update() during forward pass.
+    """
+
+    def __init__(self, key_cache: List[torch.Tensor], value_cache: List[torch.Tensor]):
+        super().__init__()
+        self.key_cache = key_cache
+        self.value_cache = value_cache
+        # Set _seen_tokens to match the sequence length
+        if key_cache:
+            self._seen_tokens = key_cache[0].shape[2]
+
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return concatenated k/v but don't actually store the update."""
+        # Return what the model expects (full key/value for attention)
+        # but don't modify our stored cache
+        if layer_idx < len(self.key_cache):
+            full_k = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
+            full_v = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
+            return full_k, full_v
+        # Fallback for unexpected layer
+        return key_states, value_states
+
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if layer_idx < len(self.key_cache):
+            return self.key_cache[layer_idx].shape[2]
+        return 0
+
+
 def _slice_kv_cache(past_key_values: DynamicCache, end: int) -> DynamicCache:
     """Slice KV cache to [0:end] along the sequence dimension."""
     new_cache = DynamicCache()
@@ -85,20 +122,21 @@ def _slice_kv_cache(past_key_values: DynamicCache, end: int) -> DynamicCache:
     return new_cache
 
 
-def _expand_kv_cache(past_key_values: DynamicCache, batch_size: int) -> DynamicCache:
-    """Expand KV cache batch dimension from 1 to batch_size via cloning."""
-    new_cache = DynamicCache()
+def _expand_kv_cache(past_key_values: DynamicCache, batch_size: int) -> ReadOnlyCache:
+    """Expand KV cache batch dimension from 1 to batch_size via broadcasting.
+
+    Returns a ReadOnlyCache that ignores update() calls, allowing fast
+    .expand() views without memory copying.
+    """
+    expanded_keys = []
+    expanded_values = []
     for layer_idx in range(len(past_key_values.key_cache)):
         k = past_key_values.key_cache[layer_idx]
         v = past_key_values.value_cache[layer_idx]
-        # Use expand + contiguous to create actual copies (not views)
-        # This prevents the model from modifying the original cache
-        new_cache.update(
-            k.expand(batch_size, -1, -1, -1).contiguous(),
-            v.expand(batch_size, -1, -1, -1).contiguous(),
-            layer_idx,
-        )
-    return new_cache
+        # expand() creates a view - no memory copy, very fast
+        expanded_keys.append(k.expand(batch_size, -1, -1, -1))
+        expanded_values.append(v.expand(batch_size, -1, -1, -1))
+    return ReadOnlyCache(expanded_keys, expanded_values)
 
 
 # ---------------------------------------------------------------------------
@@ -273,17 +311,8 @@ def _evaluate_q_values_with_kv_cache(
         del sliced_kv, expanded_kv, cand_input, cand_out, cand_hidden, cand_h
         del cand_logits, cand_logits_rs, cand_logits_reward, cand_probs_reward
 
-        # Periodic GPU memory cleanup (every 100 positions)
-        if pos_idx % 100 == 99:
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
-
     # Cleanup main cache
     del past_key_values, hidden, out
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
 
     return (actual_q, candidate_results)
 
@@ -802,7 +831,6 @@ def main() -> None:
 
             # Free GPU memory after each rollout
             del input_ids_t, candidates_per_pos, actual_q_values, candidate_results
-            gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
