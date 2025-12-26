@@ -510,7 +510,7 @@ def _make_tooltip_html(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--critic_path", required=True, help="Path to critic model")
-    p.add_argument("--ref_path", required=True, help="Path to reference model (for candidate extraction)")
+    p.add_argument("--ref_path", default="Qwen/Qwen3-1.7B", help="Path to reference model (for candidate extraction)")
     p.add_argument("--data_path", required=True, help="Path to parquet data")
     p.add_argument("--out_html", required=True, help="Output HTML file")
 
