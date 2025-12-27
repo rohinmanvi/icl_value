@@ -427,6 +427,7 @@ def create_tokenized_message(role: str, tokenized_content: List[int]) -> List[in
 class Rollout:
     response_ids: List[int]
     reward: float
+    prompt_token_ids: List[int] = None  # Original prompt tokens for on-policy reference eval
 
 
 @dataclass
@@ -731,7 +732,7 @@ def _has_mixed_outcomes(
 
 def _load_prompt_groups(cfg: Config) -> Dict[int, Dict[str, Any]]:
     """Load and parse prompt groups from parquet file."""
-    table = pq.read_table(cfg.data_path, columns=["prompt_idx", "prompt", "output_token_ids", cfg.reward_col])
+    table = pq.read_table(cfg.data_path, columns=["prompt_idx", "prompt", "prompt_token_ids", "output_token_ids", cfg.reward_col])
     df = table.to_pandas()
 
     if cfg.reward_col == "correct":
@@ -749,7 +750,14 @@ def _load_prompt_groups(cfg: Config) -> Dict[int, Dict[str, Any]]:
             toks = r["output_token_ids"]
             if hasattr(toks, "tolist"):
                 toks = toks.tolist()
-            ro.append(Rollout(response_ids=list(toks), reward=float(r[cfg.reward_col])))
+            prompt_toks = r["prompt_token_ids"]
+            if hasattr(prompt_toks, "tolist"):
+                prompt_toks = prompt_toks.tolist()
+            ro.append(Rollout(
+                response_ids=list(toks),
+                reward=float(r[cfg.reward_col]),
+                prompt_token_ids=list(prompt_toks),
+            ))
         prompt_groups[int(pid)] = {"prompt": prompt_text, "rollouts": ro}
 
     return prompt_groups
@@ -878,25 +886,59 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 parts.append("</div>")
                 continue
 
-            # Debug: show first few target tokens
-            first_toks = tgt_token_ids[:5] if len(tgt_token_ids) >= 5 else tgt_token_ids
-            first_decoded = [tok.decode([t]) for t in first_toks]
-            print(f"[DEBUG data] rollout {r_i}: first target token IDs = {first_toks}, decoded = {first_decoded}", flush=True)
+            # Build on-policy reference sequence (original prompt + response)
+            # This ensures the reference model sees the same context as during inference
+            rollout = all_rollouts[r_i]
+            ref_prompt_ids = list(rollout.prompt_token_ids)
+            ref_response_ids = list(rollout.response_ids)
+            ref_input_ids = ref_prompt_ids + ref_response_ids
+            ref_input_t = torch.tensor(ref_input_ids, dtype=torch.long, device=device).unsqueeze(0)
 
-            input_ids_t = packed.input_ids.unsqueeze(0).to(device)
+            # Positions in the reference sequence for each response token
+            ref_positions = [len(ref_prompt_ids) + i for i in range(len(ref_response_ids))]
 
-            # Step 1: Get candidates from reference model
+            # Align lengths: tgt_token_ids might include an extra EOS footer
+            # that's not in the original response_ids
+            num_tgt_tokens = len(tgt_token_ids)
+            num_ref_tokens = len(ref_response_ids)
+
+            if num_tgt_tokens < num_ref_tokens:
+                # Truncation was applied to tgt_token_ids (max_tokens_per_rollout)
+                ref_positions = ref_positions[:num_tgt_tokens]
+                ref_response_ids = ref_response_ids[:num_tgt_tokens]
+            elif num_tgt_tokens > num_ref_tokens:
+                # Footer (EOS) was added to tgt_token_ids
+                # We'll handle this by padding candidates later
+                pass
+
+            # Debug: show sequence info
+            print(f"[DEBUG data] rollout {r_i}: ref_seq_len={len(ref_input_ids)}, "
+                  f"ref_prompt_len={len(ref_prompt_ids)}, ref_response_len={len(ref_response_ids)}, "
+                  f"tgt_tokens={num_tgt_tokens}", flush=True)
+
+            # Step 1: Get candidates from reference model (on-policy sequence)
             with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
                 candidates_per_pos = _get_candidates_at_positions(
                     ref_model,
-                    input_ids=input_ids_t,
-                    positions=tgt_positions,
-                    actual_token_ids=tgt_token_ids,
+                    input_ids=ref_input_t,
+                    positions=ref_positions,
+                    actual_token_ids=ref_response_ids,
                     min_p=cfg.min_p,
                     device=device,
                 )
 
-            # Step 2: Evaluate Q-values with critic
+            # Free reference input tensor
+            del ref_input_t
+
+            # Pad candidates for any footer tokens not in original response
+            while len(candidates_per_pos) < num_tgt_tokens:
+                # For footer tokens (like EOS), just include the token itself
+                footer_idx = len(candidates_per_pos)
+                footer_tid = tgt_token_ids[footer_idx]
+                candidates_per_pos.append([(footer_tid, 0.0)])
+
+            # Step 2: Evaluate Q-values with critic (packed sequence with context)
+            input_ids_t = packed.input_ids.unsqueeze(0).to(device)
             with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
                 actual_q_values, candidate_results, num_extra_fwd = _evaluate_q_values_with_kv_cache(
                     critic_model,
