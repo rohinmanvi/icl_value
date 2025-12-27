@@ -51,6 +51,8 @@ class Config:
     samples_per_prompt: int
     max_tokens_per_rollout: int
     require_mixed_outcomes: bool
+    min_correct_pct: float
+    min_incorrect_pct: float
     dp_size: int
     # Computed fields (set by main before spawning)
     selected_prompt_ids: List[int] = None
@@ -223,6 +225,7 @@ def _get_candidates_at_positions(
         cand_ids_set = set(indices.tolist())
 
         # Always include the actual token
+        was_in_set = actual_tid in cand_ids_set
         cand_ids_set.add(actual_tid)
 
         cand_ids = list(cand_ids_set)
@@ -230,6 +233,15 @@ def _get_candidates_at_positions(
 
         # Sort by probability (descending)
         candidates = sorted(zip(cand_ids, cand_lps), key=lambda x: -x[1])
+
+        # Debug: check if actual token is in final candidates (first position only)
+        if pos_idx == 0:
+            actual_in_candidates = any(c[0] == actual_tid for c in candidates)
+            top_cand_ids = [c[0] for c in candidates[:5]]
+            print(f"[DEBUG ref-model] pos_idx=0: actual_tid={actual_tid}, was_in_set={was_in_set}, "
+                  f"actual_in_candidates={actual_in_candidates}, num_candidates={len(candidates)}, "
+                  f"top_cand_ids={top_cand_ids}", flush=True)
+
         results.append(candidates)
 
     return results
@@ -322,6 +334,12 @@ def _evaluate_q_values_with_kv_cache(
                 actual_entry = (cand_id, cand_lp, actual_q[pos_idx])
             else:
                 other_candidates.append((cand_id, cand_lp))
+
+        # Debug for first position
+        if pos_idx == 0:
+            cand_ids_in_input = [c[0] for c in candidates]
+            print(f"[DEBUG Q-eval] pos_idx=0: actual_tid={actual_tid}, actual_entry={actual_entry is not None}, "
+                  f"candidates_count={len(candidates)}, cand_ids={cand_ids_in_input[:10]}...", flush=True)
 
         # If no other candidates, just use the actual token's pre-computed Q
         if not other_candidates:
@@ -669,6 +687,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_tokens_per_rollout", type=int, default=0)
     p.add_argument("--require_mixed_outcomes", action="store_true",
                    help="Only include prompts with both correct and incorrect responses")
+    p.add_argument("--min_correct_pct", type=float, default=10.0,
+                   help="Minimum percent correct required (0-100, used with --require_mixed_outcomes)")
+    p.add_argument("--min_incorrect_pct", type=float, default=10.0,
+                   help="Minimum percent incorrect required (0-100, used with --require_mixed_outcomes)")
     p.add_argument("--dp_size", type=int, default=0, help="Data parallel size (0=use all GPUs)")
 
     return p.parse_args()
@@ -680,14 +702,31 @@ def _print_progress(msg: str, end: str = "\n") -> None:
     print(f"[{timestamp}] {msg}", end=end, flush=True)
 
 
-def _has_mixed_outcomes(rollouts: List[Rollout], threshold: float = 0.5) -> bool:
-    """Check if rollouts have both correct and incorrect responses."""
+def _has_mixed_outcomes(
+    rollouts: List[Rollout],
+    threshold: float = 0.5,
+    min_correct_pct: float = 0.0,
+    min_incorrect_pct: float = 0.0,
+) -> bool:
+    """Check if rollouts have sufficient correct and incorrect responses.
+
+    Args:
+        rollouts: List of rollouts to check
+        threshold: Reward threshold for correct (>= threshold) vs incorrect (< threshold)
+        min_correct_pct: Minimum percentage of correct responses required (0-100)
+        min_incorrect_pct: Minimum percentage of incorrect responses required (0-100)
+    """
     if len(rollouts) < 2:
         return False
+
     rewards = [r.reward for r in rollouts]
-    has_correct = any(r >= threshold for r in rewards)
-    has_incorrect = any(r < threshold for r in rewards)
-    return has_correct and has_incorrect
+    num_correct = sum(1 for r in rewards if r >= threshold)
+    num_incorrect = len(rewards) - num_correct
+
+    correct_pct = 100.0 * num_correct / len(rewards)
+    incorrect_pct = 100.0 * num_incorrect / len(rewards)
+
+    return correct_pct >= min_correct_pct and incorrect_pct >= min_incorrect_pct
 
 
 def _load_prompt_groups(cfg: Config) -> Dict[int, Dict[str, Any]]:
@@ -839,6 +878,11 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 parts.append("</div>")
                 continue
 
+            # Debug: show first few target tokens
+            first_toks = tgt_token_ids[:5] if len(tgt_token_ids) >= 5 else tgt_token_ids
+            first_decoded = [tok.decode([t]) for t in first_toks]
+            print(f"[DEBUG data] rollout {r_i}: first target token IDs = {first_toks}, decoded = {first_decoded}", flush=True)
+
             input_ids_t = packed.input_ids.unsqueeze(0).to(device)
 
             # Step 1: Get candidates from reference model
@@ -885,6 +929,13 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             for idx, (tid, pos) in enumerate(zip(tgt_token_ids, tgt_positions)):
                 q_val = actual_q_values[idx] if idx < len(actual_q_values) else 0.0
                 candidates = candidate_results[idx] if idx < len(candidate_results) else []
+
+                # Debug for first token
+                if idx == 0:
+                    cand_token_ids = [c[0] for c in candidates]
+                    actual_in_final = tid in cand_token_ids
+                    print(f"[DEBUG tooltip] idx=0: tid={tid} ({_decode_token(tok, int(tid), decode_cache)!r}), "
+                          f"actual_in_final={actual_in_final}, cand_ids={cand_token_ids}", flush=True)
 
                 tok_str = html_lib.escape(_decode_token(tok, int(tid), decode_cache))
                 tooltip_html = _make_tooltip_html(tok, tid, candidates, decode_cache, cfg.max_candidates_show)
@@ -969,6 +1020,8 @@ def main() -> None:
         samples_per_prompt=args.samples_per_prompt,
         max_tokens_per_rollout=args.max_tokens_per_rollout,
         require_mixed_outcomes=args.require_mixed_outcomes,
+        min_correct_pct=args.min_correct_pct,
+        min_incorrect_pct=args.min_incorrect_pct,
         dp_size=dp,
         reward_col=reward_col,
     )
@@ -982,9 +1035,16 @@ def main() -> None:
     if args.require_mixed_outcomes:
         filtered_ids = [
             pid for pid in prompt_ids_sorted
-            if _has_mixed_outcomes(prompt_groups[pid]["rollouts"])
+            if _has_mixed_outcomes(
+                prompt_groups[pid]["rollouts"],
+                min_correct_pct=args.min_correct_pct,
+                min_incorrect_pct=args.min_incorrect_pct,
+            )
         ]
-        _print_progress(f"  After mixed outcomes filter: {len(filtered_ids)} prompts")
+        _print_progress(
+            f"  After mixed outcomes filter (>={args.min_correct_pct}% correct, "
+            f">={args.min_incorrect_pct}% incorrect): {len(filtered_ids)} prompts"
+        )
     else:
         filtered_ids = prompt_ids_sorted
 
