@@ -179,11 +179,15 @@ def _get_candidates_at_positions(
     model: Any,
     input_ids: torch.Tensor,  # [1, S]
     positions: List[int],
+    actual_token_ids: List[int],  # The actual tokens at each position (must be included)
     min_p: float,
     device: torch.device,
 ) -> List[List[Tuple[int, float]]]:
     """
     Get candidate tokens at each position using min_p filtering.
+
+    Always includes the actual token in the candidate set, even if it
+    doesn't pass the min_p threshold.
 
     Returns: List of [(token_id, log_prob), ...] for each position.
     """
@@ -198,10 +202,12 @@ def _get_candidates_at_positions(
     # So to get candidates for position p, we look at logits at p-1
     results: List[List[Tuple[int, float]]] = []
 
-    for pos in positions:
+    for pos_idx, pos in enumerate(positions):
         if pos <= 0:
             results.append([])
             continue
+
+        actual_tid = actual_token_ids[pos_idx]
 
         # Logits at pos-1 predict token at pos
         pos_logits = logits[0, pos - 1, :]  # [V]
@@ -214,8 +220,13 @@ def _get_candidates_at_positions(
         mask = probs >= threshold
 
         indices = mask.nonzero(as_tuple=True)[0]
-        cand_ids = indices.tolist()
-        cand_lps = log_probs[indices].tolist()
+        cand_ids_set = set(indices.tolist())
+
+        # Always include the actual token
+        cand_ids_set.add(actual_tid)
+
+        cand_ids = list(cand_ids_set)
+        cand_lps = log_probs[cand_ids].tolist()
 
         # Sort by probability (descending)
         candidates = sorted(zip(cand_ids, cand_lps), key=lambda x: -x[1])
@@ -836,6 +847,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                     ref_model,
                     input_ids=input_ids_t,
                     positions=tgt_positions,
+                    actual_token_ids=tgt_token_ids,
                     min_p=cfg.min_p,
                     device=device,
                 )
