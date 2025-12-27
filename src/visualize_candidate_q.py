@@ -233,15 +233,6 @@ def _get_candidates_at_positions(
 
         # Sort by probability (descending)
         candidates = sorted(zip(cand_ids, cand_lps), key=lambda x: -x[1])
-
-        # Debug: check if actual token is in final candidates (first position only)
-        if pos_idx == 0:
-            actual_in_candidates = any(c[0] == actual_tid for c in candidates)
-            top_cand_ids = [c[0] for c in candidates[:5]]
-            print(f"[DEBUG ref-model] pos_idx=0: actual_tid={actual_tid}, was_in_set={was_in_set}, "
-                  f"actual_in_candidates={actual_in_candidates}, num_candidates={len(candidates)}, "
-                  f"top_cand_ids={top_cand_ids}", flush=True)
-
         results.append(candidates)
 
     return results
@@ -334,12 +325,6 @@ def _evaluate_q_values_with_kv_cache(
                 actual_entry = (cand_id, cand_lp, actual_q[pos_idx])
             else:
                 other_candidates.append((cand_id, cand_lp))
-
-        # Debug for first position
-        if pos_idx == 0:
-            cand_ids_in_input = [c[0] for c in candidates]
-            print(f"[DEBUG Q-eval] pos_idx=0: actual_tid={actual_tid}, actual_entry={actual_entry is not None}, "
-                  f"candidates_count={len(candidates)}, cand_ids={cand_ids_in_input[:10]}...", flush=True)
 
         # If no other candidates, just use the actual token's pre-computed Q
         if not other_candidates:
@@ -911,11 +896,6 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 # We'll handle this by padding candidates later
                 pass
 
-            # Debug: show sequence info
-            print(f"[DEBUG data] rollout {r_i}: ref_seq_len={len(ref_input_ids)}, "
-                  f"ref_prompt_len={len(ref_prompt_ids)}, ref_response_len={len(ref_response_ids)}, "
-                  f"tgt_tokens={num_tgt_tokens}", flush=True)
-
             # Step 1: Get candidates from reference model (on-policy sequence)
             with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
                 candidates_per_pos = _get_candidates_at_positions(
@@ -971,13 +951,6 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             for idx, (tid, pos) in enumerate(zip(tgt_token_ids, tgt_positions)):
                 q_val = actual_q_values[idx] if idx < len(actual_q_values) else 0.0
                 candidates = candidate_results[idx] if idx < len(candidate_results) else []
-
-                # Debug for first token
-                if idx == 0:
-                    cand_token_ids = [c[0] for c in candidates]
-                    actual_in_final = tid in cand_token_ids
-                    print(f"[DEBUG tooltip] idx=0: tid={tid} ({_decode_token(tok, int(tid), decode_cache)!r}), "
-                          f"actual_in_final={actual_in_final}, cand_ids={cand_token_ids}", flush=True)
 
                 tok_str = html_lib.escape(_decode_token(tok, int(tid), decode_cache))
                 tooltip_html = _make_tooltip_html(tok, tid, candidates, decode_cache, cfg.max_candidates_show)
