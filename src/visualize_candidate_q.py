@@ -233,22 +233,27 @@ def _evaluate_q_values_with_kv_cache(
     model: Any,
     input_ids: torch.Tensor,  # [1, S]
     positions: List[int],
+    actual_token_ids: List[int],  # The actual tokens at each position
     candidates_per_position: List[List[Tuple[int, float]]],  # [(token_id, ref_logprob), ...]
     distribution_token_id: int,
     num_bins: int,
     num_length_bins: int,
     correct_reward_index: int,
     device: torch.device,
-) -> Tuple[List[float], List[List[Tuple[int, float, float]]]]:
+) -> Tuple[List[float], List[List[Tuple[int, float, float]]], int]:
     """
     Evaluate Q-values for candidates at each position using KV cache.
+
+    Optimization: We already have Q-values for actual tokens from the initial
+    forward pass, so we only need to evaluate non-actual candidates.
 
     Returns:
         actual_q_values: Q-value for the actual token at each position
         candidate_results: [[(token_id, ref_logprob, q_value), ...], ...] per position
+        num_extra_forward_passes: Count of positions requiring additional forward passes
     """
     if not positions:
-        return ([], [])
+        return ([], [], 0)
 
     # Step 1: Run full sequence with KV cache
     base = _get_base_model(_unwrap_model(model))
@@ -286,26 +291,52 @@ def _evaluate_q_values_with_kv_cache(
     probs_reward = torch.softmax(logits_reward, dim=1)
     actual_q = probs_reward[:, correct_reward_index].cpu().tolist()
 
-    # Step 3: Evaluate candidates at each position
+    # Step 3: Evaluate only non-actual candidates at each position
     candidate_results: List[List[Tuple[int, float, float]]] = []
+    num_extra_forward_passes = 0
 
     for pos_idx, (pos, candidates) in enumerate(zip(positions, candidates_per_position)):
         if not candidates:
             candidate_results.append([])
             continue
 
-        K = len(candidates)
-        cand_ids = [c[0] for c in candidates]
-        cand_ref_lps = [c[1] for c in candidates]
+        actual_tid = actual_token_ids[pos_idx]
+
+        # Separate actual token from other candidates
+        actual_entry = None
+        other_candidates = []
+        for cand_id, cand_lp in candidates:
+            if cand_id == actual_tid:
+                # Use pre-computed Q-value for actual token
+                actual_entry = (cand_id, cand_lp, actual_q[pos_idx])
+            else:
+                other_candidates.append((cand_id, cand_lp))
+
+        # If no other candidates, just use the actual token's pre-computed Q
+        if not other_candidates:
+            if actual_entry is not None:
+                candidate_results.append([actual_entry])
+            else:
+                # Edge case: actual token not in candidates (shouldn't happen with proper min_p)
+                # Fall back to just the actual Q
+                candidate_results.append([(actual_tid, 0.0, actual_q[pos_idx])])
+            continue
+
+        # We have other candidates - need to evaluate them
+        num_extra_forward_passes += 1
+
+        other_ids = [c[0] for c in other_candidates]
+        other_lps = [c[1] for c in other_candidates]
+        K = len(other_ids)
 
         # Slice KV cache to prefix [0:pos]
         sliced_kv = _slice_kv_cache(past_key_values, end=pos)
         expanded_kv = _expand_kv_cache(sliced_kv, batch_size=K)
 
-        # Create input for candidates: [K, 1]
-        cand_input = torch.tensor(cand_ids, dtype=torch.long, device=device).unsqueeze(1)
+        # Create input for other candidates: [K, 1]
+        cand_input = torch.tensor(other_ids, dtype=torch.long, device=device).unsqueeze(1)
 
-        # Forward pass with candidates
+        # Forward pass with other candidates only
         if base is None:
             cand_out = model(
                 input_ids=cand_input,
@@ -324,16 +355,19 @@ def _evaluate_q_values_with_kv_cache(
             )
             cand_hidden = cand_out.last_hidden_state if hasattr(cand_out, "last_hidden_state") else cand_out.hidden_states[-1]
 
-        # Extract Q-values
+        # Extract Q-values for other candidates
         cand_h = cand_hidden.squeeze(1)  # [K, E]
         cand_logits = F.linear(cand_h, w, b).float()
         cand_logits_rs = cand_logits.view(-1, num_reward_states, num_length_bins)
         cand_logits_reward = torch.logsumexp(cand_logits_rs, dim=2)
         cand_probs_reward = torch.softmax(cand_logits_reward, dim=1)
-        cand_q = cand_probs_reward[:, correct_reward_index].cpu().tolist()
+        other_q = cand_probs_reward[:, correct_reward_index].cpu().tolist()
 
-        # Combine: (token_id, ref_logprob, q_value)
-        pos_results = [(cand_ids[i], cand_ref_lps[i], cand_q[i]) for i in range(K)]
+        # Combine: actual token (with pre-computed Q) + other candidates
+        pos_results = [(other_ids[i], other_lps[i], other_q[i]) for i in range(K)]
+        if actual_entry is not None:
+            pos_results.append(actual_entry)
+
         # Sort by Q-value descending
         pos_results.sort(key=lambda x: -x[2])
         candidate_results.append(pos_results)
@@ -345,7 +379,7 @@ def _evaluate_q_values_with_kv_cache(
     # Cleanup main cache
     del past_key_values, hidden, out
 
-    return (actual_q, candidate_results)
+    return (actual_q, candidate_results, num_extra_forward_passes)
 
 
 # ---------------------------------------------------------------------------
@@ -746,22 +780,25 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             continue
 
         prompt_text = str(grp["prompt"])
-        rollouts: List[Rollout] = list(grp["rollouts"])
+        all_rollouts: List[Rollout] = list(grp["rollouts"])  # Keep all for context
 
+        # Determine which rollouts to visualize (but use all for context)
         if int(cfg.samples_per_prompt) > 0:
-            rollouts = rollouts[: int(cfg.samples_per_prompt)]
+            num_to_visualize = min(len(all_rollouts), int(cfg.samples_per_prompt))
+        else:
+            num_to_visualize = len(all_rollouts)
 
-        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (global {global_i}, idx={pid}): {len(rollouts)} rollouts")
+        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (global {global_i}, idx={pid}): {num_to_visualize} rollouts to visualize, {len(all_rollouts)} total for context")
 
         parts.append("<hr>")
-        parts.append(f"<h2>prompt {global_i} | prompt_idx {int(pid)} | rollouts {len(rollouts)}</h2>")
+        parts.append(f"<h2>prompt {global_i} | prompt_idx {int(pid)} | visualizing {num_to_visualize}/{len(all_rollouts)} rollouts</h2>")
         parts.append("<h3>prompt</h3>")
         parts.append(f"<pre>{html_lib.escape(prompt_text)}</pre>")
 
         parts.append("<h3>rollouts</h3>")
         parts.append('<div class="grid">')
 
-        for r_i in range(len(rollouts)):
+        for r_i in range(num_to_visualize):
             rollout_start = time.time()
             processed_rollouts += 1
 
@@ -771,7 +808,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             packed = _pack_for_target(
                 tokenizer=tok,
                 prompt_text=prompt_text,
-                rollouts=rollouts,
+                rollouts=all_rollouts,  # Use ALL rollouts for context
                 target_idx=int(r_i),
                 max_length=int(cfg.max_length),
                 rng=rng,
@@ -786,7 +823,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
             if not tgt_positions:
                 parts.append('<div class="card">')
-                parts.append(f'<div class="hdr">rollout {r_i} | gt {rollouts[r_i].reward:.4f} | (empty)</div>')
+                parts.append(f'<div class="hdr">rollout {r_i} | gt {all_rollouts[r_i].reward:.4f} | (empty)</div>')
                 parts.append('<div class="toks">(no tokens)</div>')
                 parts.append("</div>")
                 continue
@@ -805,10 +842,11 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
             # Step 2: Evaluate Q-values with critic
             with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
-                actual_q_values, candidate_results = _evaluate_q_values_with_kv_cache(
+                actual_q_values, candidate_results, num_extra_fwd = _evaluate_q_values_with_kv_cache(
                     critic_model,
                     input_ids=input_ids_t,
                     positions=tgt_positions,
+                    actual_token_ids=tgt_token_ids,
                     candidates_per_position=candidates_per_pos,
                     distribution_token_id=cfg.distribution_token_id,
                     num_bins=num_bins,
@@ -819,9 +857,10 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
             rollout_time = time.time() - rollout_start
             avg_cands = np.mean([len(c) for c in candidates_per_pos]) if candidates_per_pos else 0
+            pct_extra = 100.0 * num_extra_fwd / len(tgt_positions) if tgt_positions else 0
             _print_progress(
-                f"[Rank {rank}]   Rollout {r_i+1}/{len(rollouts)}: {len(tgt_positions)} tokens, "
-                f"{avg_cands:.1f} avg candidates, {rollout_time:.2f}s"
+                f"[Rank {rank}]   Rollout {r_i+1}/{num_to_visualize}: {len(tgt_positions)} tokens, "
+                f"{avg_cands:.1f} avg cands, {num_extra_fwd} extra fwd ({pct_extra:.0f}%), {rollout_time:.2f}s"
             )
 
             mean_q = float(np.mean(actual_q_values)) if actual_q_values else 0.0
@@ -847,7 +886,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             parts.append('<div class="hdr">')
             parts.append(
                 html_lib.escape(
-                    f"rollout {r_i} | gt {rollouts[r_i].reward:.4f} | mean_q {mean_q:.4f} | "
+                    f"rollout {r_i} | gt {all_rollouts[r_i].reward:.4f} | mean_q {mean_q:.4f} | "
                     f"ctx_n {len(ctx)} | avg_cand {avg_candidates:.1f} | tok {len(tgt_token_ids)}"
                 )
             )
