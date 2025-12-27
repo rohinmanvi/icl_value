@@ -11,19 +11,50 @@ from __future__ import annotations
 
 import argparse
 import html as html_lib
+import json
 import os
 import random
 import sys
+import tempfile
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
+
+
+@dataclass
+class Config:
+    """Configuration passed to worker processes."""
+    critic_path: str
+    ref_path: str
+    data_path: str
+    out_html: str
+    num_prompts: int
+    prompt_idx: Optional[List[int]]
+    min_p: float
+    max_candidates_show: int
+    distribution_token_id: int
+    label_column: str
+    max_length: int
+    seed: int
+    dtype: str
+    attn_implementation: str
+    tokenizer_path: Optional[str]
+    samples_per_prompt: int
+    max_tokens_per_rollout: int
+    require_mixed_outcomes: bool
+    dp_size: int
+    # Computed fields (set by main before spawning)
+    selected_prompt_ids: List[int] = None
+    reward_col: str = "correct"
 
 # Qwen chat token ids
 IM_START_TOKEN_ID = 151644
@@ -589,8 +620,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attn_implementation", type=str, default="flash_attention_2")
 
     p.add_argument("--tokenizer_path", type=str, default=None)
-    p.add_argument("--max_rollouts_per_prompt", type=int, default=0)
+    p.add_argument("--samples_per_prompt", type=int, default=0, help="Max rollouts to process per prompt (0=all)")
     p.add_argument("--max_tokens_per_rollout", type=int, default=0)
+    p.add_argument("--require_mixed_outcomes", action="store_true",
+                   help="Only include prompts with both correct and incorrect responses")
+    p.add_argument("--dp_size", type=int, default=0, help="Data parallel size (0=use all GPUs)")
 
     return p.parse_args()
 
@@ -601,51 +635,22 @@ def _print_progress(msg: str, end: str = "\n") -> None:
     print(f"[{timestamp}] {msg}", end=end, flush=True)
 
 
-def main() -> None:
-    args = parse_args()
-    script_start = time.time()
+def _has_mixed_outcomes(rollouts: List[Rollout], threshold: float = 0.5) -> bool:
+    """Check if rollouts have both correct and incorrect responses."""
+    if len(rollouts) < 2:
+        return False
+    rewards = [r.reward for r in rollouts]
+    has_correct = any(r >= threshold for r in rewards)
+    has_incorrect = any(r < threshold for r in rewards)
+    return has_correct and has_incorrect
 
-    torch.manual_seed(int(args.seed))
 
-    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
-    amp_dtype = _torch_dtype(args.dtype)
-
-    _print_progress(f"Loading critic model from {args.critic_path}...")
-    model_load_start = time.time()
-    model_kwargs: Dict[str, Any] = {"torch_dtype": amp_dtype, "trust_remote_code": True}
-    if args.attn_implementation and args.attn_implementation != "auto":
-        model_kwargs["attn_implementation"] = args.attn_implementation
-
-    critic_model = AutoModelForCausalLM.from_pretrained(args.critic_path, **model_kwargs)
-    critic_model.to(device)
-    critic_model.eval()
-    _print_progress(f"  Critic model loaded in {time.time() - model_load_start:.1f}s")
-
-    _print_progress(f"Loading reference model from {args.ref_path}...")
-    model_load_start = time.time()
-    ref_model = AutoModelForCausalLM.from_pretrained(args.ref_path, **model_kwargs)
-    ref_model.to(device)
-    ref_model.eval()
-    _print_progress(f"  Reference model loaded in {time.time() - model_load_start:.1f}s")
-
-    tok_src = args.tokenizer_path if args.tokenizer_path else args.ref_path
-    tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
-    if tok.pad_token_id is None:
-        tok.pad_token_id = tok.eos_token_id
-
-    # Load data
-    _print_progress(f"Loading data from {args.data_path}...")
-    pf = pq.ParquetFile(args.data_path)
-    names = set(pf.schema_arrow.names)
-
-    reward_col = args.label_column
-    if reward_col not in names:
-        raise ValueError(f"Missing column: {reward_col}")
-
-    table = pq.read_table(args.data_path, columns=["prompt_idx", "prompt", "output_token_ids", reward_col])
+def _load_prompt_groups(cfg: Config) -> Dict[int, Dict[str, Any]]:
+    """Load and parse prompt groups from parquet file."""
+    table = pq.read_table(cfg.data_path, columns=["prompt_idx", "prompt", "output_token_ids", cfg.reward_col])
     df = table.to_pandas()
 
-    if reward_col == "correct":
+    if cfg.reward_col == "correct":
         df["correct"] = df["correct"].astype(float)
 
     prompt_groups: Dict[int, Dict[str, Any]] = {}
@@ -660,59 +665,82 @@ def main() -> None:
             toks = r["output_token_ids"]
             if hasattr(toks, "tolist"):
                 toks = toks.tolist()
-            ro.append(Rollout(response_ids=list(toks), reward=float(r[reward_col])))
+            ro.append(Rollout(response_ids=list(toks), reward=float(r[cfg.reward_col])))
         prompt_groups[int(pid)] = {"prompt": prompt_text, "rollouts": ro}
 
-    prompt_ids_sorted = sorted(prompt_groups.keys())
-    _print_progress(f"  Loaded {len(prompt_groups)} prompts, {len(df)} total rollouts")
+    return prompt_groups
 
-    # Select prompts
-    if args.prompt_idx and len(args.prompt_idx) > 0:
-        selected_prompt_ids = [int(pid) for pid in args.prompt_idx if int(pid) in prompt_groups]
-    else:
-        selected_prompt_ids = prompt_ids_sorted[: args.num_prompts]
 
-    # Count total rollouts to process
-    total_rollouts = sum(
-        min(len(prompt_groups[pid]["rollouts"]), args.max_rollouts_per_prompt) if args.max_rollouts_per_prompt > 0
-        else len(prompt_groups[pid]["rollouts"])
-        for pid in selected_prompt_ids if pid in prompt_groups
-    )
-    _print_progress(f"Will process {len(selected_prompt_ids)} prompts, {total_rollouts} rollouts")
+def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
+    """Worker process that handles a shard of prompts."""
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+    torch.manual_seed(int(cfg.seed) + rank)
+    amp_dtype = _torch_dtype(cfg.dtype)
+
+    _print_progress(f"[Rank {rank}] Loading models on {device}...")
+
+    model_kwargs: Dict[str, Any] = {"torch_dtype": amp_dtype, "trust_remote_code": True}
+    attn_impl = cfg.attn_implementation
+    if device.type != "cuda" and attn_impl == "flash_attention_2":
+        attn_impl = "sdpa"
+    if attn_impl and attn_impl != "auto":
+        model_kwargs["attn_implementation"] = attn_impl
+
+    critic_model = AutoModelForCausalLM.from_pretrained(cfg.critic_path, **model_kwargs)
+    critic_model.to(device)
+    critic_model.eval()
+
+    ref_model = AutoModelForCausalLM.from_pretrained(cfg.ref_path, **model_kwargs)
+    ref_model.to(device)
+    ref_model.eval()
+
+    tok_src = cfg.tokenizer_path if cfg.tokenizer_path else cfg.ref_path
+    tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+
+    _print_progress(f"[Rank {rank}] Models loaded, loading data...")
+
+    # Load data
+    prompt_groups = _load_prompt_groups(cfg)
+
+    # Get assigned prompts for this worker
+    all_prompt_ids = cfg.selected_prompt_ids
+    my_prompt_ids = [pid for i, pid in enumerate(all_prompt_ids) if i % world == rank]
+
+    if not my_prompt_ids:
+        _print_progress(f"[Rank {rank}] No prompts assigned, exiting.")
+        # Write empty fragment
+        fragment_path = os.path.join(fragment_dir, f"fragment_{rank:04d}.html")
+        with open(fragment_path, "w", encoding="utf-8") as f:
+            f.write("")
+        return
+
+    _print_progress(f"[Rank {rank}] Processing {len(my_prompt_ids)} prompts...")
 
     # Critic config
-    if reward_col == "correct":
-        length_bins = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    if cfg.reward_col == "correct":
         reward_values = [0.0, 1.0]
     else:
-        length_bins = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
         reward_values = [0.0, 0.1666667, 0.3333333, 0.5, 0.6666667, 0.8333333, 1.0]
 
+    length_bins = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
     num_length_bins = len(length_bins) - 1
     num_reward_states = len(reward_values)
     num_bins = num_length_bins * num_reward_states
     correct_reward_index = int(max(range(len(reward_values)), key=lambda i: reward_values[i]))
 
-    # Generate HTML
-    title = f"Candidate Q-Values: {os.path.basename(args.critic_path.rstrip('/'))}"
-    parts: List[str] = [_html_header(title)]
-
-    parts.append('<div class="meta">')
-    parts.append(f"critic_path: {html_lib.escape(args.critic_path)}<br>")
-    parts.append(f"ref_path: {html_lib.escape(args.ref_path)}<br>")
-    parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
-    parts.append(f"min_p: {args.min_p}<br>")
-    parts.append(f"reward_column: {html_lib.escape(reward_col)}<br>")
-    parts.append(f"selected_prompts: {html_lib.escape(str(selected_prompt_ids))}<br>")
-    parts.append("</div>")
-
     decode_cache: Dict[int, str] = {}
+    parts: List[str] = []
     processed_rollouts = 0
-    processing_start = time.time()
 
-    _print_progress("Starting processing...")
+    for local_i, pid in enumerate(my_prompt_ids):
+        # Find global index for display
+        global_i = all_prompt_ids.index(pid) + 1
 
-    for p_i, pid in enumerate(selected_prompt_ids, start=1):
         grp = prompt_groups.get(int(pid), None)
         if grp is None:
             continue
@@ -720,13 +748,13 @@ def main() -> None:
         prompt_text = str(grp["prompt"])
         rollouts: List[Rollout] = list(grp["rollouts"])
 
-        if int(args.max_rollouts_per_prompt) > 0:
-            rollouts = rollouts[: int(args.max_rollouts_per_prompt)]
+        if int(cfg.samples_per_prompt) > 0:
+            rollouts = rollouts[: int(cfg.samples_per_prompt)]
 
-        _print_progress(f"Prompt {p_i}/{len(selected_prompt_ids)} (idx={pid}): {len(rollouts)} rollouts")
+        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (global {global_i}, idx={pid}): {len(rollouts)} rollouts")
 
         parts.append("<hr>")
-        parts.append(f"<h2>prompt {p_i} | prompt_idx {int(pid)} | rollouts {len(rollouts)}</h2>")
+        parts.append(f"<h2>prompt {global_i} | prompt_idx {int(pid)} | rollouts {len(rollouts)}</h2>")
         parts.append("<h3>prompt</h3>")
         parts.append(f"<pre>{html_lib.escape(prompt_text)}</pre>")
 
@@ -737,7 +765,7 @@ def main() -> None:
             rollout_start = time.time()
             processed_rollouts += 1
 
-            seed_i = (int(args.seed) * 1000003 + int(pid) * 1009 + int(r_i) * 9176) & 0xFFFFFFFF
+            seed_i = (int(cfg.seed) * 1000003 + int(pid) * 1009 + int(r_i) * 9176) & 0xFFFFFFFF
             rng = random.Random(int(seed_i))
 
             packed = _pack_for_target(
@@ -745,16 +773,16 @@ def main() -> None:
                 prompt_text=prompt_text,
                 rollouts=rollouts,
                 target_idx=int(r_i),
-                max_length=int(args.max_length),
+                max_length=int(cfg.max_length),
                 rng=rng,
             )
 
             tgt_token_ids = packed.target_token_ids
             tgt_positions = packed.target_positions
 
-            if int(args.max_tokens_per_rollout) > 0 and len(tgt_token_ids) > int(args.max_tokens_per_rollout):
-                tgt_token_ids = tgt_token_ids[: int(args.max_tokens_per_rollout)]
-                tgt_positions = tgt_positions[: int(args.max_tokens_per_rollout)]
+            if int(cfg.max_tokens_per_rollout) > 0 and len(tgt_token_ids) > int(cfg.max_tokens_per_rollout):
+                tgt_token_ids = tgt_token_ids[: int(cfg.max_tokens_per_rollout)]
+                tgt_positions = tgt_positions[: int(cfg.max_tokens_per_rollout)]
 
             if not tgt_positions:
                 parts.append('<div class="card">')
@@ -771,7 +799,7 @@ def main() -> None:
                     ref_model,
                     input_ids=input_ids_t,
                     positions=tgt_positions,
-                    min_p=args.min_p,
+                    min_p=cfg.min_p,
                     device=device,
                 )
 
@@ -782,7 +810,7 @@ def main() -> None:
                     input_ids=input_ids_t,
                     positions=tgt_positions,
                     candidates_per_position=candidates_per_pos,
-                    distribution_token_id=args.distribution_token_id,
+                    distribution_token_id=cfg.distribution_token_id,
                     num_bins=num_bins,
                     num_length_bins=num_length_bins,
                     correct_reward_index=correct_reward_index,
@@ -792,9 +820,8 @@ def main() -> None:
             rollout_time = time.time() - rollout_start
             avg_cands = np.mean([len(c) for c in candidates_per_pos]) if candidates_per_pos else 0
             _print_progress(
-                f"  Rollout {r_i+1}/{len(rollouts)}: {len(tgt_positions)} tokens, "
-                f"{avg_cands:.1f} avg candidates, {rollout_time:.2f}s "
-                f"[{processed_rollouts}/{total_rollouts}]"
+                f"[Rank {rank}]   Rollout {r_i+1}/{len(rollouts)}: {len(tgt_positions)} tokens, "
+                f"{avg_cands:.1f} avg candidates, {rollout_time:.2f}s"
             )
 
             mean_q = float(np.mean(actual_q_values)) if actual_q_values else 0.0
@@ -806,7 +833,7 @@ def main() -> None:
                 candidates = candidate_results[idx] if idx < len(candidate_results) else []
 
                 tok_str = html_lib.escape(_decode_token(tok, int(tid), decode_cache))
-                tooltip_html = _make_tooltip_html(tok, tid, candidates, decode_cache, args.max_candidates_show)
+                tooltip_html = _make_tooltip_html(tok, tid, candidates, decode_cache, cfg.max_candidates_show)
 
                 spans.append(
                     f'<span class="tok" style="background-color:{_reward_rgb(q_val)}">'
@@ -814,7 +841,6 @@ def main() -> None:
                 )
 
             ctx = packed.context_rollout_indices
-            ctx_str = ",".join(str(int(x)) for x in ctx)
             avg_candidates = np.mean([len(c) for c in candidate_results]) if candidate_results else 0
 
             parts.append('<div class="card">')
@@ -836,22 +862,199 @@ def main() -> None:
 
         parts.append("</div>")
 
-    parts.append(_html_footer())
-
-    out_dir = os.path.dirname(os.path.abspath(args.out_html))
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
-
-    with open(args.out_html, "w", encoding="utf-8") as f:
+    # Write fragment to file
+    fragment_path = os.path.join(fragment_dir, f"fragment_{rank:04d}.html")
+    with open(fragment_path, "w", encoding="utf-8") as f:
         f.write("".join(parts))
 
-    total_time = time.time() - script_start
-    _print_progress(
-        f"Done! Wrote {args.out_html}\n"
-        f"  Processed {processed_rollouts} rollouts in {total_time:.1f}s "
-        f"({total_time/max(processed_rollouts,1):.2f}s/rollout)"
+    _print_progress(f"[Rank {rank}] Done! Processed {processed_rollouts} rollouts, wrote fragment.")
+
+
+def main() -> None:
+    args = parse_args()
+    script_start = time.time()
+
+    # Determine dp_size
+    ngpus = torch.cuda.device_count()
+    if args.dp_size == 0:
+        dp = max(1, ngpus)
+    else:
+        dp = args.dp_size
+
+    if ngpus > 0 and dp > ngpus:
+        raise RuntimeError(f"Requested dp_size={dp}, but only {ngpus} CUDA devices are visible.")
+    if ngpus == 0 and dp != 1:
+        raise RuntimeError("No CUDA devices visible; run with --dp-size 1 for CPU mode.")
+
+    # Load data to determine prompts (only in main process)
+    _print_progress(f"Loading data from {args.data_path}...")
+    pf = pq.ParquetFile(args.data_path)
+    names = set(pf.schema_arrow.names)
+
+    reward_col = args.label_column
+    if reward_col not in names:
+        raise ValueError(f"Missing column: {reward_col}")
+
+    # Create config
+    cfg = Config(
+        critic_path=args.critic_path,
+        ref_path=args.ref_path,
+        data_path=args.data_path,
+        out_html=args.out_html,
+        num_prompts=args.num_prompts,
+        prompt_idx=args.prompt_idx,
+        min_p=args.min_p,
+        max_candidates_show=args.max_candidates_show,
+        distribution_token_id=args.distribution_token_id,
+        label_column=args.label_column,
+        max_length=args.max_length,
+        seed=args.seed,
+        dtype=args.dtype,
+        attn_implementation=args.attn_implementation,
+        tokenizer_path=args.tokenizer_path,
+        samples_per_prompt=args.samples_per_prompt,
+        max_tokens_per_rollout=args.max_tokens_per_rollout,
+        require_mixed_outcomes=args.require_mixed_outcomes,
+        dp_size=dp,
+        reward_col=reward_col,
     )
+
+    # Load prompt groups to determine selection
+    prompt_groups = _load_prompt_groups(cfg)
+    prompt_ids_sorted = sorted(prompt_groups.keys())
+    _print_progress(f"  Loaded {len(prompt_groups)} prompts")
+
+    # Filter for mixed outcomes if requested
+    if args.require_mixed_outcomes:
+        filtered_ids = [
+            pid for pid in prompt_ids_sorted
+            if _has_mixed_outcomes(prompt_groups[pid]["rollouts"])
+        ]
+        _print_progress(f"  After mixed outcomes filter: {len(filtered_ids)} prompts")
+    else:
+        filtered_ids = prompt_ids_sorted
+
+    # Select prompts
+    if args.prompt_idx and len(args.prompt_idx) > 0:
+        selected_prompt_ids = [int(pid) for pid in args.prompt_idx if int(pid) in prompt_groups]
+        if args.require_mixed_outcomes:
+            selected_prompt_ids = [pid for pid in selected_prompt_ids if pid in filtered_ids]
+    else:
+        selected_prompt_ids = filtered_ids[: args.num_prompts]
+
+    cfg.selected_prompt_ids = selected_prompt_ids
+
+    # Count total rollouts to process
+    total_rollouts = sum(
+        min(len(prompt_groups[pid]["rollouts"]), args.samples_per_prompt) if args.samples_per_prompt > 0
+        else len(prompt_groups[pid]["rollouts"])
+        for pid in selected_prompt_ids if pid in prompt_groups
+    )
+
+    _print_progress(
+        f"Will process {len(selected_prompt_ids)} prompts, {total_rollouts} rollouts "
+        f"across {dp} GPU(s)"
+    )
+
+    # Create temp directory for fragments
+    fragment_dir = tempfile.mkdtemp(prefix="visualize_q_")
+    _print_progress(f"Fragment directory: {fragment_dir}")
+
+    try:
+        # Spawn workers
+        if dp == 1:
+            # Single GPU: run directly without spawning
+            _worker(0, 1, cfg, fragment_dir)
+        else:
+            ctx = mp.get_context("spawn")
+            procs = []
+            for r in range(dp):
+                p = ctx.Process(target=_worker, args=(r, dp, cfg, fragment_dir), daemon=False)
+                p.start()
+                procs.append(p)
+
+            # Wait for all workers
+            any_fail = False
+            for r, p in enumerate(procs):
+                p.join()
+                if p.exitcode != 0:
+                    any_fail = True
+                    print(f"[main] Worker rank {r} (pid={p.pid}) exited with code {p.exitcode}", flush=True)
+
+            if any_fail:
+                raise RuntimeError("One or more workers failed")
+
+        # Merge fragments into final HTML
+        _print_progress("Merging fragments...")
+
+        title = f"Candidate Q-Values: {os.path.basename(args.critic_path.rstrip('/'))}"
+        final_parts: List[str] = [_html_header(title)]
+
+        final_parts.append('<div class="meta">')
+        final_parts.append(f"critic_path: {html_lib.escape(args.critic_path)}<br>")
+        final_parts.append(f"ref_path: {html_lib.escape(args.ref_path)}<br>")
+        final_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
+        final_parts.append(f"min_p: {args.min_p}<br>")
+        final_parts.append(f"reward_column: {html_lib.escape(reward_col)}<br>")
+        final_parts.append(f"dp_size: {dp}<br>")
+        final_parts.append(f"selected_prompts: {html_lib.escape(str(selected_prompt_ids))}<br>")
+        final_parts.append("</div>")
+
+        # Read and merge fragments in order
+        # Fragments are ordered by rank, but prompts are interleaved across ranks
+        # We need to reorder by global prompt index
+        prompt_fragments: Dict[int, str] = {}
+
+        for r in range(dp):
+            fragment_path = os.path.join(fragment_dir, f"fragment_{r:04d}.html")
+            if os.path.exists(fragment_path):
+                with open(fragment_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # Associate with the prompts this rank processed
+                rank_prompts = [pid for i, pid in enumerate(selected_prompt_ids) if i % dp == r]
+                if rank_prompts and content:
+                    # Split content by prompt boundaries (each prompt starts with <hr>)
+                    # Filter out empty sections and associate with prompt IDs
+                    prompt_sections = [s for s in content.split("<hr>") if s.strip()]
+                    for i, section in enumerate(prompt_sections):
+                        if i < len(rank_prompts):
+                            prompt_fragments[rank_prompts[i]] = "<hr>" + section
+
+        # Output in original prompt order
+        for pid in selected_prompt_ids:
+            if pid in prompt_fragments:
+                final_parts.append(prompt_fragments[pid])
+
+        final_parts.append(_html_footer())
+
+        out_dir = os.path.dirname(os.path.abspath(args.out_html))
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
+        with open(args.out_html, "w", encoding="utf-8") as f:
+            f.write("".join(final_parts))
+
+        total_time = time.time() - script_start
+        _print_progress(
+            f"Done! Wrote {args.out_html}\n"
+            f"  Processed {total_rollouts} rollouts in {total_time:.1f}s "
+            f"({total_time/max(total_rollouts,1):.2f}s/rollout)"
+        )
+
+    finally:
+        # Cleanup fragment directory
+        import shutil
+        try:
+            shutil.rmtree(fragment_dir)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Interrupted.", flush=True)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
