@@ -858,9 +858,12 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             rollout_time = time.time() - rollout_start
             avg_cands = np.mean([len(c) for c in candidates_per_pos]) if candidates_per_pos else 0
             pct_extra = 100.0 * num_extra_fwd / len(tgt_positions) if tgt_positions else 0
+            ctx_count = len(packed.context_rollout_indices)
+            seq_len = len(packed.input_ids)
             _print_progress(
-                f"[Rank {rank}]   Rollout {r_i+1}/{num_to_visualize}: {len(tgt_positions)} tokens, "
-                f"{avg_cands:.1f} avg cands, {num_extra_fwd} extra fwd ({pct_extra:.0f}%), {rollout_time:.2f}s"
+                f"[Rank {rank}]   Rollout {r_i+1}/{num_to_visualize}: {len(tgt_positions)} tgt toks, "
+                f"seq_len={seq_len}, ctx={ctx_count}/{len(all_rollouts)-1}, "
+                f"{num_extra_fwd} extra fwd ({pct_extra:.0f}%), {rollout_time:.2f}s"
             )
 
             mean_q = float(np.mean(actual_q_values)) if actual_q_values else 0.0
