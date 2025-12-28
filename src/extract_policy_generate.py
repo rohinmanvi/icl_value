@@ -69,6 +69,9 @@ class Config:
     # Show reference trajectories from dataset for comparison
     show_reference_trajectories: int = 2  # How many reference trajectories to show per prompt
 
+    # Skip prompts with long responses
+    max_avg_response_length: int = 2048
+
     reward_col: str = "correct"
 
 
@@ -824,6 +827,13 @@ def _has_mixed_outcomes(
     return correct_pct >= min_correct_pct and incorrect_pct >= min_incorrect_pct
 
 
+def _avg_response_length(rollouts: List[Rollout]) -> float:
+    """Compute average response length across rollouts."""
+    if not rollouts:
+        return 0.0
+    return sum(len(r.response_ids) for r in rollouts) / len(rollouts)
+
+
 def _load_prompt_groups(cfg: Config) -> Dict[int, Dict[str, Any]]:
     table = pq.read_table(cfg.data_path, columns=["prompt_idx", "prompt", "prompt_token_ids", "output_token_ids", cfg.reward_col])
     df = table.to_pandas()
@@ -891,6 +901,8 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--show_reference_trajectories", type=int, default=2,
                    help="Number of reference trajectories to show per prompt")
+    p.add_argument("--max_avg_response_length", type=int, default=2048,
+                   help="Skip prompts with average response length greater than this")
 
     return p.parse_args()
 
@@ -935,6 +947,7 @@ def main() -> None:
         min_correct_pct=args.min_correct_pct,
         min_incorrect_pct=args.min_incorrect_pct,
         show_reference_trajectories=args.show_reference_trajectories,
+        max_avg_response_length=args.max_avg_response_length,
         reward_col=args.label_column,
     )
 
@@ -968,10 +981,20 @@ def main() -> None:
     prompt_ids_sorted = sorted(prompt_groups.keys())
     _print_progress(f"Loaded {len(prompt_groups)} prompts")
 
+    # Filter by average response length
+    if args.max_avg_response_length > 0:
+        length_filtered_ids = [
+            pid for pid in prompt_ids_sorted
+            if _avg_response_length(prompt_groups[pid]["rollouts"]) <= args.max_avg_response_length
+        ]
+        _print_progress(f"After length filter (avg <= {args.max_avg_response_length}): {len(length_filtered_ids)}/{len(prompt_ids_sorted)} prompts")
+    else:
+        length_filtered_ids = prompt_ids_sorted
+
     # Filter for mixed outcomes if requested
     if args.require_mixed_outcomes:
         filtered_ids = [
-            pid for pid in prompt_ids_sorted
+            pid for pid in length_filtered_ids
             if _has_mixed_outcomes(
                 prompt_groups[pid]["rollouts"],
                 min_correct_pct=args.min_correct_pct,
@@ -980,7 +1003,7 @@ def main() -> None:
         ]
         _print_progress(f"After mixed outcomes filter: {len(filtered_ids)} prompts")
     else:
-        filtered_ids = prompt_ids_sorted
+        filtered_ids = length_filtered_ids
 
     # Select prompts
     if args.prompt_idx and len(args.prompt_idx) > 0:
