@@ -478,10 +478,9 @@ def _generate_with_q_weighting(
         if (step + 1) % progress_interval == 0 or current_time - last_progress_time >= 5.0:
             elapsed = current_time - gen_start_time
             toks_per_sec = (step + 1) / elapsed if elapsed > 0 else 0
-            mean_q_so_far = np.mean(token_q_values) if token_q_values else 0
             print(
                 f"\r{progress_prefix}[{step+1}/{cfg.max_new_tokens}] "
-                f"{toks_per_sec:.1f} tok/s, mean_q={mean_q_so_far:.3f}, "
+                f"{toks_per_sec:.1f} tok/s, q={sampled_q:.3f}, "
                 f"cands={num_cands}",
                 end="", flush=True
             )
@@ -523,13 +522,14 @@ def _generate_with_q_weighting(
 
         del next_token
 
-    # Clear progress line
+    # Clear progress line - show final Q value
     if generated_ids:
+        final_q = token_q_values[-1] if token_q_values else 0.0
         elapsed = time.time() - gen_start_time
         toks_per_sec = len(generated_ids) / elapsed if elapsed > 0 else 0
         print(
-            f"\r{progress_prefix}[{len(generated_ids)}/{cfg.max_new_tokens}] "
-            f"{toks_per_sec:.1f} tok/s, done.{' ' * 20}",
+            f"\r{progress_prefix}[{len(generated_ids)} toks] "
+            f"{toks_per_sec:.1f} tok/s, final_q={final_q:.3f}{' ' * 10}",
             flush=True
         )
 
