@@ -459,19 +459,19 @@ def _generate_with_q_weighting(
         del sliced_kv, expanded_kv, cand_input, cand_out, cand_hidden
 
         # Compute Q-weighted distribution: π_new ∝ π_ref · exp(Q/τ)
-        ref_probs_cand = torch.tensor([ref_probs[i].item() for i in cand_indices], device=device)
+        # Use log-space computation for numerical stability with small τ
+        ref_lps_cand = torch.tensor([ref_log_probs[i].item() for i in cand_indices], device=device)
         q_tensor = torch.tensor(cand_q_values, device=device)
 
         # Apply temperature
         if cfg.temperature > 0:
-            weights = ref_probs_cand * torch.exp(q_tensor / cfg.temperature)
+            # log(π_new) = log(π_ref) + Q/τ, then softmax to normalize
+            log_weights = ref_lps_cand + q_tensor / cfg.temperature
+            weights = F.softmax(log_weights, dim=0)
         else:
             # Temperature = 0: greedy w.r.t. Q-value
-            weights = torch.zeros_like(ref_probs_cand)
+            weights = torch.zeros_like(ref_lps_cand)
             weights[q_tensor.argmax()] = 1.0
-
-        # Normalize
-        weights = weights / weights.sum()
 
         # Sample
         sampled_idx = torch.multinomial(weights, 1).item()
