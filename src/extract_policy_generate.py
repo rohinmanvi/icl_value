@@ -871,8 +871,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_samples", type=int, default=4, help="Samples per prompt from extracted policy")
     p.add_argument("--temperature", type=float, default=1.0, help="Temperature τ for Q-weighting")
 
-    p.add_argument("--min_p", type=float, default=0.05, help="Min-p threshold for candidate filtering")
-    p.add_argument("--max_new_tokens", type=int, default=2048, help="Max tokens to generate")
+    p.add_argument("--min_p", type=float, default=0.01, help="Min-p threshold for candidate filtering")
+    p.add_argument("--max_new_tokens", type=int, default=8192, help="Max tokens to generate")
     p.add_argument("--max_candidates_show", type=int, default=15, help="Max candidates to show in tooltip")
 
     p.add_argument("--distribution_token_id", type=int, default=151669)
