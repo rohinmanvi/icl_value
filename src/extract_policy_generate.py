@@ -18,7 +18,9 @@ import html as html_lib
 import json
 import os
 import random
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -27,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -72,7 +75,13 @@ class Config:
     # Skip prompts with long responses
     max_avg_response_length: int = 2048
 
+    # Data parallel
+    dp_size: int = 0  # 0 = use all GPUs
+
     reward_col: str = "correct"
+
+    # Computed fields (set by main before spawning)
+    selected_prompt_ids: List[int] = None
 
 
 # Qwen chat token ids
@@ -903,6 +912,8 @@ def parse_args() -> argparse.Namespace:
                    help="Number of reference trajectories to show per prompt")
     p.add_argument("--max_avg_response_length", type=int, default=2048,
                    help="Skip prompts with average response length greater than this")
+    p.add_argument("--dp_size", type=int, default=0,
+                   help="Data parallel size (0=use all GPUs)")
 
     return p.parse_args()
 
@@ -912,108 +923,54 @@ def _print_progress(msg: str, end: str = "\n") -> None:
     print(f"[{timestamp}] {msg}", end=end, flush=True)
 
 
-def main() -> None:
-    args = parse_args()
-    script_start = time.time()
+def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
+    """Worker process that handles a shard of prompts on a specific GPU."""
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_dtype = _torch_dtype(args.dtype)
+    torch.manual_seed(int(cfg.seed) + rank)
+    amp_dtype = _torch_dtype(cfg.dtype)
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-
-    # Create config
-    cfg = Config(
-        critic_path=args.critic_path,
-        ref_path=args.ref_path,
-        data_path=args.data_path,
-        out_html=args.out_html,
-        num_prompts=args.num_prompts,
-        num_samples=args.num_samples,
-        temperature=args.temperature,
-        min_p=args.min_p,
-        max_new_tokens=args.max_new_tokens,
-        max_candidates_show=args.max_candidates_show,
-        distribution_token_id=args.distribution_token_id,
-        label_column=args.label_column,
-        max_length=args.max_length,
-        seed=args.seed,
-        dtype=args.dtype,
-        attn_implementation=args.attn_implementation,
-        tokenizer_path=args.tokenizer_path,
-        prompt_idx=args.prompt_idx,
-        require_mixed_outcomes=args.require_mixed_outcomes,
-        min_correct_pct=args.min_correct_pct,
-        min_incorrect_pct=args.min_incorrect_pct,
-        show_reference_trajectories=args.show_reference_trajectories,
-        max_avg_response_length=args.max_avg_response_length,
-        reward_col=args.label_column,
-    )
-
-    # Load models
-    _print_progress(f"Loading models on {device}...")
+    _print_progress(f"[Rank {rank}] Loading models on {device}...")
 
     model_kwargs: Dict[str, Any] = {"torch_dtype": amp_dtype, "trust_remote_code": True}
-    attn_impl = args.attn_implementation
+    attn_impl = cfg.attn_implementation
     if device.type != "cuda" and attn_impl == "flash_attention_2":
         attn_impl = "sdpa"
     if attn_impl and attn_impl != "auto":
         model_kwargs["attn_implementation"] = attn_impl
 
-    critic_model = AutoModelForCausalLM.from_pretrained(args.critic_path, **model_kwargs)
+    critic_model = AutoModelForCausalLM.from_pretrained(cfg.critic_path, **model_kwargs)
     critic_model.to(device)
     critic_model.eval()
 
-    ref_model = AutoModelForCausalLM.from_pretrained(args.ref_path, **model_kwargs)
+    ref_model = AutoModelForCausalLM.from_pretrained(cfg.ref_path, **model_kwargs)
     ref_model.to(device)
     ref_model.eval()
 
-    tok_src = args.tokenizer_path if args.tokenizer_path else args.ref_path
+    tok_src = cfg.tokenizer_path if cfg.tokenizer_path else cfg.ref_path
     tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    _print_progress("Models loaded, loading data...")
+    _print_progress(f"[Rank {rank}] Models loaded, loading data...")
 
     # Load data
     prompt_groups = _load_prompt_groups(cfg)
-    prompt_ids_sorted = sorted(prompt_groups.keys())
-    _print_progress(f"Loaded {len(prompt_groups)} prompts")
 
-    # Filter by average response length
-    if args.max_avg_response_length > 0:
-        length_filtered_ids = [
-            pid for pid in prompt_ids_sorted
-            if _avg_response_length(prompt_groups[pid]["rollouts"]) <= args.max_avg_response_length
-        ]
-        _print_progress(f"After length filter (avg <= {args.max_avg_response_length}): {len(length_filtered_ids)}/{len(prompt_ids_sorted)} prompts")
-    else:
-        length_filtered_ids = prompt_ids_sorted
+    # Get assigned prompts for this worker
+    all_prompt_ids = cfg.selected_prompt_ids
+    my_prompt_ids = [pid for i, pid in enumerate(all_prompt_ids) if i % world == rank]
 
-    # Filter for mixed outcomes if requested
-    if args.require_mixed_outcomes:
-        filtered_ids = [
-            pid for pid in length_filtered_ids
-            if _has_mixed_outcomes(
-                prompt_groups[pid]["rollouts"],
-                min_correct_pct=args.min_correct_pct,
-                min_incorrect_pct=args.min_incorrect_pct,
-            )
-        ]
-        _print_progress(f"After mixed outcomes filter: {len(filtered_ids)} prompts")
-    else:
-        filtered_ids = length_filtered_ids
+    if not my_prompt_ids:
+        _print_progress(f"[Rank {rank}] No prompts assigned, exiting.")
+        fragment_path = os.path.join(fragment_dir, f"fragment_{rank:04d}.html")
+        with open(fragment_path, "w", encoding="utf-8") as f:
+            f.write("")
+        return
 
-    # Select prompts
-    if args.prompt_idx and len(args.prompt_idx) > 0:
-        selected_prompt_ids = [int(pid) for pid in args.prompt_idx if int(pid) in prompt_groups]
-        if args.require_mixed_outcomes:
-            selected_prompt_ids = [pid for pid in selected_prompt_ids if pid in filtered_ids]
-    else:
-        selected_prompt_ids = filtered_ids[: args.num_prompts]
-
-    _print_progress(f"Will process {len(selected_prompt_ids)} prompts, {args.num_samples} samples each")
+    _print_progress(f"[Rank {rank}] Processing {len(my_prompt_ids)} prompts...")
 
     # Critic config
     if cfg.reward_col == "correct":
@@ -1035,8 +992,12 @@ def main() -> None:
     total_reference = 0
     prompt_times: List[float] = []
 
-    for prompt_i, pid in enumerate(selected_prompt_ids):
+    for local_i, pid in enumerate(my_prompt_ids):
         prompt_start = time.time()
+
+        # Find global index for display
+        global_i = all_prompt_ids.index(pid) + 1
+
         grp = prompt_groups.get(int(pid), None)
         if grp is None:
             continue
@@ -1047,16 +1008,16 @@ def main() -> None:
         # ETA calculation
         if prompt_times:
             avg_prompt_time = np.mean(prompt_times)
-            remaining_prompts = len(selected_prompt_ids) - prompt_i
+            remaining_prompts = len(my_prompt_ids) - local_i
             eta_seconds = avg_prompt_time * remaining_prompts
             eta_str = f", ETA: {eta_seconds/60:.1f}min" if eta_seconds >= 60 else f", ETA: {eta_seconds:.0f}s"
         else:
             eta_str = ""
 
-        _print_progress(f"Prompt {prompt_i+1}/{len(selected_prompt_ids)} (idx={pid}): {len(all_rollouts)} reference rollouts{eta_str}")
+        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (global {global_i}, idx={pid}){eta_str}")
 
         parts.append("<hr>")
-        parts.append(f"<h2>Prompt {prompt_i+1} | prompt_idx {int(pid)}</h2>")
+        parts.append(f"<h2>Prompt {global_i} | prompt_idx {int(pid)}</h2>")
         parts.append("<h3>Prompt</h3>")
         parts.append(f"<pre>{html_lib.escape(prompt_text)}</pre>")
 
@@ -1064,27 +1025,22 @@ def main() -> None:
         parts.append(f"<h3>Extracted Policy (τ={cfg.temperature})</h3>")
         parts.append('<div class="grid">')
 
-        extracted_correct = 0
-        extracted_total = 0
-
-        for sample_i in range(args.num_samples):
-            sample_start = time.time()
-
-            seed_i = (args.seed * 1000003 + pid * 1009 + sample_i * 9176) & 0xFFFFFFFF
+        for sample_i in range(cfg.num_samples):
+            seed_i = (cfg.seed * 1000003 + pid * 1009 + sample_i * 9176) & 0xFFFFFFFF
             rng = random.Random(seed_i)
 
-            # Use ALL rollouts as context (same as training - _pack_context_for_critic handles max_length)
+            # Use ALL rollouts as context
             context_rollouts = all_rollouts
 
             # Progress prefix for this sample
-            progress_prefix = f"  Sample {sample_i+1}/{args.num_samples}: "
+            progress_prefix = f"[Rank {rank}] Sample {sample_i+1}/{cfg.num_samples}: "
 
             # Generate
             traj = _generate_with_q_weighting(
                 ref_model=ref_model,
                 critic_model=critic_model,
                 tokenizer=tokenizer,
-                prompt_token_ids=all_rollouts[0].prompt_token_ids,  # Use first rollout's prompt
+                prompt_token_ids=all_rollouts[0].prompt_token_ids,
                 context_rollouts=context_rollouts,
                 prompt_text=prompt_text,
                 cfg=cfg,
@@ -1097,11 +1053,8 @@ def main() -> None:
                 progress_prefix=progress_prefix,
             )
 
-            sample_time = time.time() - sample_start
             mean_q = np.mean(traj.token_q_values) if traj.token_q_values else 0.0
-
             total_extracted += 1
-            extracted_total += 1
 
             # Build visualization
             spans: List[str] = []
@@ -1132,7 +1085,7 @@ def main() -> None:
         parts.append("</div>")
 
         # Show reference trajectories
-        num_ref_to_show = min(args.show_reference_trajectories, len(all_rollouts))
+        num_ref_to_show = min(cfg.show_reference_trajectories, len(all_rollouts))
         if num_ref_to_show > 0:
             parts.append(f"<h3>Reference Trajectories (from dataset)</h3>")
             parts.append('<div class="grid">')
@@ -1140,8 +1093,8 @@ def main() -> None:
             for ref_i in range(num_ref_to_show):
                 ref_start = time.time()
                 rollout = all_rollouts[ref_i]
-                print(f"  Reference {ref_i+1}/{num_ref_to_show}: evaluating {len(rollout.response_ids)} tokens...", end="", flush=True)
-                seed_i = (args.seed * 1000003 + pid * 1009 + ref_i * 7) & 0xFFFFFFFF
+                print(f"[Rank {rank}] Reference {ref_i+1}/{num_ref_to_show}: evaluating {len(rollout.response_ids)} tokens...", end="", flush=True)
+                seed_i = (cfg.seed * 1000003 + pid * 1009 + ref_i * 7) & 0xFFFFFFFF
                 rng = random.Random(seed_i)
 
                 # Evaluate Q-values
@@ -1197,41 +1150,201 @@ def main() -> None:
         # Record prompt time
         prompt_time = time.time() - prompt_start
         prompt_times.append(prompt_time)
-        _print_progress(f"  Prompt {prompt_i+1} completed in {prompt_time:.1f}s")
+        _print_progress(f"[Rank {rank}] Prompt {local_i+1} completed in {prompt_time:.1f}s")
 
-    # Build final HTML
-    title = f"Extracted Policy Generation (τ={cfg.temperature})"
-    final_parts: List[str] = [_html_header(title)]
+    # Write fragment to file
+    fragment_path = os.path.join(fragment_dir, f"fragment_{rank:04d}.html")
+    with open(fragment_path, "w", encoding="utf-8") as f:
+        f.write("".join(parts))
 
-    final_parts.append('<div class="meta">')
-    final_parts.append(f"critic_path: {html_lib.escape(args.critic_path)}<br>")
-    final_parts.append(f"ref_path: {html_lib.escape(args.ref_path)}<br>")
-    final_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
-    final_parts.append(f"temperature: {cfg.temperature}<br>")
-    final_parts.append(f"min_p: {cfg.min_p}<br>")
-    final_parts.append(f"num_prompts: {len(selected_prompt_ids)}<br>")
-    final_parts.append(f"num_samples: {args.num_samples}<br>")
-    final_parts.append(f"max_new_tokens: {args.max_new_tokens}<br>")
-    final_parts.append("</div>")
+    _print_progress(f"[Rank {rank}] Done! Generated {total_extracted}, evaluated {total_reference}.")
 
-    final_parts.extend(parts)
-    final_parts.append(_html_footer())
 
-    # Write output
-    out_dir = os.path.dirname(os.path.abspath(args.out_html))
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
+def main() -> None:
+    args = parse_args()
+    script_start = time.time()
 
-    with open(args.out_html, "w", encoding="utf-8") as f:
-        f.write("".join(final_parts))
+    # Determine dp_size
+    ngpus = torch.cuda.device_count()
+    if args.dp_size == 0:
+        dp = max(1, ngpus)
+    else:
+        dp = args.dp_size
 
-    total_time = time.time() - script_start
-    _print_progress(
-        f"Done! Wrote {args.out_html}\n"
-        f"  Generated {total_extracted} extracted trajectories\n"
-        f"  Evaluated {total_reference} reference trajectories\n"
-        f"  Total time: {total_time:.1f}s"
+    if ngpus > 0 and dp > ngpus:
+        raise RuntimeError(f"Requested dp_size={dp}, but only {ngpus} CUDA devices are visible.")
+    if ngpus == 0 and dp != 1:
+        raise RuntimeError("No CUDA devices visible; run with --dp_size 1 for CPU mode.")
+
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    # Create config (without selected_prompt_ids yet)
+    cfg = Config(
+        critic_path=args.critic_path,
+        ref_path=args.ref_path,
+        data_path=args.data_path,
+        out_html=args.out_html,
+        num_prompts=args.num_prompts,
+        num_samples=args.num_samples,
+        temperature=args.temperature,
+        min_p=args.min_p,
+        max_new_tokens=args.max_new_tokens,
+        max_candidates_show=args.max_candidates_show,
+        distribution_token_id=args.distribution_token_id,
+        label_column=args.label_column,
+        max_length=args.max_length,
+        seed=args.seed,
+        dtype=args.dtype,
+        attn_implementation=args.attn_implementation,
+        tokenizer_path=args.tokenizer_path,
+        prompt_idx=args.prompt_idx,
+        require_mixed_outcomes=args.require_mixed_outcomes,
+        min_correct_pct=args.min_correct_pct,
+        min_incorrect_pct=args.min_incorrect_pct,
+        show_reference_trajectories=args.show_reference_trajectories,
+        max_avg_response_length=args.max_avg_response_length,
+        dp_size=dp,
+        reward_col=args.label_column,
     )
+
+    # Load data to determine prompts (only in main process)
+    _print_progress(f"Loading data from {args.data_path}...")
+    prompt_groups = _load_prompt_groups(cfg)
+    prompt_ids_sorted = sorted(prompt_groups.keys())
+    _print_progress(f"Loaded {len(prompt_groups)} prompts")
+
+    # Filter by average response length
+    if args.max_avg_response_length > 0:
+        length_filtered_ids = [
+            pid for pid in prompt_ids_sorted
+            if _avg_response_length(prompt_groups[pid]["rollouts"]) <= args.max_avg_response_length
+        ]
+        _print_progress(f"After length filter (avg <= {args.max_avg_response_length}): {len(length_filtered_ids)}/{len(prompt_ids_sorted)} prompts")
+    else:
+        length_filtered_ids = prompt_ids_sorted
+
+    # Filter for mixed outcomes if requested
+    if args.require_mixed_outcomes:
+        filtered_ids = [
+            pid for pid in length_filtered_ids
+            if _has_mixed_outcomes(
+                prompt_groups[pid]["rollouts"],
+                min_correct_pct=args.min_correct_pct,
+                min_incorrect_pct=args.min_incorrect_pct,
+            )
+        ]
+        _print_progress(f"After mixed outcomes filter: {len(filtered_ids)} prompts")
+    else:
+        filtered_ids = length_filtered_ids
+
+    # Select prompts
+    if args.prompt_idx and len(args.prompt_idx) > 0:
+        selected_prompt_ids = [int(pid) for pid in args.prompt_idx if int(pid) in prompt_groups]
+        if args.require_mixed_outcomes:
+            selected_prompt_ids = [pid for pid in selected_prompt_ids if pid in filtered_ids]
+    else:
+        selected_prompt_ids = filtered_ids[: args.num_prompts]
+
+    cfg.selected_prompt_ids = selected_prompt_ids
+
+    _print_progress(
+        f"Will process {len(selected_prompt_ids)} prompts, {args.num_samples} samples each "
+        f"across {dp} GPU(s)"
+    )
+
+    # Create temp directory for fragments
+    fragment_dir = tempfile.mkdtemp(prefix="extract_policy_")
+    _print_progress(f"Fragment directory: {fragment_dir}")
+
+    try:
+        # Spawn workers
+        if dp == 1:
+            # Single GPU: run directly without spawning
+            _worker(0, 1, cfg, fragment_dir)
+        else:
+            ctx = mp.get_context("spawn")
+            procs = []
+            for r in range(dp):
+                p = ctx.Process(target=_worker, args=(r, dp, cfg, fragment_dir), daemon=False)
+                p.start()
+                procs.append(p)
+
+            # Wait for all workers
+            any_fail = False
+            for r, p in enumerate(procs):
+                p.join()
+                if p.exitcode != 0:
+                    any_fail = True
+                    print(f"[main] Worker rank {r} (pid={p.pid}) exited with code {p.exitcode}", flush=True)
+
+            if any_fail:
+                raise RuntimeError("One or more workers failed")
+
+        # Merge fragments into final HTML
+        _print_progress("Merging fragments...")
+
+        title = f"Extracted Policy Generation (τ={cfg.temperature})"
+        final_parts: List[str] = [_html_header(title)]
+
+        final_parts.append('<div class="meta">')
+        final_parts.append(f"critic_path: {html_lib.escape(args.critic_path)}<br>")
+        final_parts.append(f"ref_path: {html_lib.escape(args.ref_path)}<br>")
+        final_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
+        final_parts.append(f"temperature: {cfg.temperature}<br>")
+        final_parts.append(f"min_p: {cfg.min_p}<br>")
+        final_parts.append(f"num_prompts: {len(selected_prompt_ids)}<br>")
+        final_parts.append(f"num_samples: {args.num_samples}<br>")
+        final_parts.append(f"max_new_tokens: {args.max_new_tokens}<br>")
+        final_parts.append(f"dp_size: {dp}<br>")
+        final_parts.append("</div>")
+
+        # Read and merge fragments in order
+        prompt_fragments: Dict[int, str] = {}
+
+        for r in range(dp):
+            fragment_path = os.path.join(fragment_dir, f"fragment_{r:04d}.html")
+            if os.path.exists(fragment_path):
+                with open(fragment_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                # Associate with the prompts this rank processed
+                rank_prompts = [pid for i, pid in enumerate(selected_prompt_ids) if i % dp == r]
+                if rank_prompts and content:
+                    # Split content by prompt boundaries (each prompt starts with <hr>)
+                    prompt_sections = [s for s in content.split("<hr>") if s.strip()]
+                    for i, section in enumerate(prompt_sections):
+                        if i < len(rank_prompts):
+                            prompt_fragments[rank_prompts[i]] = "<hr>" + section
+
+        # Output in original prompt order
+        for pid in selected_prompt_ids:
+            if pid in prompt_fragments:
+                final_parts.append(prompt_fragments[pid])
+
+        final_parts.append(_html_footer())
+
+        # Write output
+        out_dir = os.path.dirname(os.path.abspath(args.out_html))
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
+        with open(args.out_html, "w", encoding="utf-8") as f:
+            f.write("".join(final_parts))
+
+        total_time = time.time() - script_start
+        _print_progress(
+            f"Done! Wrote {args.out_html}\n"
+            f"  Processed {len(selected_prompt_ids)} prompts\n"
+            f"  Total time: {total_time:.1f}s"
+        )
+
+    finally:
+        # Cleanup fragment directory
+        try:
+            shutil.rmtree(fragment_dir)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
