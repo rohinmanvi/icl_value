@@ -891,7 +891,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=1.0, help="Temperature τ for Q-weighting")
 
     p.add_argument("--min_p", type=float, default=0.01, help="Min-p threshold for candidate filtering")
-    p.add_argument("--max_new_tokens", type=int, default=8192, help="Max tokens to generate")
+    p.add_argument("--max_new_tokens", type=int, default=2048, help="Max tokens to generate")
     p.add_argument("--max_candidates_show", type=int, default=15, help="Max candidates to show in tooltip")
 
     p.add_argument("--distribution_token_id", type=int, default=151669)
@@ -910,7 +910,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--show_reference_trajectories", type=int, default=2,
                    help="Number of reference trajectories to show per prompt")
-    p.add_argument("--max_avg_response_length", type=int, default=2048,
+    p.add_argument("--max_avg_response_length", type=int, default=1536,
                    help="Skip prompts with average response length greater than this")
     p.add_argument("--dp_size", type=int, default=0,
                    help="Data parallel size (0=use all GPUs)")
