@@ -1050,8 +1050,8 @@ def main() -> None:
             seed_i = (args.seed * 1000003 + pid * 1009 + sample_i * 9176) & 0xFFFFFFFF
             rng = random.Random(seed_i)
 
-            # Use some rollouts as context
-            context_rollouts = all_rollouts[:min(len(all_rollouts), 4)]
+            # Use ALL rollouts as context (same as training - _pack_context_for_critic handles max_length)
+            context_rollouts = all_rollouts
 
             # Progress prefix for this sample
             progress_prefix = f"  Sample {sample_i+1}/{args.num_samples}: "
