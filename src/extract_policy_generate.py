@@ -218,48 +218,65 @@ def _feedback_tokens(tokenizer: Any, reward: float, content_plus_footer_len: int
     return tokenizer.encode(s, add_special_tokens=False)
 
 
-def _pack_context_for_generation(
+def _pack_context_for_critic(
     tokenizer: Any,
     prompt_text: str,
     context_rollouts: List[Rollout],
     max_length: int,
     rng: random.Random,
-) -> Tuple[List[int], int]:
+) -> List[int]:
     """
-    Build a packed context sequence for the critic during generation.
+    Build a packed context sequence for the critic, matching training format exactly.
+
+    Structure (same as train_in_context_critic.py):
+        [user prompt] [ctx0 block] [ctx0 feedback] ... [ctxN block] [ctxN feedback] [target header]
+
+    Where:
+        - user prompt = create_tokenized_message("user", prompt_tokens)
+        - ctx block = [IM_START, ASSISTANT, NEWLINE] + content + [IM_END if not present]
+        - ctx feedback = create_tokenized_message("user", "Reward: X\nLength: Y tokens")
+        - target header = [IM_START, ASSISTANT, NEWLINE]
+
+    The target response tokens are appended after this prefix during generation.
 
     Returns:
-        prefix_ids: The packed context (prompt + context rollouts)
-        target_start: Position where the target response will start
+        prefix_ids: The packed context ending with target header
     """
+    # 1. User prompt (same as training)
     prompt_tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
     prefix_ids = create_tokenized_message("user", prompt_tokens)
 
-    # Add context rollouts
+    # 2. Context rollouts with feedback (same as training)
     context_indices = list(range(len(context_rollouts)))
     rng.shuffle(context_indices)
+
+    # Target header that will be added at the end
+    target_header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
 
     for ridx in context_indices:
         r = context_rollouts[ridx]
         content = list(r.response_ids)
+
+        # Build trajectory block: [IM_START, ASSISTANT, NEWLINE] + content + [IM_END if needed]
         header, footer_r, block = _make_traj_block(content)
         content_plus_footer_len = len(content) + len(footer_r)
 
+        # Build feedback message: "Reward: X\nLength: Y tokens" (same format as training)
         fb_tokens = _feedback_tokens(tokenizer, r.reward, content_plus_footer_len)
         fb_msg = create_tokenized_message("user", fb_tokens)
 
         add_len = len(block) + len(fb_msg)
-        if len(prefix_ids) + add_len > max_length // 2:  # Reserve half for generation
+        # Reserve space for target header and generation
+        if len(prefix_ids) + add_len + len(target_header) > max_length // 2:
             break
 
         prefix_ids.extend(block)
         prefix_ids.extend(fb_msg)
 
-    # Add target header (assistant response start)
-    target_header = [IM_START_TOKEN_ID, ASSISTANT_TOKEN_ID, NEWLINE_TOKEN_ID]
+    # 3. Target header (assistant response start - content follows during generation)
     prefix_ids.extend(target_header)
 
-    return prefix_ids, len(prefix_ids)
+    return prefix_ids
 
 
 # ---------------------------------------------------------------------------
@@ -321,8 +338,8 @@ def _generate_with_q_weighting(
     2. Compute Q-values for candidates using critic
     3. Sample from π_new ∝ π_ref · exp(Q/τ)
     """
-    # Build context for critic
-    critic_prefix, _ = _pack_context_for_generation(
+    # Build context for critic (matching training format exactly)
+    critic_prefix = _pack_context_for_critic(
         tokenizer, prompt_text, context_rollouts, cfg.max_length, rng
     )
 
@@ -388,54 +405,46 @@ def _generate_with_q_weighting(
         cand_ref_lps = ref_log_probs[cand_indices].tolist()
 
         # Get Q-values for candidates
+        # Q-value is computed from hidden state AFTER feeding the candidate token
+        # So we must do a forward pass for each candidate
         num_cands = len(cand_indices)
         cand_q_values: List[float] = []
 
-        if num_cands == 1:
-            # Only one candidate, use current hidden state
-            h = critic_hidden[0, -1, :]  # [E]
+        # Use KV cache expansion for efficiency (works for any number of candidates)
+        sliced_kv = _slice_kv_cache(critic_kv, end=critic_kv.get_seq_length())
+        expanded_kv = _expand_kv_cache(sliced_kv, batch_size=num_cands)
+
+        cand_input = torch.tensor(cand_indices, dtype=torch.long, device=device).unsqueeze(1)  # [K, 1]
+
+        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
+            if base is None:
+                cand_out = critic_model(
+                    input_ids=cand_input,
+                    past_key_values=expanded_kv,
+                    use_cache=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                cand_hidden = cand_out.hidden_states[-1]
+            else:
+                cand_out = base(
+                    input_ids=cand_input,
+                    past_key_values=expanded_kv,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                cand_hidden = cand_out.last_hidden_state if hasattr(cand_out, "last_hidden_state") else cand_out.hidden_states[-1]
+
+        # Extract Q-values from hidden states after each candidate
+        for i in range(num_cands):
+            h = cand_hidden[i, 0, :]  # [E]
             q = _get_q_value_for_token(
                 critic_model, h, cfg.distribution_token_id,
                 num_bins, num_length_bins, correct_reward_index
             )
-            cand_q_values = [q]
-        else:
-            # Multiple candidates - need to evaluate each
-            # Use KV cache expansion for efficiency
-            sliced_kv = _slice_kv_cache(critic_kv, end=critic_kv.get_seq_length())
-            expanded_kv = _expand_kv_cache(sliced_kv, batch_size=num_cands)
+            cand_q_values.append(q)
 
-            cand_input = torch.tensor(cand_indices, dtype=torch.long, device=device).unsqueeze(1)  # [K, 1]
-
-            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
-                if base is None:
-                    cand_out = critic_model(
-                        input_ids=cand_input,
-                        past_key_values=expanded_kv,
-                        use_cache=False,
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    cand_hidden = cand_out.hidden_states[-1]
-                else:
-                    cand_out = base(
-                        input_ids=cand_input,
-                        past_key_values=expanded_kv,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    cand_hidden = cand_out.last_hidden_state if hasattr(cand_out, "last_hidden_state") else cand_out.hidden_states[-1]
-
-            # Extract Q-values
-            for i in range(num_cands):
-                h = cand_hidden[i, 0, :]  # [E]
-                q = _get_q_value_for_token(
-                    critic_model, h, cfg.distribution_token_id,
-                    num_bins, num_length_bins, correct_reward_index
-                )
-                cand_q_values.append(q)
-
-            del sliced_kv, expanded_kv, cand_input, cand_out, cand_hidden
+        del sliced_kv, expanded_kv, cand_input, cand_out, cand_hidden
 
         # Compute Q-weighted distribution: π_new ∝ π_ref · exp(Q/τ)
         ref_probs_cand = torch.tensor([ref_probs[i].item() for i in cand_indices], device=device)
@@ -570,10 +579,10 @@ def _evaluate_trajectory_q_values(
     if not response_ids:
         return [], []
 
-    # Build context for critic
-    # Filter out the target rollout from context
+    # Build context for critic (matching training format exactly)
+    # Filter out the target rollout from context (same as visualization script)
     ctx_rollouts = [r for r in context_rollouts if r is not rollout]
-    critic_prefix, _ = _pack_context_for_generation(
+    critic_prefix = _pack_context_for_critic(
         tokenizer, prompt_text, ctx_rollouts, cfg.max_length, rng
     )
 
