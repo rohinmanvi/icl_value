@@ -418,45 +418,54 @@ def _generate_with_q_weighting(
 
         # Get Q-values for candidates
         # Q-value is computed from hidden state AFTER feeding the candidate token
-        # So we must do a forward pass for each candidate
+        # Process in batches to avoid OOM with many candidates
         num_cands = len(cand_indices)
         cand_q_values: List[float] = []
 
-        # Use KV cache expansion for efficiency (works for any number of candidates)
+        # Batch size for candidate processing (tune based on GPU memory)
+        CAND_BATCH_SIZE = 32
+
         sliced_kv = _slice_kv_cache(critic_kv, end=critic_kv.get_seq_length())
-        expanded_kv = _expand_kv_cache(sliced_kv, batch_size=num_cands)
 
-        cand_input = torch.tensor(cand_indices, dtype=torch.long, device=device).unsqueeze(1)  # [K, 1]
+        for batch_start in range(0, num_cands, CAND_BATCH_SIZE):
+            batch_end = min(batch_start + CAND_BATCH_SIZE, num_cands)
+            batch_cand_indices = cand_indices[batch_start:batch_end]
+            batch_size = len(batch_cand_indices)
 
-        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
-            if base is None:
-                cand_out = critic_model(
-                    input_ids=cand_input,
-                    past_key_values=expanded_kv,
-                    use_cache=False,
-                    output_hidden_states=True,
-                    return_dict=True,
+            expanded_kv = _expand_kv_cache(sliced_kv, batch_size=batch_size)
+            cand_input = torch.tensor(batch_cand_indices, dtype=torch.long, device=device).unsqueeze(1)  # [B, 1]
+
+            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
+                if base is None:
+                    cand_out = critic_model(
+                        input_ids=cand_input,
+                        past_key_values=expanded_kv,
+                        use_cache=False,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    cand_hidden = cand_out.hidden_states[-1]
+                else:
+                    cand_out = base(
+                        input_ids=cand_input,
+                        past_key_values=expanded_kv,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    cand_hidden = cand_out.last_hidden_state if hasattr(cand_out, "last_hidden_state") else cand_out.hidden_states[-1]
+
+            # Extract Q-values from hidden states after each candidate
+            for i in range(batch_size):
+                h = cand_hidden[i, 0, :]  # [E]
+                q = _get_q_value_for_token(
+                    critic_model, h, cfg.distribution_token_id,
+                    num_bins, num_length_bins, correct_reward_index
                 )
-                cand_hidden = cand_out.hidden_states[-1]
-            else:
-                cand_out = base(
-                    input_ids=cand_input,
-                    past_key_values=expanded_kv,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                cand_hidden = cand_out.last_hidden_state if hasattr(cand_out, "last_hidden_state") else cand_out.hidden_states[-1]
+                cand_q_values.append(q)
 
-        # Extract Q-values from hidden states after each candidate
-        for i in range(num_cands):
-            h = cand_hidden[i, 0, :]  # [E]
-            q = _get_q_value_for_token(
-                critic_model, h, cfg.distribution_token_id,
-                num_bins, num_length_bins, correct_reward_index
-            )
-            cand_q_values.append(q)
+            del expanded_kv, cand_input, cand_out, cand_hidden
 
-        del sliced_kv, expanded_kv, cand_input, cand_out, cand_hidden
+        del sliced_kv
 
         # Compute Q-weighted distribution: π_new ∝ π_ref · exp(Q/τ)
         # Use log-space computation for numerical stability with small τ
