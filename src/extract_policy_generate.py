@@ -934,9 +934,20 @@ def _print_progress(msg: str, end: str = "\n") -> None:
 
 def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     """Worker process that handles a shard of prompts on a specific GPU."""
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
+    # Set CUDA_VISIBLE_DEVICES before any CUDA operations to properly initialize
+    # CUDA in spawned processes (avoids error 802: system not yet initialized)
+    if world > 1:
+        # Multi-GPU mode with spawned processes: each worker gets one GPU
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(rank)
+        device = torch.device("cuda:0")  # Always cuda:0 since we set VISIBLE_DEVICES
         torch.cuda.set_device(device)
+    elif torch.cuda.is_available():
+        # Single worker (not spawned) with GPU available
+        device = torch.device("cuda:0")
+        torch.cuda.set_device(device)
+    else:
+        # CPU fallback
+        device = torch.device("cpu")
 
     torch.manual_seed(int(cfg.seed) + rank)
     amp_dtype = _torch_dtype(cfg.dtype)
