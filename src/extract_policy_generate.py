@@ -908,7 +908,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_correct_pct", type=float, default=10.0)
     p.add_argument("--min_incorrect_pct", type=float, default=10.0)
 
-    p.add_argument("--show_reference_trajectories", type=int, default=2,
+    p.add_argument("--show_reference_trajectories", type=int, default=4,
                    help="Number of reference trajectories to show per prompt")
     p.add_argument("--max_avg_response_length", type=int, default=1536,
                    help="Skip prompts with average response length greater than this")
