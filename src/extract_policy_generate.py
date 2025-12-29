@@ -942,13 +942,39 @@ def _print_progress(msg: str, end: str = "\n") -> None:
 
 def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     """Worker process that handles a shard of prompts on a specific GPU."""
-    # CUDA_VISIBLE_DEVICES should already be set by the subprocess launcher
-    # This worker only sees one GPU (cuda:0)
-    if torch.cuda.is_available():
-        device = torch.device("cuda:0")
-        torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
+    # Determine device based on CUDA_VISIBLE_DEVICES (set by launcher) or rank
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+    # Try to initialize CUDA device
+    device = None
+    if cuda_visible:
+        # CUDA_VISIBLE_DEVICES is set, so cuda:0 maps to our assigned GPU
+        try:
+            device = torch.device("cuda:0")
+            torch.cuda.set_device(device)
+            # Force CUDA initialization by doing a small operation
+            _ = torch.cuda.current_device()
+        except Exception as e:
+            _print_progress(f"[Rank {rank}] CUDA init failed with CUDA_VISIBLE_DEVICES={cuda_visible}: {e}")
+            device = None
+
+    if device is None and world > 1:
+        # Multi-GPU mode: try using rank as device index directly
+        try:
+            device = torch.device(f"cuda:{rank}")
+            torch.cuda.set_device(device)
+            _ = torch.cuda.current_device()
+        except Exception as e:
+            _print_progress(f"[Rank {rank}] CUDA init failed with cuda:{rank}: {e}")
+            device = None
+
+    if device is None:
+        # Fallback to checking availability
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+            torch.cuda.set_device(device)
+        else:
+            device = torch.device("cpu")
 
     torch.manual_seed(int(cfg.seed) + rank)
     amp_dtype = _torch_dtype(cfg.dtype)
@@ -1181,12 +1207,27 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     _print_progress(f"[Rank {rank}] Done! Generated {total_extracted}, evaluated {total_reference}.")
 
 
+def _get_gpu_count_without_cuda_init() -> int:
+    """Get GPU count using nvidia-smi to avoid initializing CUDA in the main process."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+            return len(lines)
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass
+    return 0
+
+
 def main() -> None:
     args = parse_args()
     script_start = time.time()
 
-    # Determine dp_size
-    ngpus = torch.cuda.device_count()
+    # Determine dp_size using nvidia-smi (avoids CUDA initialization in main process)
+    ngpus = _get_gpu_count_without_cuda_init()
     if args.dp_size == 0:
         dp = max(1, ngpus)
     else:
@@ -1291,6 +1332,7 @@ def main() -> None:
                 pickle.dump(cfg, f)
 
             # Launch workers via subprocess with CUDA_VISIBLE_DEVICES set
+            # Stagger launches to avoid CUDA initialization race conditions
             script_path = os.path.abspath(__file__)
             procs = []
             for r in range(dp):
@@ -1311,6 +1353,9 @@ def main() -> None:
                 p = subprocess.Popen(cmd, env=env)
                 procs.append((r, p))
                 _print_progress(f"Launched worker rank {r} (pid={p.pid}) on GPU {r}")
+                # Small delay between launches to avoid CUDA init race conditions
+                if r < dp - 1:
+                    time.sleep(0.5)
 
             # Wait for all workers
             any_fail = False
