@@ -80,6 +80,9 @@ class Config:
 
     reward_col: str = "correct"
 
+    # Posterior mode: π_new ∝ π_ref · Q instead of π_ref · exp(Q/τ)
+    posterior_mode: bool = False
+
     # Computed fields (set by main before spawning)
     selected_prompt_ids: List[int] = None
 
@@ -467,20 +470,26 @@ def _generate_with_q_weighting(
 
         del sliced_kv
 
-        # Compute Q-weighted distribution: π_new ∝ π_ref · exp(Q/τ)
-        # Use log-space computation for numerical stability with small τ
-        ref_lps_cand = torch.tensor([ref_log_probs[i].item() for i in cand_indices], device=device)
+        # Compute weighted distribution
         q_tensor = torch.tensor(cand_q_values, device=device)
 
-        # Apply temperature
-        if cfg.temperature > 0:
-            # log(π_new) = log(π_ref) + Q/τ, then softmax to normalize
-            log_weights = ref_lps_cand + q_tensor / cfg.temperature
-            weights = F.softmax(log_weights, dim=0)
+        if cfg.posterior_mode:
+            # Posterior mode: π_new ∝ π_ref · Q (Bayesian posterior P(a|s,success))
+            ref_probs_cand = torch.tensor([ref_probs[i].item() for i in cand_indices], device=device)
+            weights = ref_probs_cand * q_tensor
+            weights = weights / weights.sum()
         else:
-            # Temperature = 0: greedy w.r.t. Q-value
-            weights = torch.zeros_like(ref_lps_cand)
-            weights[q_tensor.argmax()] = 1.0
+            # Exp mode: π_new ∝ π_ref · exp(Q/τ)
+            # Use log-space computation for numerical stability with small τ
+            ref_lps_cand = torch.tensor([ref_log_probs[i].item() for i in cand_indices], device=device)
+            if cfg.temperature > 0:
+                # log(π_new) = log(π_ref) + Q/τ, then softmax to normalize
+                log_weights = ref_lps_cand + q_tensor / cfg.temperature
+                weights = F.softmax(log_weights, dim=0)
+            else:
+                # Temperature = 0: greedy w.r.t. Q-value
+                weights = torch.zeros_like(ref_lps_cand)
+                weights[q_tensor.argmax()] = 1.0
 
         # Sample
         sampled_idx = torch.multinomial(weights, 1).item()
@@ -923,6 +932,8 @@ def parse_args() -> argparse.Namespace:
                    help="Skip prompts with average response length greater than this")
     p.add_argument("--dp_size", type=int, default=0,
                    help="Data parallel size (0=use all GPUs)")
+    p.add_argument("--posterior_mode", action="store_true",
+                   help="Use posterior mode: π ∝ π_ref · Q instead of π_ref · exp(Q/τ)")
 
     return p.parse_args()
 
@@ -1031,7 +1042,10 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
         parts.append(f"<pre>{html_lib.escape(prompt_text)}</pre>")
 
         # Generate trajectories with extracted policy
-        parts.append(f"<h3>Extracted Policy (τ={cfg.temperature})</h3>")
+        if cfg.posterior_mode:
+            parts.append("<h3>Extracted Policy (Posterior)</h3>")
+        else:
+            parts.append(f"<h3>Extracted Policy (τ={cfg.temperature})</h3>")
         parts.append('<div class="grid">')
 
         for sample_i in range(cfg.num_samples):
@@ -1216,6 +1230,7 @@ def main() -> None:
         max_avg_response_length=args.max_avg_response_length,
         dp_size=dp,
         reward_col=args.label_column,
+        posterior_mode=args.posterior_mode,
     )
 
     # Load data to determine prompts (only in main process)
@@ -1294,14 +1309,20 @@ def main() -> None:
         # Merge fragments into final HTML
         _print_progress("Merging fragments...")
 
-        title = f"Extracted Policy Generation (τ={cfg.temperature})"
+        if cfg.posterior_mode:
+            title = "Extracted Policy Generation (Posterior: π ∝ π_ref · Q)"
+        else:
+            title = f"Extracted Policy Generation (τ={cfg.temperature})"
         final_parts: List[str] = [_html_header(title)]
 
         final_parts.append('<div class="meta">')
         final_parts.append(f"critic_path: {html_lib.escape(args.critic_path)}<br>")
         final_parts.append(f"ref_path: {html_lib.escape(args.ref_path)}<br>")
         final_parts.append(f"data_path: {html_lib.escape(args.data_path)}<br>")
-        final_parts.append(f"temperature: {cfg.temperature}<br>")
+        if cfg.posterior_mode:
+            final_parts.append("mode: posterior (π ∝ π_ref · Q)<br>")
+        else:
+            final_parts.append(f"mode: exp (π ∝ π_ref · exp(Q/τ)), temperature: {cfg.temperature}<br>")
         final_parts.append(f"min_p: {cfg.min_p}<br>")
         final_parts.append(f"num_prompts: {len(selected_prompt_ids)}<br>")
         final_parts.append(f"num_samples: {args.num_samples}<br>")
