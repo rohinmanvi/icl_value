@@ -17,10 +17,8 @@ import argparse
 import html as html_lib
 import json
 import os
-import pickle
 import random
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -31,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
@@ -925,13 +924,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dp_size", type=int, default=0,
                    help="Data parallel size (0=use all GPUs)")
 
-    # Worker mode arguments (used internally for subprocess workers)
-    p.add_argument("--worker_mode", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--worker_rank", type=int, default=0, help=argparse.SUPPRESS)
-    p.add_argument("--worker_world", type=int, default=1, help=argparse.SUPPRESS)
-    p.add_argument("--worker_config", type=str, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--worker_fragment_dir", type=str, default=None, help=argparse.SUPPRESS)
-
     return p.parse_args()
 
 
@@ -942,39 +934,9 @@ def _print_progress(msg: str, end: str = "\n") -> None:
 
 def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     """Worker process that handles a shard of prompts on a specific GPU."""
-    # Determine device based on CUDA_VISIBLE_DEVICES (set by launcher) or rank
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-
-    # Try to initialize CUDA device
-    device = None
-    if cuda_visible:
-        # CUDA_VISIBLE_DEVICES is set, so cuda:0 maps to our assigned GPU
-        try:
-            device = torch.device("cuda:0")
-            torch.cuda.set_device(device)
-            # Force CUDA initialization by doing a small operation
-            _ = torch.cuda.current_device()
-        except Exception as e:
-            _print_progress(f"[Rank {rank}] CUDA init failed with CUDA_VISIBLE_DEVICES={cuda_visible}: {e}")
-            device = None
-
-    if device is None and world > 1:
-        # Multi-GPU mode: try using rank as device index directly
-        try:
-            device = torch.device(f"cuda:{rank}")
-            torch.cuda.set_device(device)
-            _ = torch.cuda.current_device()
-        except Exception as e:
-            _print_progress(f"[Rank {rank}] CUDA init failed with cuda:{rank}: {e}")
-            device = None
-
-    if device is None:
-        # Fallback to checking availability
-        if torch.cuda.is_available():
-            device = torch.device("cuda:0")
-            torch.cuda.set_device(device)
-        else:
-            device = torch.device("cpu")
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     torch.manual_seed(int(cfg.seed) + rank)
     amp_dtype = _torch_dtype(cfg.dtype)
@@ -1207,27 +1169,12 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     _print_progress(f"[Rank {rank}] Done! Generated {total_extracted}, evaluated {total_reference}.")
 
 
-def _get_gpu_count_without_cuda_init() -> int:
-    """Get GPU count using nvidia-smi to avoid initializing CUDA in the main process."""
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode == 0:
-            lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-            return len(lines)
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-        pass
-    return 0
-
-
 def main() -> None:
     args = parse_args()
     script_start = time.time()
 
-    # Determine dp_size using nvidia-smi (avoids CUDA initialization in main process)
-    ngpus = _get_gpu_count_without_cuda_init()
+    # Determine dp_size
+    ngpus = torch.cuda.device_count()
     if args.dp_size == 0:
         dp = max(1, ngpus)
     else:
@@ -1321,49 +1268,25 @@ def main() -> None:
     _print_progress(f"Fragment directory: {fragment_dir}")
 
     try:
-        # Launch workers
+        # Spawn workers
         if dp == 1:
             # Single GPU: run directly without spawning
             _worker(0, 1, cfg, fragment_dir)
         else:
-            # Save config to temp file for workers to load
-            config_path = os.path.join(fragment_dir, "config.pkl")
-            with open(config_path, "wb") as f:
-                pickle.dump(cfg, f)
-
-            # Launch workers via subprocess with CUDA_VISIBLE_DEVICES set
-            # Stagger launches to avoid CUDA initialization race conditions
-            script_path = os.path.abspath(__file__)
+            ctx = mp.get_context("spawn")
             procs = []
             for r in range(dp):
-                env = os.environ.copy()
-                env["CUDA_VISIBLE_DEVICES"] = str(r)
-                cmd = [
-                    sys.executable, script_path,
-                    "--worker_mode",
-                    "--worker_rank", str(r),
-                    "--worker_world", str(dp),
-                    "--worker_config", config_path,
-                    "--worker_fragment_dir", fragment_dir,
-                    # Dummy required args (not used in worker mode, but needed for argparse)
-                    "--critic_path", cfg.critic_path,
-                    "--data_path", cfg.data_path,
-                    "--out_html", cfg.out_html,
-                ]
-                p = subprocess.Popen(cmd, env=env)
-                procs.append((r, p))
-                _print_progress(f"Launched worker rank {r} (pid={p.pid}) on GPU {r}")
-                # Small delay between launches to avoid CUDA init race conditions
-                if r < dp - 1:
-                    time.sleep(0.5)
+                p = ctx.Process(target=_worker, args=(r, dp, cfg, fragment_dir), daemon=False)
+                p.start()
+                procs.append(p)
 
             # Wait for all workers
             any_fail = False
-            for r, p in procs:
-                retcode = p.wait()
-                if retcode != 0:
+            for r, p in enumerate(procs):
+                p.join()
+                if p.exitcode != 0:
                     any_fail = True
-                    print(f"[main] Worker rank {r} (pid={p.pid}) exited with code {retcode}", flush=True)
+                    print(f"[main] Worker rank {r} (pid={p.pid}) exited with code {p.exitcode}", flush=True)
 
             if any_fail:
                 raise RuntimeError("One or more workers failed")
@@ -1433,24 +1356,9 @@ def main() -> None:
             pass
 
 
-def run_worker_mode(args: argparse.Namespace) -> None:
-    """Entry point for subprocess workers."""
-    # Load config from pickle file
-    with open(args.worker_config, "rb") as f:
-        cfg = pickle.load(f)
-
-    # Run the worker
-    _worker(args.worker_rank, args.worker_world, cfg, args.worker_fragment_dir)
-
-
 if __name__ == "__main__":
     try:
-        # Quick check for worker mode before full arg parsing
-        if "--worker_mode" in sys.argv:
-            args = parse_args()
-            run_worker_mode(args)
-        else:
-            main()
+        main()
     except KeyboardInterrupt:
         print("Interrupted.", flush=True)
     except Exception:
