@@ -1053,7 +1053,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 progress_prefix=progress_prefix,
             )
 
-            mean_q = np.mean(traj.token_q_values) if traj.token_q_values else 0.0
+            final_q = traj.token_q_values[-1] if traj.token_q_values else 0.0
             total_extracted += 1
 
             # Build visualization
@@ -1074,7 +1074,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             parts.append('<div class="hdr">')
             parts.append(
                 html_lib.escape(
-                    f"sample {sample_i} | mean_q {mean_q:.4f} | "
+                    f"sample {sample_i} | final_q {final_q:.4f} | "
                     f"tok {len(traj.response_ids)}"
                 )
             )
@@ -1116,8 +1116,8 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
                 ref_time = time.time() - ref_start
                 total_reference += 1
-                mean_q = np.mean(q_values) if q_values else 0.0
-                print(f" done in {ref_time:.1f}s, mean_q={mean_q:.3f}", flush=True)
+                final_q = q_values[-1] if q_values else 0.0
+                print(f" done in {ref_time:.1f}s, final_q={final_q:.3f}", flush=True)
 
                 # Build visualization
                 spans: List[str] = []
@@ -1137,7 +1137,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 parts.append('<div class="hdr">')
                 parts.append(
                     html_lib.escape(
-                        f"ref {ref_i} | gt {rollout.reward:.4f} | mean_q {mean_q:.4f} | "
+                        f"ref {ref_i} | gt {rollout.reward:.4f} | final_q {final_q:.4f} | "
                         f"tok {len(rollout.response_ids)}"
                     )
                 )
