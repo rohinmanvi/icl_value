@@ -1097,6 +1097,9 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     total_reference = 0
     prompt_times: List[float] = []
 
+    # Performance tracking (for summary)
+    prompt_stats: List[Dict[str, Any]] = []
+
     for local_i, pid in enumerate(my_prompt_ids):
         prompt_start = time.time()
 
@@ -1125,6 +1128,11 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
         parts.append(f"<h2>Prompt {global_i} | prompt_idx {int(pid)}</h2>")
         parts.append("<h3>Prompt</h3>")
         parts.append(f"<pre>{html_lib.escape(prompt_text)}</pre>")
+
+        # Stats for this prompt
+        extracted_final_q: List[float] = []
+        reference_gt: List[float] = []
+        reference_final_q: List[float] = []
 
         # Generate trajectories with extracted policy
         if cfg.posterior_mode:
@@ -1164,6 +1172,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             final_q = traj.token_q_values[-1] if traj.token_q_values else 0.0
             avg_kl = np.mean(traj.token_kl_divergences) if traj.token_kl_divergences else 0.0
             total_extracted += 1
+            extracted_final_q.append(final_q)
 
             # Build dual-row visualization: Q-value row + KL row
             q_spans: List[str] = []
@@ -1238,6 +1247,8 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 final_q = q_values[-1] if q_values else 0.0
                 avg_kl = np.mean(kl_values) if kl_values else 0.0
                 print(f" done in {ref_time:.1f}s, final_q={final_q:.3f}", flush=True)
+                reference_gt.append(rollout.reward)
+                reference_final_q.append(final_q)
 
                 # Build dual-row visualization
                 q_spans: List[str] = []
@@ -1277,6 +1288,14 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
             parts.append("</div>")
 
+        # Collect stats for this prompt
+        prompt_stats.append({
+            'prompt_idx': pid,
+            'extracted_final_q': extracted_final_q,
+            'reference_gt': reference_gt,
+            'reference_final_q': reference_final_q,
+        })
+
         # Record prompt time
         prompt_time = time.time() - prompt_start
         prompt_times.append(prompt_time)
@@ -1286,6 +1305,11 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
     fragment_path = os.path.join(fragment_dir, f"fragment_{rank:04d}.html")
     with open(fragment_path, "w", encoding="utf-8") as f:
         f.write("".join(parts))
+
+    # Write stats to JSON file
+    stats_path = os.path.join(fragment_dir, f"stats_{rank:04d}.json")
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(prompt_stats, f)
 
     _print_progress(f"[Rank {rank}] Done! Generated {total_extracted}, evaluated {total_reference}.")
 
@@ -1438,8 +1462,9 @@ def main() -> None:
         meta_html += f"dp_size: {dp}<br>"
         meta_html += "</div>"
 
-        # Read and collect fragments
+        # Read and collect fragments and stats
         prompt_fragments: Dict[int, str] = {}
+        all_stats: Dict[int, Dict] = {}
 
         for r in range(dp):
             fragment_path = os.path.join(fragment_dir, f"fragment_{r:04d}.html")
@@ -1454,6 +1479,83 @@ def main() -> None:
                     for i, section in enumerate(prompt_sections):
                         if i < len(rank_prompts):
                             prompt_fragments[rank_prompts[i]] = section
+
+            # Read stats
+            stats_path = os.path.join(fragment_dir, f"stats_{r:04d}.json")
+            if os.path.exists(stats_path):
+                with open(stats_path, "r", encoding="utf-8") as f:
+                    stats_list = json.load(f)
+                for s in stats_list:
+                    all_stats[s['prompt_idx']] = s
+
+        # Compute and print performance summary
+        threshold = 0.5
+        all_extracted_q = []
+        all_reference_gt = []
+        all_reference_q = []
+        per_prompt_results = []
+
+        for pid in selected_prompt_ids:
+            if pid not in all_stats:
+                continue
+            s = all_stats[pid]
+            ext_q = s['extracted_final_q']
+            ref_gt = s['reference_gt']
+            ref_q = s['reference_final_q']
+
+            all_extracted_q.extend(ext_q)
+            all_reference_gt.extend(ref_gt)
+            all_reference_q.extend(ref_q)
+
+            # Per-prompt accuracy
+            ext_correct = sum(1 for q in ext_q if q >= threshold)
+            ext_total = len(ext_q)
+            ext_acc = ext_correct / ext_total if ext_total > 0 else 0.0
+
+            gt_correct = sum(1 for r in ref_gt if r >= threshold)
+            gt_total = len(ref_gt)
+            gt_acc = gt_correct / gt_total if gt_total > 0 else 0.0
+
+            per_prompt_results.append({
+                'idx': pid,
+                'ext_acc': ext_acc, 'ext_correct': ext_correct, 'ext_total': ext_total,
+                'gt_acc': gt_acc, 'gt_correct': gt_correct, 'gt_total': gt_total,
+            })
+
+        # Aggregate accuracy
+        agg_ext_correct = sum(1 for q in all_extracted_q if q >= threshold)
+        agg_ext_total = len(all_extracted_q)
+        agg_ext_acc = agg_ext_correct / agg_ext_total if agg_ext_total > 0 else 0.0
+
+        agg_gt_correct = sum(1 for r in all_reference_gt if r >= threshold)
+        agg_gt_total = len(all_reference_gt)
+        agg_gt_acc = agg_gt_correct / agg_gt_total if agg_gt_total > 0 else 0.0
+
+        agg_ref_q_correct = sum(1 for q in all_reference_q if q >= threshold)
+        agg_ref_q_total = len(all_reference_q)
+        agg_ref_q_acc = agg_ref_q_correct / agg_ref_q_total if agg_ref_q_total > 0 else 0.0
+
+        # Print summary
+        print('\n' + '='*60)
+        print('ACCURACY STATISTICS')
+        print('='*60)
+        print(f'\nThreshold for "correct": final_q >= {threshold}')
+        print('\n--- Per-Prompt Results ---')
+        print(f'{"Prompt":<10} {"Extracted":<15} {"Ref (GT)":<15} {"Improvement":<12}')
+        print('-'*52)
+        for r in per_prompt_results:
+            imp = r['ext_acc'] - r['gt_acc']
+            print(f'{r["idx"]:<10} {r["ext_acc"]:>6.1%} ({r["ext_correct"]}/{r["ext_total"]})   '
+                  f'{r["gt_acc"]:>6.1%} ({r["gt_correct"]}/{r["gt_total"]})   {imp:>+6.1%}')
+
+        print('\n--- Aggregate Results ---')
+        print(f'Extracted Policy:     {agg_ext_acc:>6.1%} ({agg_ext_correct}/{agg_ext_total})')
+        print(f'Reference (Q-pred):   {agg_ref_q_acc:>6.1%} ({agg_ref_q_correct}/{agg_ref_q_total})')
+        print(f'Reference (GT):       {agg_gt_acc:>6.1%} ({agg_gt_correct}/{agg_gt_total})')
+        print(f'\nImprovement over reference (GT): {agg_ext_acc - agg_gt_acc:+.1%}')
+        if agg_gt_acc > 0:
+            print(f'Relative improvement: {agg_ext_acc / agg_gt_acc:.2f}x')
+        print('='*60 + '\n')
 
         # Write per-prompt HTML files
         for global_i, pid in enumerate(selected_prompt_ids):
@@ -1473,15 +1575,43 @@ def main() -> None:
 
             _print_progress(f"Wrote {prompt_file}")
 
-        # Write index.html
+        # Write index.html with aggregate statistics
         index_parts: List[str] = [_html_header(title)]
         index_parts.append(meta_html)
-        index_parts.append("<h2>Prompts</h2>")
+
+        # Add aggregate statistics
+        index_parts.append('<div class="stats">')
+        index_parts.append('<h3>Aggregate Statistics</h3>')
+        index_parts.append('<table style="border-collapse: collapse; margin: 10px 0;">')
+        index_parts.append('<tr><th style="text-align:left; padding: 4px 12px;">Policy</th>')
+        index_parts.append('<th style="padding: 4px 12px;">Correct</th>')
+        index_parts.append('<th style="padding: 4px 12px;">Total</th>')
+        index_parts.append('<th style="padding: 4px 12px;">Accuracy</th></tr>')
+        index_parts.append(f'<tr><td style="padding: 4px 12px;"><b>Extracted Policy</b></td>')
+        index_parts.append(f'<td style="text-align:center;">{agg_ext_correct}</td>')
+        index_parts.append(f'<td style="text-align:center;">{agg_ext_total}</td>')
+        index_parts.append(f'<td style="text-align:center;"><b>{agg_ext_acc:.1%}</b></td></tr>')
+        index_parts.append(f'<tr><td style="padding: 4px 12px;">Reference (Ground Truth)</td>')
+        index_parts.append(f'<td style="text-align:center;">{agg_gt_correct}</td>')
+        index_parts.append(f'<td style="text-align:center;">{agg_gt_total}</td>')
+        index_parts.append(f'<td style="text-align:center;">{agg_gt_acc:.1%}</td></tr>')
+        index_parts.append('</table>')
+        if agg_gt_acc > 0:
+            improvement = agg_ext_acc - agg_gt_acc
+            index_parts.append(f'<p><b>Improvement: {improvement:+.1%} ({agg_ext_acc / agg_gt_acc:.2f}x)</b></p>')
+        index_parts.append('</div>')
+
+        # Per-prompt results
+        index_parts.append("<h3>Per-Prompt Results</h3>")
         index_parts.append("<ul>")
-        for global_i, pid in enumerate(selected_prompt_ids):
+        for r in per_prompt_results:
+            pid = r['idx']
             if pid in prompt_fragments:
+                imp = r['ext_acc'] - r['gt_acc']
                 index_parts.append(
-                    f'<li><a href="prompt_{pid}.html">Prompt {global_i+1} (idx={pid})</a></li>'
+                    f'<li><a href="prompt_{pid}.html">Prompt {pid}</a>: '
+                    f'Extracted {r["ext_acc"]:.0%} vs Reference {r["gt_acc"]:.0%} '
+                    f'({imp:+.0%})</li>'
                 )
         index_parts.append("</ul>")
         index_parts.append(_html_footer())
