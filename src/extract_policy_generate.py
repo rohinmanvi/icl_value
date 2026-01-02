@@ -346,8 +346,6 @@ def _generate_with_q_weighting(
     # Progress tracking
     progress_prefix: str = "",
     progress_interval: int = 50,
-    # Optional: exclude one rollout from context (to match training/reference eval structure)
-    exclude_rollout_idx: Optional[int] = None,
 ) -> GeneratedTrajectory:
     """
     Generate a trajectory using Q-weighted sampling.
@@ -358,15 +356,8 @@ def _generate_with_q_weighting(
     3. Sample from π_new ∝ π_ref · exp(Q/τ)
     """
     # Build context for critic (matching training format exactly)
-    # Exclude one rollout from context to match training structure where
-    # the target trajectory is NOT included in its own context
-    if exclude_rollout_idx is not None and 0 <= exclude_rollout_idx < len(context_rollouts):
-        ctx_rollouts = [r for i, r in enumerate(context_rollouts) if i != exclude_rollout_idx]
-    else:
-        ctx_rollouts = context_rollouts
-
     critic_prefix = _pack_context_for_critic(
-        tokenizer, prompt_text, ctx_rollouts, cfg.max_length, rng
+        tokenizer, prompt_text, context_rollouts, cfg.max_length, rng
     )
 
     # Initialize sequences
@@ -630,6 +621,9 @@ def _evaluate_trajectory_q_values(
     """
     Evaluate Q-values for an existing trajectory.
 
+    For each position, computes Q-values for ALL candidate tokens (not just the actual token).
+    This requires O(seq_len * num_candidates) forward passes but gives accurate results.
+
     Returns:
         token_q_values: Q-value for each token
         token_candidates: [(token_id, ref_prob, q_value, extracted_prob), ...] for each position
@@ -642,56 +636,55 @@ def _evaluate_trajectory_q_values(
         return [], [], []
 
     # Build context for critic (matching training format exactly)
-    # Filter out the target rollout from context (same as visualization script)
+    # Filter out the target rollout from context
     ctx_rollouts = [r for r in context_rollouts if r is not rollout]
     critic_prefix = _pack_context_for_critic(
         tokenizer, prompt_text, ctx_rollouts, cfg.max_length, rng
     )
 
-    # Reference model: on-policy sequence
+    # Reference model: get logits for all positions in one forward pass
     ref_seq = prompt_ids + response_ids
     ref_input = torch.tensor([ref_seq], dtype=torch.long, device=device)
 
-    # Critic model: packed sequence with context + target response
-    critic_seq = critic_prefix + response_ids
-    # Add EOS if not present
-    if response_ids[-1] != IM_END_TOKEN_ID:
-        critic_seq.append(IM_END_TOKEN_ID)
-    critic_input = torch.tensor([critic_seq], dtype=torch.long, device=device)
-
     with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
-        # Reference model forward
         ref_out = ref_model(input_ids=ref_input, use_cache=False, return_dict=True)
         ref_logits = ref_out.logits  # [1, S, V]
 
-        # Critic model forward
-        base = _get_base_model(_unwrap_model(critic_model))
+    # Critic model: build KV cache for the prefix
+    critic_prefix_input = torch.tensor([critic_prefix], dtype=torch.long, device=device)
+    base = _get_base_model(_unwrap_model(critic_model))
+
+    with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
         if base is None:
-            critic_out = critic_model(
-                input_ids=critic_input,
-                use_cache=False,
-                output_hidden_states=True,
+            critic_prefix_out = critic_model(
+                input_ids=critic_prefix_input,
+                use_cache=True,
                 return_dict=True,
             )
-            critic_hidden = critic_out.hidden_states[-1]
+            critic_kv = critic_prefix_out.past_key_values
         else:
-            critic_out = base(
-                input_ids=critic_input,
-                use_cache=False,
+            critic_prefix_out = base(
+                input_ids=critic_prefix_input,
+                use_cache=True,
                 return_dict=True,
             )
-            critic_hidden = critic_out.last_hidden_state if hasattr(critic_out, "last_hidden_state") else critic_out.hidden_states[-1]
+            critic_kv = critic_prefix_out.past_key_values
 
-    # Extract Q-values and candidates for each position
-    token_q_values: List[float] = []
-    token_candidates: List[List[Tuple[int, float, float, float]]] = []  # 4-tuple
-    token_kl_divergences: List[float] = []
+    del critic_prefix_input, critic_prefix_out
 
+    # Prepare for Q-value extraction
     m = _unwrap_model(critic_model)
     lm_head = _get_lm_head(m)
     w = lm_head.weight[cfg.distribution_token_id : cfg.distribution_token_id + num_bins]
     b = lm_head.bias[cfg.distribution_token_id : cfg.distribution_token_id + num_bins] if hasattr(lm_head, "bias") and lm_head.bias is not None else None
     num_reward_states = num_bins // num_length_bins
+
+    token_q_values: List[float] = []
+    token_candidates: List[List[Tuple[int, float, float, float]]] = []
+    token_kl_divergences: List[float] = []
+
+    # Batch size for candidate processing
+    CAND_BATCH_SIZE = 32
 
     for i, tid in enumerate(response_ids):
         # Reference position: position before this token
@@ -714,30 +707,60 @@ def _evaluate_trajectory_q_values(
         if tid not in cand_indices:
             cand_indices.append(tid)
 
-        # Critic position: position of this token in critic sequence
-        critic_pos = len(critic_prefix) + i
-
-        # Get Q-value for actual token
-        h = critic_hidden[0, critic_pos, :]
-        logits_h = F.linear(h, w, b).float()
-        logits_rs = logits_h.view(num_reward_states, num_length_bins)
-        logits_reward = torch.logsumexp(logits_rs, dim=1)
-        probs_reward = torch.softmax(logits_reward, dim=0)
-        actual_q = probs_reward[correct_reward_index].item()
-
-        token_q_values.append(actual_q)
-
-        # Get reference probs for candidates
+        num_cands = len(cand_indices)
         ref_probs_cand = [ref_probs_all[cid].item() for cid in cand_indices]
 
-        # For reference trajectories, we approximate Q-values (expensive to compute all)
-        # Use actual Q for the actual token, neutral Q=0.5 for others
-        cand_q_values = []
-        for cid in cand_indices:
-            if cid == tid:
-                cand_q_values.append(actual_q)
-            else:
-                cand_q_values.append(0.5)  # Neutral Q for others (approximation)
+        # Compute Q-values for ALL candidates by running forward passes
+        cand_q_values: List[float] = []
+
+        # Slice KV cache to current position (prefix + tokens so far)
+        current_kv = _slice_kv_cache(critic_kv, end=critic_kv.get_seq_length())
+
+        for batch_start in range(0, num_cands, CAND_BATCH_SIZE):
+            batch_end = min(batch_start + CAND_BATCH_SIZE, num_cands)
+            batch_cand_indices = cand_indices[batch_start:batch_end]
+            batch_size = len(batch_cand_indices)
+
+            expanded_kv = _expand_kv_cache(current_kv, batch_size=batch_size)
+            cand_input = torch.tensor(batch_cand_indices, dtype=torch.long, device=device).unsqueeze(1)  # [B, 1]
+
+            with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
+                if base is None:
+                    cand_out = critic_model(
+                        input_ids=cand_input,
+                        past_key_values=expanded_kv,
+                        use_cache=False,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    cand_hidden = cand_out.hidden_states[-1]
+                else:
+                    cand_out = base(
+                        input_ids=cand_input,
+                        past_key_values=expanded_kv,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    cand_hidden = cand_out.last_hidden_state if hasattr(cand_out, "last_hidden_state") else cand_out.hidden_states[-1]
+
+            # Extract Q-values from hidden states
+            for j in range(batch_size):
+                h = cand_hidden[j, 0, :]  # [E]
+                logits_h = F.linear(h, w, b).float()
+                logits_rs = logits_h.view(num_reward_states, num_length_bins)
+                logits_reward = torch.logsumexp(logits_rs, dim=1)
+                probs_reward = torch.softmax(logits_reward, dim=0)
+                q = probs_reward[correct_reward_index].item()
+                cand_q_values.append(q)
+
+            del expanded_kv, cand_input, cand_out, cand_hidden
+
+        del current_kv
+
+        # Find the Q-value for the actual token
+        actual_idx = cand_indices.index(tid)
+        actual_q = cand_q_values[actual_idx]
+        token_q_values.append(actual_q)
 
         # Compute extracted policy probabilities
         q_tensor = torch.tensor(cand_q_values, device=device)
@@ -775,7 +798,28 @@ def _evaluate_trajectory_q_values(
         candidates.sort(key=lambda x: -x[2])  # Sort by Q-value descending
         token_candidates.append(candidates)
 
-    del ref_input, critic_input, ref_out, critic_out, ref_logits, critic_hidden
+        # Update KV cache with actual token for next position
+        next_token = torch.tensor([[tid]], dtype=torch.long, device=device)
+        with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
+            if base is None:
+                update_out = critic_model(
+                    input_ids=next_token,
+                    past_key_values=critic_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                critic_kv = update_out.past_key_values
+            else:
+                update_out = base(
+                    input_ids=next_token,
+                    past_key_values=critic_kv,
+                    use_cache=True,
+                    return_dict=True,
+                )
+                critic_kv = update_out.past_key_values
+        del next_token, update_out
+
+    del ref_input, ref_out, ref_logits, critic_kv
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -1156,19 +1200,10 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
         # Pass 1: Generate all trajectories and collect KL values
         for sample_i in range(cfg.num_samples):
-            # Exclude one rollout from context to match training structure.
-            # During training, the target trajectory is NOT included in its own context.
-            # We use sample_i % len(all_rollouts) to vary which rollout is excluded,
-            # making the context match what reference evaluation would see for that rollout.
-            exclude_idx = sample_i % len(all_rollouts)
-
-            # Use the SAME RNG seed as reference evaluation for this excluded rollout.
-            # This ensures the context shuffling is identical.
-            # Reference eval uses: (cfg.seed * 1000003 + pid * 1009 + ref_i * 7)
-            seed_i = (cfg.seed * 1000003 + pid * 1009 + exclude_idx * 7) & 0xFFFFFFFF
+            seed_i = (cfg.seed * 1000003 + pid * 1009 + sample_i * 9176) & 0xFFFFFFFF
             rng = random.Random(seed_i)
             context_rollouts = all_rollouts
-            progress_prefix = f"[Rank {rank}] Sample {sample_i+1}/{cfg.num_samples} (excl ref {exclude_idx}): "
+            progress_prefix = f"[Rank {rank}] Sample {sample_i+1}/{cfg.num_samples}: "
 
             traj = _generate_with_q_weighting(
                 ref_model=ref_model,
@@ -1185,7 +1220,6 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 num_length_bins=num_length_bins,
                 correct_reward_index=correct_reward_index,
                 progress_prefix=progress_prefix,
-                exclude_rollout_idx=exclude_idx,
             )
 
             final_q = traj.token_q_values[-1] if traj.token_q_values else 0.0
