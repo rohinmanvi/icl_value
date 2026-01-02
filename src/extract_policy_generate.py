@@ -346,6 +346,8 @@ def _generate_with_q_weighting(
     # Progress tracking
     progress_prefix: str = "",
     progress_interval: int = 50,
+    # Optional: exclude one rollout from context (to match training/reference eval structure)
+    exclude_rollout_idx: Optional[int] = None,
 ) -> GeneratedTrajectory:
     """
     Generate a trajectory using Q-weighted sampling.
@@ -356,8 +358,15 @@ def _generate_with_q_weighting(
     3. Sample from π_new ∝ π_ref · exp(Q/τ)
     """
     # Build context for critic (matching training format exactly)
+    # Exclude one rollout from context to match training structure where
+    # the target trajectory is NOT included in its own context
+    if exclude_rollout_idx is not None and 0 <= exclude_rollout_idx < len(context_rollouts):
+        ctx_rollouts = [r for i, r in enumerate(context_rollouts) if i != exclude_rollout_idx]
+    else:
+        ctx_rollouts = context_rollouts
+
     critic_prefix = _pack_context_for_critic(
-        tokenizer, prompt_text, context_rollouts, cfg.max_length, rng
+        tokenizer, prompt_text, ctx_rollouts, cfg.max_length, rng
     )
 
     # Initialize sequences
@@ -1147,10 +1156,19 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
         # Pass 1: Generate all trajectories and collect KL values
         for sample_i in range(cfg.num_samples):
-            seed_i = (cfg.seed * 1000003 + pid * 1009 + sample_i * 9176) & 0xFFFFFFFF
+            # Exclude one rollout from context to match training structure.
+            # During training, the target trajectory is NOT included in its own context.
+            # We use sample_i % len(all_rollouts) to vary which rollout is excluded,
+            # making the context match what reference evaluation would see for that rollout.
+            exclude_idx = sample_i % len(all_rollouts)
+
+            # Use the SAME RNG seed as reference evaluation for this excluded rollout.
+            # This ensures the context shuffling is identical.
+            # Reference eval uses: (cfg.seed * 1000003 + pid * 1009 + ref_i * 7)
+            seed_i = (cfg.seed * 1000003 + pid * 1009 + exclude_idx * 7) & 0xFFFFFFFF
             rng = random.Random(seed_i)
             context_rollouts = all_rollouts
-            progress_prefix = f"[Rank {rank}] Sample {sample_i+1}/{cfg.num_samples}: "
+            progress_prefix = f"[Rank {rank}] Sample {sample_i+1}/{cfg.num_samples} (excl ref {exclude_idx}): "
 
             traj = _generate_with_q_weighting(
                 ref_model=ref_model,
@@ -1167,6 +1185,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 num_length_bins=num_length_bins,
                 correct_reward_index=correct_reward_index,
                 progress_prefix=progress_prefix,
+                exclude_rollout_idx=exclude_idx,
             )
 
             final_q = traj.token_q_values[-1] if traj.token_q_values else 0.0
