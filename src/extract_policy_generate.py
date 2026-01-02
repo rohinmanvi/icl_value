@@ -1232,7 +1232,7 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
         for ref_i in range(num_ref_to_show):
             ref_start = time.time()
             rollout = all_rollouts[ref_i]
-            print(f"[Rank {rank}] Reference {ref_i+1}/{num_ref_to_show}: evaluating {len(rollout.response_ids)} tokens...", end="", flush=True)
+            print(f"\n[Rank {rank}] Reference {ref_i+1}/{num_ref_to_show}: evaluating {len(rollout.response_ids)} tokens...", end="", flush=True)
             seed_i = (cfg.seed * 1000003 + pid * 1009 + ref_i * 7) & 0xFFFFFFFF
             rng = random.Random(seed_i)
 
@@ -1260,14 +1260,8 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             reference_final_q.append(final_q)
             reference_trajs.append((ref_i, rollout, q_values, candidates, kl_values))
 
-        # Compute max KL across all trajectories for this prompt
-        all_kl_values: List[float] = []
-        for _, traj in extracted_trajs:
-            all_kl_values.extend(traj.token_kl_divergences)
-        for _, _, _, _, kl_values in reference_trajs:
-            all_kl_values.extend(kl_values)
-        max_kl = max(all_kl_values) if all_kl_values else 1.0
-        max_kl = max(max_kl, 0.01)  # Avoid division issues
+        # Use constant max KL for consistent coloring across prompts
+        max_kl = 2.0
 
         # Pass 2: Build HTML with normalized KL colors
         if cfg.posterior_mode:
