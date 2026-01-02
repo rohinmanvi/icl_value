@@ -894,12 +894,18 @@ def _make_tooltip_html(
     candidates: List[Tuple[int, float, float, float]],  # 4-tuple
     decode_cache: Dict[int, str],
     max_show: int = 15,
+    kl_value: Optional[float] = None,
 ) -> str:
     """Create tooltip HTML showing token candidates with probabilities.
 
     Each candidate is (token_id, ref_prob, q_value, extracted_prob).
     """
     lines = ['<div class="tooltip"><table>']
+
+    # Show KL value if provided
+    if kl_value is not None:
+        lines.append(f"<tr><td colspan='4' style='text-align:center; color:#aaa;'>KL: {kl_value:.4f}</td></tr>")
+
     lines.append("<tr><th>Token</th><th>π_ref</th><th>Q</th><th>π_ext</th></tr>")
 
     for tid, ref_prob, q_val, ext_prob in candidates[:max_show]:
@@ -1134,24 +1140,18 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
         reference_gt: List[float] = []
         reference_final_q: List[float] = []
 
-        # Generate trajectories with extracted policy
-        if cfg.posterior_mode:
-            parts.append("<h3>Extracted Policy (Posterior)</h3>")
-        else:
-            parts.append(f"<h3>Extracted Policy (τ={cfg.temperature})</h3>")
-        parts.append('<div class="grid">')
+        # Store trajectory data for two-pass rendering (need max_kl first)
+        extracted_trajs: List[Tuple[int, GeneratedTrajectory]] = []  # (sample_i, traj)
+        reference_trajs: List[Tuple[int, Rollout, List[float], List[List[Tuple[int, float, float, float]]], List[float]]] = []
+        # reference_trajs: (ref_i, rollout, q_values, candidates, kl_values)
 
+        # Pass 1: Generate all trajectories and collect KL values
         for sample_i in range(cfg.num_samples):
             seed_i = (cfg.seed * 1000003 + pid * 1009 + sample_i * 9176) & 0xFFFFFFFF
             rng = random.Random(seed_i)
-
-            # Use ALL rollouts as context
             context_rollouts = all_rollouts
-
-            # Progress prefix for this sample
             progress_prefix = f"[Rank {rank}] Sample {sample_i+1}/{cfg.num_samples}: "
 
-            # Generate
             traj = _generate_with_q_weighting(
                 ref_model=ref_model,
                 critic_model=critic_model,
@@ -1170,11 +1170,63 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
             )
 
             final_q = traj.token_q_values[-1] if traj.token_q_values else 0.0
-            avg_kl = np.mean(traj.token_kl_divergences) if traj.token_kl_divergences else 0.0
             total_extracted += 1
             extracted_final_q.append(final_q)
+            extracted_trajs.append((sample_i, traj))
 
-            # Build dual-row visualization: Q-value row + KL row
+        # Evaluate reference trajectories
+        num_ref_to_show = min(cfg.show_reference_trajectories, len(all_rollouts))
+        for ref_i in range(num_ref_to_show):
+            ref_start = time.time()
+            rollout = all_rollouts[ref_i]
+            print(f"[Rank {rank}] Reference {ref_i+1}/{num_ref_to_show}: evaluating {len(rollout.response_ids)} tokens...", end="", flush=True)
+            seed_i = (cfg.seed * 1000003 + pid * 1009 + ref_i * 7) & 0xFFFFFFFF
+            rng = random.Random(seed_i)
+
+            q_values, candidates, kl_values = _evaluate_trajectory_q_values(
+                ref_model=ref_model,
+                critic_model=critic_model,
+                tokenizer=tokenizer,
+                rollout=rollout,
+                context_rollouts=all_rollouts,
+                prompt_text=prompt_text,
+                cfg=cfg,
+                device=device,
+                amp_dtype=amp_dtype,
+                rng=rng,
+                num_bins=num_bins,
+                num_length_bins=num_length_bins,
+                correct_reward_index=correct_reward_index,
+            )
+
+            ref_time = time.time() - ref_start
+            total_reference += 1
+            final_q = q_values[-1] if q_values else 0.0
+            print(f" done in {ref_time:.1f}s, final_q={final_q:.3f}", flush=True)
+            reference_gt.append(rollout.reward)
+            reference_final_q.append(final_q)
+            reference_trajs.append((ref_i, rollout, q_values, candidates, kl_values))
+
+        # Compute max KL across all trajectories for this prompt
+        all_kl_values: List[float] = []
+        for _, traj in extracted_trajs:
+            all_kl_values.extend(traj.token_kl_divergences)
+        for _, _, _, _, kl_values in reference_trajs:
+            all_kl_values.extend(kl_values)
+        max_kl = max(all_kl_values) if all_kl_values else 1.0
+        max_kl = max(max_kl, 0.01)  # Avoid division issues
+
+        # Pass 2: Build HTML with normalized KL colors
+        if cfg.posterior_mode:
+            parts.append("<h3>Extracted Policy (Posterior)</h3>")
+        else:
+            parts.append(f"<h3>Extracted Policy (τ={cfg.temperature})</h3>")
+        parts.append('<div class="grid">')
+
+        for sample_i, traj in extracted_trajs:
+            final_q = traj.token_q_values[-1] if traj.token_q_values else 0.0
+            avg_kl = np.mean(traj.token_kl_divergences) if traj.token_kl_divergences else 0.0
+
             q_spans: List[str] = []
             kl_spans: List[str] = []
             for idx, tid in enumerate(traj.response_ids):
@@ -1183,16 +1235,15 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                 candidates = traj.token_candidates[idx] if idx < len(traj.token_candidates) else []
 
                 tok_str = html_lib.escape(_decode_token(tokenizer, int(tid), decode_cache))
-                tooltip_html = _make_tooltip_html(tokenizer, tid, candidates, decode_cache, cfg.max_candidates_show)
+                tooltip_html = _make_tooltip_html(tokenizer, tid, candidates, decode_cache, cfg.max_candidates_show, kl_value=kl_val)
 
-                # Q-value row (with tooltip)
                 q_spans.append(
                     f'<span class="tok" style="background-color:{_reward_rgb(q_val)}">'
                     f'{tok_str}{tooltip_html}</span>'
                 )
-                # KL row (no tooltip to avoid duplication)
                 kl_spans.append(
-                    f'<span class="tok" style="background-color:{_kl_rgb(kl_val)}">{tok_str}</span>'
+                    f'<span class="tok" style="background-color:{_kl_rgb(kl_val, max_kl)}">'
+                    f'{tok_str}{tooltip_html}</span>'
                 )
 
             parts.append('<div class="card extracted">')
@@ -1212,45 +1263,15 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
 
         parts.append("</div>")
 
-        # Show reference trajectories
-        num_ref_to_show = min(cfg.show_reference_trajectories, len(all_rollouts))
-        if num_ref_to_show > 0:
+        # Reference trajectories
+        if reference_trajs:
             parts.append(f"<h3>Reference Trajectories (from dataset)</h3>")
             parts.append('<div class="grid">')
 
-            for ref_i in range(num_ref_to_show):
-                ref_start = time.time()
-                rollout = all_rollouts[ref_i]
-                print(f"[Rank {rank}] Reference {ref_i+1}/{num_ref_to_show}: evaluating {len(rollout.response_ids)} tokens...", end="", flush=True)
-                seed_i = (cfg.seed * 1000003 + pid * 1009 + ref_i * 7) & 0xFFFFFFFF
-                rng = random.Random(seed_i)
-
-                # Evaluate Q-values
-                q_values, candidates, kl_values = _evaluate_trajectory_q_values(
-                    ref_model=ref_model,
-                    critic_model=critic_model,
-                    tokenizer=tokenizer,
-                    rollout=rollout,
-                    context_rollouts=all_rollouts,
-                    prompt_text=prompt_text,
-                    cfg=cfg,
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    rng=rng,
-                    num_bins=num_bins,
-                    num_length_bins=num_length_bins,
-                    correct_reward_index=correct_reward_index,
-                )
-
-                ref_time = time.time() - ref_start
-                total_reference += 1
+            for ref_i, rollout, q_values, candidates, kl_values in reference_trajs:
                 final_q = q_values[-1] if q_values else 0.0
                 avg_kl = np.mean(kl_values) if kl_values else 0.0
-                print(f" done in {ref_time:.1f}s, final_q={final_q:.3f}", flush=True)
-                reference_gt.append(rollout.reward)
-                reference_final_q.append(final_q)
 
-                # Build dual-row visualization
                 q_spans: List[str] = []
                 kl_spans: List[str] = []
                 for idx, tid in enumerate(rollout.response_ids):
@@ -1259,16 +1280,15 @@ def _worker(rank: int, world: int, cfg: Config, fragment_dir: str) -> None:
                     cands = candidates[idx] if idx < len(candidates) else []
 
                     tok_str = html_lib.escape(_decode_token(tokenizer, int(tid), decode_cache))
-                    tooltip_html = _make_tooltip_html(tokenizer, tid, cands, decode_cache, cfg.max_candidates_show)
+                    tooltip_html = _make_tooltip_html(tokenizer, tid, cands, decode_cache, cfg.max_candidates_show, kl_value=kl_val)
 
-                    # Q-value row (with tooltip)
                     q_spans.append(
                         f'<span class="tok" style="background-color:{_reward_rgb(q_val)}">'
                         f'{tok_str}{tooltip_html}</span>'
                     )
-                    # KL row (no tooltip to avoid duplication)
                     kl_spans.append(
-                        f'<span class="tok" style="background-color:{_kl_rgb(kl_val)}">{tok_str}</span>'
+                        f'<span class="tok" style="background-color:{_kl_rgb(kl_val, max_kl)}">'
+                        f'{tok_str}{tooltip_html}</span>'
                     )
 
                 parts.append('<div class="card reference">')
@@ -1394,13 +1414,19 @@ def main() -> None:
     else:
         filtered_ids = length_filtered_ids
 
-    # Select prompts
+    # Select prompts (randomly sample if not explicitly specified)
     if args.prompt_idx and len(args.prompt_idx) > 0:
         selected_prompt_ids = [int(pid) for pid in args.prompt_idx if int(pid) in prompt_groups]
         if args.require_mixed_outcomes:
             selected_prompt_ids = [pid for pid in selected_prompt_ids if pid in filtered_ids]
     else:
-        selected_prompt_ids = filtered_ids[: args.num_prompts]
+        # Randomly sample prompts instead of taking first N
+        rng = random.Random(args.seed)
+        if len(filtered_ids) <= args.num_prompts:
+            selected_prompt_ids = filtered_ids
+        else:
+            selected_prompt_ids = rng.sample(filtered_ids, args.num_prompts)
+        selected_prompt_ids.sort()  # Sort for consistent ordering in output
 
     cfg.selected_prompt_ids = selected_prompt_ids
 
