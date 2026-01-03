@@ -32,38 +32,42 @@ conda deactivate && conda deactivate
 conda activate zip
 
 # === Configuration ===
-critic_model_id="models/joint_distribution_critic_no_ans_supervise_from_8_with_32"
-in_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_ref_logprobs.parquet"
-out_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_ref_logprobs_with_critic.parquet"
+critic_path="models/joint_distribution_critic_no_ans_supervise_from_8_with_32"
+ref_path="Qwen/Qwen3-1.7B"
+in_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
+out_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_q_labels.parquet"
 
 dp_size=8
-arrow_batch_size=1024
 max_length=131072
-shuffle_seed=0
-label_rollouts_per_prompt=1  # -1=all, 0=none, K>0=subsample K per prompt
-label_seed=0
+min_p=0.01
+seed=42
+max_groups=128            # -1 for all prompts
+max_rollouts_per_prompt=1 # -1 for all rollouts
 
-echo "Starting in-context critic labeling:"
-echo "  Critic model: $critic_model_id"
-echo "  Input:       $in_file"
-echo "  Output:      $out_file"
-echo "  DP size:     $dp_size"
-echo "  Max length:  $max_length"
-echo "  Seed:        $shuffle_seed"
-echo "  Label/prompt:$label_rollouts_per_prompt"
-echo "  Label seed:  $label_seed"
-echo "  Start time:  $(date)"
+echo "Starting in-context critic Q-value labeling:"
+echo "  Critic model: $critic_path"
+echo "  Ref model:    $ref_path"
+echo "  Input:        $in_file"
+echo "  Output:       $out_file"
+echo "  DP size:      $dp_size"
+echo "  Max length:   $max_length"
+echo "  Min-p:        $min_p"
+echo "  Seed:         $seed"
+echo "  Max groups:   $max_groups"
+echo "  Rollouts/prompt: $max_rollouts_per_prompt"
+echo "  Start time:   $(date)"
 
 python3 -u src/label_in_context_critic.py \
-    --critic-model-id "$critic_model_id" \
-    --in-parquet "$in_file" \
-    --out-parquet "$out_file" \
-    --dp-size $dp_size \
-    --arrow-batch-size $arrow_batch_size \
-    --max-length $max_length \
-    --shuffle-seed $shuffle_seed \
-    --label-rollouts-per-prompt $label_rollouts_per_prompt \
-    --label-seed $label_seed 2>&1 | tee -a /home/rohin/icl_value/logs/critic_label_$(basename ${out_file} .parquet).log
+    --critic_path "$critic_path" \
+    --ref_path "$ref_path" \
+    --in_parquet "$in_file" \
+    --out_parquet "$out_file" \
+    --dp_size $dp_size \
+    --max_length $max_length \
+    --min_p $min_p \
+    --seed $seed \
+    --max_groups $max_groups \
+    --max_rollouts_per_prompt $max_rollouts_per_prompt 2>&1 | tee -a /home/rohin/icl_value/logs/critic_label_$(basename ${out_file} .parquet).log
 
 exit_code=${PIPESTATUS[0]}
 echo "Labeling completed with exit code: $exit_code at $(date)"
