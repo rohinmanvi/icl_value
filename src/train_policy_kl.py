@@ -297,11 +297,8 @@ def compute_kl_loss(
             q_extended = torch.full((vocab_size,), min_q.item(), dtype=torch.float32, device=device)
             q_extended[cand_ids_tensor] = cand_qs_tensor
 
-            # Unnormalized log extracted policy: log π_ref + Q / τ
-            log_p_extracted_unnorm = log_ref_extended + q_extended / temperature
-
-            # Normalize
-            log_p_extracted = log_p_extracted_unnorm - torch.logsumexp(log_p_extracted_unnorm, dim=-1)
+            # Log extracted policy: log π_ref + Q / τ, then normalize
+            log_p_extracted = F.log_softmax(log_ref_extended + q_extended / temperature, dim=-1)
 
             # KL(π_extracted || π_student) - forward KL for mode-covering
             # With log_target=True: computes exp(log_target) * (log_target - input)
