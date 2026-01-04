@@ -9,11 +9,12 @@ For each trajectory:
 1. Build packed in-context sequence (matching training format exactly)
 2. Use reference model to get min-p filtered candidates at each position
 3. Compute Q-values for all candidates using the critic model
-4. Store candidate_ids and candidate_q_values
+4. Store candidate_ids, candidate_q_values, and candidate_ref_logprobs
 
 Output: A new parquet file with all original columns preserved, plus:
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
 - candidate_q_values: List[List[float]] - Q-values for each candidate
+- candidate_ref_logprobs: List[List[float]] - reference model log probs for each candidate
 """
 
 from __future__ import annotations
@@ -269,19 +270,20 @@ def _compute_candidate_q_values(
     num_bins: int,
     num_length_bins: int,
     correct_reward_index: int,
-) -> Tuple[List[List[int]], List[List[float]]]:
+) -> Tuple[List[List[int]], List[List[float]], List[List[float]]]:
     """
-    Compute Q-values for all min-p filtered candidates at each position.
+    Compute Q-values and reference log probs for all min-p filtered candidates at each position.
 
     Returns:
         candidate_ids: List of candidate token IDs for each position
         candidate_q_values: List of Q-values for each candidate at each position
+        candidate_ref_logprobs: List of reference log probs for each candidate at each position
     """
     response_ids = list(rollout.response_ids)
     prompt_ids = list(rollout.prompt_token_ids) if rollout.prompt_token_ids else []
 
     if not response_ids:
-        return [], []
+        return [], [], []
 
     # Build context for critic
     critic_prefix, _ = _pack_context_for_critic(
@@ -327,6 +329,7 @@ def _compute_candidate_q_values(
 
     all_candidate_ids: List[List[int]] = []
     all_candidate_q_values: List[List[float]] = []
+    all_candidate_ref_logprobs: List[List[float]] = []
 
     # Batch size for candidate processing
     CAND_BATCH_SIZE = 32
@@ -353,6 +356,9 @@ def _compute_candidate_q_values(
             cand_indices.append(tid)
 
         num_cands = len(cand_indices)
+
+        # Get reference log probs for candidates
+        cand_ref_logprobs: List[float] = [ref_log_probs_all[c].item() for c in cand_indices]
 
         # Compute Q-values for ALL candidates
         cand_q_values: List[float] = []
@@ -403,6 +409,7 @@ def _compute_candidate_q_values(
 
         all_candidate_ids.append(cand_indices)
         all_candidate_q_values.append(cand_q_values)
+        all_candidate_ref_logprobs.append(cand_ref_logprobs)
 
         # Update KV cache with actual token for next position
         next_token = torch.tensor([[tid]], dtype=torch.long, device=device)
@@ -429,7 +436,7 @@ def _compute_candidate_q_values(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    return all_candidate_ids, all_candidate_q_values
+    return all_candidate_ids, all_candidate_q_values, all_candidate_ref_logprobs
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +575,7 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
             print(f"\r[Rank {rank}] Rollout {rollout_i+1}/{len(all_rollouts)}: {len(rollout.response_ids)} tokens...", end="", flush=True)
             start_time = time.time()
 
-            candidate_ids, candidate_q_values = _compute_candidate_q_values(
+            candidate_ids, candidate_q_values, candidate_ref_logprobs = _compute_candidate_q_values(
                 ref_model=ref_model,
                 critic_model=critic_model,
                 tokenizer=tokenizer,
@@ -591,6 +598,7 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
                 "row_index": row_idx,
                 "candidate_ids": candidate_ids,
                 "candidate_q_values": candidate_q_values,
+                "candidate_ref_logprobs": candidate_ref_logprobs,
             })
 
     # Write results to parquet shard (just the new columns with row indices)
@@ -602,6 +610,7 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
             "row_index": pa.array([r["row_index"] for r in results], type=pa.int64()),
             "candidate_ids": pa.array([r["candidate_ids"] for r in results], type=pa.list_(pa.list_(pa.int64()))),
             "candidate_q_values": pa.array([r["candidate_q_values"] for r in results], type=pa.list_(pa.list_(pa.float32()))),
+            "candidate_ref_logprobs": pa.array([r["candidate_ref_logprobs"] for r in results], type=pa.list_(pa.list_(pa.float32()))),
         })
 
         pq.write_table(table, shard_path)
@@ -672,11 +681,13 @@ def _merge_shards(in_parquet: str, out_parquet: str, dp_size: int) -> bool:
         row_to_labels[row["row_index"]] = {
             "candidate_ids": row["candidate_ids"],
             "candidate_q_values": row["candidate_q_values"],
+            "candidate_ref_logprobs": row["candidate_ref_logprobs"],
         }
 
     # Add new columns
     original_df["candidate_ids"] = original_df.index.map(lambda idx: row_to_labels[idx]["candidate_ids"])
     original_df["candidate_q_values"] = original_df.index.map(lambda idx: row_to_labels[idx]["candidate_q_values"])
+    original_df["candidate_ref_logprobs"] = original_df.index.map(lambda idx: row_to_labels[idx]["candidate_ref_logprobs"])
 
     # Reset index and convert back to pyarrow
     original_df = original_df.reset_index(drop=True)

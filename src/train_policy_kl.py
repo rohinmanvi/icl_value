@@ -2,14 +2,15 @@
 """
 Train a student policy with KL divergence loss against the extracted policy.
 
-The extracted policy is: π_ext(a) ∝ π_student(a) * exp(Q(a) / τ)
+The extracted policy is: π_ext(a) ∝ π_ref(a) * exp(Q(a) / τ)
 
-We minimize KL(π_student || π_extracted) over candidate tokens only.
-Non-candidate tokens are treated as having 0 probability (min-p filtering).
+We minimize KL(π_extracted || π_student) (forward KL for mode-covering).
+Non-candidate tokens use min-p filtered reference probabilities with min(Q).
 
 Input data must have columns:
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
 - candidate_q_values: List[List[float]] - Q-values for each candidate
+- candidate_ref_logprobs: List[List[float]] - reference model log probs for each candidate
 - output_token_ids: List[int] - the actual trajectory tokens (for reference)
 
 Example usage:
@@ -57,7 +58,7 @@ class PolicyKLDataset(Dataset):
         df = pq.read_table(table).to_pandas() if isinstance(table, str) else table
 
         # Validate required columns
-        required_cols = ["prompt_token_ids", "output_token_ids", "candidate_ids", "candidate_q_values"]
+        required_cols = ["prompt_token_ids", "output_token_ids", "candidate_ids", "candidate_q_values", "candidate_ref_logprobs"]
         for c in required_cols:
             if c not in df.columns:
                 raise ValueError(f"Dataset missing required column: {c}")
@@ -103,18 +104,22 @@ class PolicyKLDataset(Dataset):
 
         candidate_ids = row["candidate_ids"]
         candidate_q_values = row["candidate_q_values"]
+        candidate_ref_logprobs = row["candidate_ref_logprobs"]
 
         # Convert numpy arrays if needed
         if hasattr(candidate_ids, 'tolist'):
             candidate_ids = candidate_ids.tolist()
         if hasattr(candidate_q_values, 'tolist'):
             candidate_q_values = candidate_q_values.tolist()
+        if hasattr(candidate_ref_logprobs, 'tolist'):
+            candidate_ref_logprobs = candidate_ref_logprobs.tolist()
 
         return {
             "prompt_ids": list(prompt_ids),
             "output_ids": list(output_ids),
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
+            "candidate_ref_logprobs": candidate_ref_logprobs,
         }
 
     def __len__(self):
@@ -127,6 +132,7 @@ class PolicyKLDataset(Dataset):
         output_ids = sample["output_ids"]
         candidate_ids = sample["candidate_ids"]
         candidate_q_values = sample["candidate_q_values"]
+        candidate_ref_logprobs = sample["candidate_ref_logprobs"]
 
         # Full sequence: prompt + output
         full_ids = prompt_ids + output_ids
@@ -140,12 +146,14 @@ class PolicyKLDataset(Dataset):
                 full_ids = full_ids[:self.max_length]
                 candidate_ids = []
                 candidate_q_values = []
+                candidate_ref_logprobs = []
                 output_ids = []
             else:
                 output_ids = output_ids[:max_output]
                 full_ids = prompt_ids + output_ids
                 candidate_ids = candidate_ids[:max_output]
                 candidate_q_values = candidate_q_values[:max_output]
+                candidate_ref_logprobs = candidate_ref_logprobs[:max_output]
 
         # Label positions: positions in full_ids that correspond to output tokens
         # Position i predicts token at position i+1
@@ -171,6 +179,7 @@ class PolicyKLDataset(Dataset):
             # Skip first output token (no position to predict it from)
             candidate_ids = candidate_ids[1:] if candidate_ids else []
             candidate_q_values = candidate_q_values[1:] if candidate_q_values else []
+            candidate_ref_logprobs = candidate_ref_logprobs[1:] if candidate_ref_logprobs else []
 
         input_tensor = torch.tensor(full_ids, dtype=torch.long)
 
@@ -179,6 +188,7 @@ class PolicyKLDataset(Dataset):
             "label_positions": label_positions,
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
+            "candidate_ref_logprobs": candidate_ref_logprobs,
             "taken_token_ids": taken_token_ids,
         }
 
@@ -195,6 +205,7 @@ class PolicyKLDataset(Dataset):
             "label_positions": [s["label_positions"] for s in batch],
             "candidate_ids": [s["candidate_ids"] for s in batch],
             "candidate_q_values": [s["candidate_q_values"] for s in batch],
+            "candidate_ref_logprobs": [s["candidate_ref_logprobs"] for s in batch],
             "taken_token_ids": [s["taken_token_ids"] for s in batch],
         }
 
@@ -205,15 +216,17 @@ def compute_kl_loss(
     temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Compute KL divergence loss: KL(π_student || π_extracted)
+    Compute KL divergence loss: KL(π_extracted || π_student) - forward KL for mode-covering
 
-    π_student = softmax(all_logits) - full vocabulary
-    π_extracted = softmax(all_logits + Q_extended / τ) where Q_extended is Q for candidates, 0 otherwise
+    π_student = softmax(student_logits) - full vocabulary from student model
+    π_extracted ∝ π_ref * exp(Q / τ) - using stored reference log probs
+
+    For non-candidate tokens, we use min(Q) and assume negligible reference probability.
 
     Also computes proper RL advantage:
     - V(s_t) = Q(s_{t-1}, a_{t-1}) (Q-value of previous taken action)
     - A(s_t, a) = Q(s_t, a) - V(s_t) for candidates, 0 for non-candidates
-    - Expected advantage = Σ π_student_full(a) * A(a)
+    - Expected advantage = Σ π(a) * A(a)
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -231,8 +244,9 @@ def compute_kl_loss(
     total_advantage_extracted = 0.0
     total_v_state = 0.0
 
-    for batch_idx, (positions, cand_ids_list, cand_q_list, taken_ids) in enumerate(
-        zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"], batch["taken_token_ids"])
+    for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
+        zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
+            batch["candidate_ref_logprobs"], batch["taken_token_ids"])
     ):
         if positions is None or len(positions) == 0:
             continue
@@ -242,8 +256,8 @@ def compute_kl_loss(
         # Track Q-value of taken action at each position for computing V(s_{t+1})
         prev_q_taken = None
 
-        for pos_idx, (pos, cand_ids, cand_qs, taken_id) in enumerate(
-            zip(positions, cand_ids_list, cand_q_list, taken_ids)
+        for pos_idx, (pos, cand_ids, cand_qs, cand_ref_lps, taken_id) in enumerate(
+            zip(positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids)
         ):
             # Handle numpy arrays and lists
             if cand_ids is None or len(cand_ids) < 2:
@@ -254,6 +268,7 @@ def compute_kl_loss(
             # Convert to lists if numpy arrays
             cand_ids_list_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
             cand_qs_list_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
+            cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
 
             # Get logits for this position
             pos_logits = logits[batch_idx, pos, :]  # [V]
@@ -261,19 +276,32 @@ def compute_kl_loss(
             # Candidate tensors
             cand_ids_tensor = torch.tensor(cand_ids_list_local, dtype=torch.long, device=device)
             cand_qs_tensor = torch.tensor(cand_qs_list_local, dtype=torch.float32, device=device)
+            cand_ref_lps_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
 
-            # π_student = softmax(all_logits) - full vocabulary
+            # π_student = softmax(student_logits) - full vocabulary
             log_p_student = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
             p_student = log_p_student.exp()
 
-            # π_extracted = softmax(all_logits + Q_extended / τ)
-            # Q_extended is Q for candidates, min(Q) for non-candidates
+            # π_extracted ∝ π_ref * exp(Q / τ)
+            # In log space: log π_extracted = log π_ref + Q / τ - log Z
+            # For candidates, we have stored ref log probs
+            # For non-candidates, use min(Q) and very low reference prob
+
             min_q = cand_qs_tensor.min()
+            min_ref_lp = cand_ref_lps_tensor.min() - 10.0  # Very low prob for non-candidates
+
+            # Build full vocabulary log probs for extracted policy (unnormalized)
+            log_ref_extended = torch.full((vocab_size,), min_ref_lp.item(), dtype=torch.float32, device=device)
+            log_ref_extended[cand_ids_tensor] = cand_ref_lps_tensor
+
             q_extended = torch.full((vocab_size,), min_q.item(), dtype=torch.float32, device=device)
             q_extended[cand_ids_tensor] = cand_qs_tensor
 
-            extracted_logits = pos_logits.float() + q_extended / temperature
-            log_p_extracted = F.log_softmax(extracted_logits, dim=-1)  # [V]
+            # Unnormalized log extracted policy: log π_ref + Q / τ
+            log_p_extracted_unnorm = log_ref_extended + q_extended / temperature
+
+            # Normalize
+            log_p_extracted = log_p_extracted_unnorm - torch.logsumexp(log_p_extracted_unnorm, dim=-1)
 
             # KL(π_extracted || π_student) - forward KL for mode-covering
             # With log_target=True: computes exp(log_target) * (log_target - input)
@@ -298,7 +326,7 @@ def compute_kl_loss(
                 advantages_extended = torch.zeros(vocab_size, dtype=torch.float32, device=device)
                 advantages_extended[cand_ids_tensor] = cand_qs_tensor - v_state
 
-                # Expected advantage for student: E_{π_student}[A(a)]
+                # Expected advantage for student and extracted policies
                 p_extracted = log_p_extracted.exp()
                 expected_advantage_student = (p_student * advantages_extended).sum()
                 expected_advantage_extracted = (p_extracted * advantages_extended).sum()

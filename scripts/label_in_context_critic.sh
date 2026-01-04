@@ -35,7 +35,7 @@ conda activate zip
 critic_path="models/joint_distribution_critic_no_ans_supervise_from_8_with_32"
 ref_path="Qwen/Qwen3-1.7B"
 in_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
-out_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_q_labels.parquet"
+out_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_q_labels_reflogprobs.parquet"
 
 dp_size=8
 max_length=131072
