@@ -221,13 +221,16 @@ def compute_kl_loss(
     for batch_idx, (positions, cand_ids_list, cand_q_list) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"])
     ):
-        if not positions or not cand_ids_list:
+        if positions is None or len(positions) == 0:
+            continue
+        if cand_ids_list is None or len(cand_ids_list) == 0:
             continue
 
         for pos_idx, (pos, cand_ids, cand_qs) in enumerate(
             zip(positions, cand_ids_list, cand_q_list)
         ):
-            if not cand_ids or len(cand_ids) < 2:
+            # Handle numpy arrays and lists
+            if cand_ids is None or len(cand_ids) < 2:
                 # Need at least 2 candidates for meaningful KL
                 continue
 
