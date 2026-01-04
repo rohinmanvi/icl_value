@@ -140,6 +140,7 @@ class PolicyKLDataset(Dataset):
                 full_ids = full_ids[:self.max_length]
                 candidate_ids = []
                 candidate_q_values = []
+                output_ids = []
             else:
                 output_ids = output_ids[:max_output]
                 full_ids = prompt_ids + output_ids
@@ -151,10 +152,13 @@ class PolicyKLDataset(Dataset):
         # So for output token at position len(prompt_ids) + j, we supervise position len(prompt_ids) + j - 1
         prompt_len = len(prompt_ids)
         label_positions = []
+        taken_token_ids = []  # The actual tokens taken by the original policy
+
         for j in range(len(output_ids)):
             pos = prompt_len + j - 1  # Position that predicts output_ids[j]
             if pos >= 0:
                 label_positions.append(pos)
+                taken_token_ids.append(output_ids[j])
 
         # Adjust candidate arrays to match label_positions
         # candidate_ids[j] corresponds to output_ids[j], which is predicted at label_positions[j]
@@ -175,6 +179,7 @@ class PolicyKLDataset(Dataset):
             "label_positions": label_positions,
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
+            "taken_token_ids": taken_token_ids,
         }
 
     @staticmethod
@@ -190,6 +195,7 @@ class PolicyKLDataset(Dataset):
             "label_positions": [s["label_positions"] for s in batch],
             "candidate_ids": [s["candidate_ids"] for s in batch],
             "candidate_q_values": [s["candidate_q_values"] for s in batch],
+            "taken_token_ids": [s["taken_token_ids"] for s in batch],
         }
 
 
@@ -205,6 +211,9 @@ def compute_kl_loss(
     π_extracted = softmax(logits[candidates] + Q / τ)
 
     KL(P || Q) = Σ P(x) * log(P(x) / Q(x))
+
+    Also computes advantage: V_student - Q(a_taken)
+    where V_student = Σ π_student(a) * Q(a)
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -217,32 +226,39 @@ def compute_kl_loss(
     total_positions = 0
     total_entropy_student = 0.0
     total_entropy_extracted = 0.0
+    total_advantage = 0.0
+    total_v_student = 0.0
+    total_q_taken = 0.0
 
-    for batch_idx, (positions, cand_ids_list, cand_q_list) in enumerate(
-        zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"])
+    for batch_idx, (positions, cand_ids_list, cand_q_list, taken_ids) in enumerate(
+        zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"], batch["taken_token_ids"])
     ):
         if positions is None or len(positions) == 0:
             continue
         if cand_ids_list is None or len(cand_ids_list) == 0:
             continue
 
-        for pos_idx, (pos, cand_ids, cand_qs) in enumerate(
-            zip(positions, cand_ids_list, cand_q_list)
+        for pos_idx, (pos, cand_ids, cand_qs, taken_id) in enumerate(
+            zip(positions, cand_ids_list, cand_q_list, taken_ids)
         ):
             # Handle numpy arrays and lists
             if cand_ids is None or len(cand_ids) < 2:
                 # Need at least 2 candidates for meaningful KL
                 continue
 
+            # Convert to lists if numpy arrays
+            cand_ids_list_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
+            cand_qs_list_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
+
             # Get logits for this position
             pos_logits = logits[batch_idx, pos, :]  # [V]
 
             # Extract logits for candidates only
-            cand_ids_tensor = torch.tensor(cand_ids, dtype=torch.long, device=device)
+            cand_ids_tensor = torch.tensor(cand_ids_list_local, dtype=torch.long, device=device)
             cand_logits = pos_logits[cand_ids_tensor]  # [num_candidates]
 
             # Q-values
-            cand_qs_tensor = torch.tensor(cand_qs, dtype=torch.float32, device=device)
+            cand_qs_tensor = torch.tensor(cand_qs_list_local, dtype=torch.float32, device=device)
 
             # π_student = softmax(cand_logits)
             log_p_student = F.log_softmax(cand_logits.float(), dim=-1)
@@ -265,12 +281,32 @@ def compute_kl_loss(
             total_entropy_student += -(p_student * log_p_student).sum()
             total_entropy_extracted += -(p_extracted * log_p_extracted).sum()
 
+            # Advantage computation: V_student - Q(a_taken)
+            # V_student = Σ π_student(a) * Q(a)
+            v_student = (p_student * cand_qs_tensor).sum()
+
+            # Find Q-value of taken action
+            try:
+                taken_idx = cand_ids_list_local.index(taken_id)
+                q_taken = cand_qs_tensor[taken_idx]
+            except ValueError:
+                # Taken action not in candidates (shouldn't happen, but fallback)
+                q_taken = v_student  # No advantage if we can't find it
+
+            advantage = v_student - q_taken
+            total_advantage += advantage.detach()
+            total_v_student += v_student.detach()
+            total_q_taken += q_taken.detach() if isinstance(q_taken, torch.Tensor) else q_taken
+
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {
             "num_positions": 0,
             "entropy_student": zero.detach(),
             "entropy_extracted": zero.detach(),
+            "advantage": zero.detach(),
+            "v_student": zero.detach(),
+            "q_taken": zero.detach(),
         }
 
     avg_kl = total_kl / total_positions
@@ -279,6 +315,9 @@ def compute_kl_loss(
         "num_positions": total_positions,
         "entropy_student": (total_entropy_student / total_positions).detach(),
         "entropy_extracted": (total_entropy_extracted / total_positions).detach(),
+        "advantage": (total_advantage / total_positions),
+        "v_student": (total_v_student / total_positions),
+        "q_taken": (total_q_taken / total_positions),
     }
 
     return avg_kl, metrics
@@ -391,6 +430,9 @@ def train(
     accum_loss = 0.0
     accum_entropy_student = 0.0
     accum_entropy_extracted = 0.0
+    accum_advantage = 0.0
+    accum_v_student = 0.0
+    accum_q_taken = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -420,6 +462,9 @@ def train(
             accum_loss += loss_val.item()
             accum_entropy_student += metrics["entropy_student"].item() if isinstance(metrics["entropy_student"], torch.Tensor) else metrics["entropy_student"]
             accum_entropy_extracted += metrics["entropy_extracted"].item() if isinstance(metrics["entropy_extracted"], torch.Tensor) else metrics["entropy_extracted"]
+            accum_advantage += metrics["advantage"].item() if isinstance(metrics["advantage"], torch.Tensor) else metrics["advantage"]
+            accum_v_student += metrics["v_student"].item() if isinstance(metrics["v_student"], torch.Tensor) else metrics["v_student"]
+            accum_q_taken += metrics["q_taken"].item() if isinstance(metrics["q_taken"], torch.Tensor) else metrics["q_taken"]
             accum_count += 1
 
             if not update:
@@ -443,15 +488,22 @@ def train(
                 avg_loss = accum_loss / max(1, accum_count)
                 avg_ent_s = accum_entropy_student / max(1, accum_count)
                 avg_ent_e = accum_entropy_extracted / max(1, accum_count)
+                avg_adv = accum_advantage / max(1, accum_count)
+                avg_v_s = accum_v_student / max(1, accum_count)
+                avg_q_t = accum_q_taken / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
-                    f"H_student={avg_ent_s:.3f} H_extracted={avg_ent_e:.3f} lr={lr:.2e}"
+                    f"adv={avg_adv:.4f} V_s={avg_v_s:.3f} Q_t={avg_q_t:.3f} "
+                    f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} lr={lr:.2e}"
                 )
 
                 if wandb_project:
                     wandb.log({
                         "train/kl_loss": avg_loss,
+                        "train/advantage": avg_adv,
+                        "train/v_student": avg_v_s,
+                        "train/q_taken": avg_q_t,
                         "train/entropy_student": avg_ent_s,
                         "train/entropy_extracted": avg_ent_e,
                         "lr": lr,
@@ -461,6 +513,9 @@ def train(
                 accum_loss = 0.0
                 accum_entropy_student = 0.0
                 accum_entropy_extracted = 0.0
+                accum_advantage = 0.0
+                accum_v_student = 0.0
+                accum_q_taken = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
