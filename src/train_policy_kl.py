@@ -274,9 +274,10 @@ def compute_kl_loss(
             extracted_logits = pos_logits.float() + q_extended / temperature
             log_p_extracted = F.log_softmax(extracted_logits, dim=-1)  # [V]
 
-            # KL(π_student || π_extracted) using F.kl_div
-            # F.kl_div expects (log_input, target) and computes target * (log(target) - log_input)
-            kl = F.kl_div(log_p_extracted, p_student, reduction='sum')
+            # KL(π_extracted || π_student) - forward KL for mode-covering
+            # With log_target=True: computes exp(log_target) * (log_target - input)
+            # This encourages student to cover all modes of extracted policy
+            kl = F.kl_div(log_p_student, log_p_extracted, reduction='sum', log_target=True)
 
             total_kl += kl
             total_positions += 1
