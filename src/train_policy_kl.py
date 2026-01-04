@@ -381,8 +381,9 @@ def train(
     warmup_iters = int(warmup_ratio * total_iters)
 
     def lr_schedule(i):
-        if i < warmup_iters:
-            return learning_rate * i / max(1, warmup_iters)
+        # Start at 0, linearly increase to learning_rate over warmup_iters
+        if i <= warmup_iters:
+            return learning_rate * (i - 1) / max(1, warmup_iters)
         progress = (i - warmup_iters) / max(1, total_iters - warmup_iters)
         return min_learning_rate + 0.5 * (1 + math.cos(math.pi * progress)) * (learning_rate - min_learning_rate)
 
