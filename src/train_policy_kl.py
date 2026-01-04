@@ -207,10 +207,8 @@ def compute_kl_loss(
     """
     Compute KL divergence loss: KL(π_student || π_extracted)
 
-    π_student = softmax(logits[candidates])
-    π_extracted = softmax(logits[candidates] + Q / τ)
-
-    KL(P || Q) = Σ P(x) * log(P(x) / Q(x))
+    π_student = softmax(all_logits) - full vocabulary
+    π_extracted = softmax(all_logits + Q_extended / τ) where Q_extended is Q for candidates, 0 otherwise
 
     Also computes proper RL advantage:
     - V(s_t) = Q(s_{t-1}, a_{t-1}) (Q-value of previous taken action)
@@ -223,6 +221,7 @@ def compute_kl_loss(
     # Forward pass
     outputs = model(input_ids=input_ids, use_cache=False)
     logits = outputs.logits  # [B, S, V]
+    vocab_size = logits.shape[-1]
 
     total_kl = 0.0
     total_positions = 0
@@ -258,31 +257,33 @@ def compute_kl_loss(
             # Get logits for this position
             pos_logits = logits[batch_idx, pos, :]  # [V]
 
-            # Extract logits for candidates only
+            # Candidate tensors
             cand_ids_tensor = torch.tensor(cand_ids_list_local, dtype=torch.long, device=device)
-            cand_logits = pos_logits[cand_ids_tensor]  # [num_candidates]
-
-            # Q-values
             cand_qs_tensor = torch.tensor(cand_qs_list_local, dtype=torch.float32, device=device)
 
-            # π_student over candidates = softmax(cand_logits)
-            log_p_student_cand = F.log_softmax(cand_logits.float(), dim=-1)
-            p_student_cand = log_p_student_cand.exp()
+            # π_student = softmax(all_logits) - full vocabulary
+            log_p_student = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
+            p_student = log_p_student.exp()
 
-            # π_extracted = softmax(cand_logits + Q / τ)
-            extracted_logits = cand_logits.float() + cand_qs_tensor / temperature
-            log_p_extracted = F.log_softmax(extracted_logits, dim=-1)
-            p_extracted = log_p_extracted.exp()
+            # π_extracted = softmax(all_logits + Q_extended / τ)
+            # Q_extended is Q for candidates, min(Q) for non-candidates
+            min_q = cand_qs_tensor.min()
+            q_extended = torch.full((vocab_size,), min_q.item(), dtype=torch.float32, device=device)
+            q_extended[cand_ids_tensor] = cand_qs_tensor
 
-            # KL(π_student || π_extracted) over candidates
-            kl = (p_student_cand * (log_p_student_cand - log_p_extracted)).sum()
+            extracted_logits = pos_logits.float() + q_extended / temperature
+            log_p_extracted = F.log_softmax(extracted_logits, dim=-1)  # [V]
+
+            # KL(π_student || π_extracted) using F.kl_div
+            # F.kl_div expects (log_input, target) and computes target * (log(target) - log_input)
+            kl = F.kl_div(log_p_extracted, p_student, reduction='sum')
 
             total_kl += kl
             total_positions += 1
 
-            # Entropy for monitoring (over candidates)
-            total_entropy_student += -(p_student_cand * log_p_student_cand).sum()
-            total_entropy_extracted += -(p_extracted * log_p_extracted).sum()
+            # Entropy for monitoring
+            total_entropy_student += -(p_student * log_p_student).sum()
+            total_entropy_extracted += -(log_p_extracted.exp() * log_p_extracted).sum()
 
             # --- Proper RL Advantage Computation ---
             # V(s_t) = Q(s_{t-1}, a_{t-1}) = prev_q_taken
@@ -291,18 +292,12 @@ def compute_kl_loss(
             if prev_q_taken is not None:
                 v_state = prev_q_taken  # V(s_t) = Q-value of previous taken action
 
-                # A(a) = Q(a) - V(s_t) for candidates
-                advantages_cand = cand_qs_tensor - v_state  # [num_candidates]
+                # A(a) = Q(a) - V(s_t) for candidates, min(Q) - V(s_t) for non-candidates
+                # Expected advantage = Σ π_student(a) * A(a)
+                advantages_extended = torch.full((vocab_size,), (min_q - v_state).item(), dtype=torch.float32, device=device)
+                advantages_extended[cand_ids_tensor] = cand_qs_tensor - v_state
 
-                # Full softmax over entire vocabulary
-                p_student_full = F.softmax(pos_logits.float(), dim=-1)  # [V]
-
-                # Get probabilities for candidates under full distribution
-                p_student_for_cands = p_student_full[cand_ids_tensor]  # [num_candidates]
-
-                # Expected advantage = Σ π_student_full(a) * A(a)
-                # Non-candidates have A(a) = 0, so they don't contribute
-                expected_advantage = (p_student_for_cands * advantages_cand).sum()
+                expected_advantage = (p_student * advantages_extended).sum()
 
                 total_advantage += expected_advantage.detach()
                 total_v_state += v_state.detach() if isinstance(v_state, torch.Tensor) else v_state
@@ -326,10 +321,6 @@ def compute_kl_loss(
         }
 
     avg_kl = total_kl / total_positions
-
-    # Note: advantage is averaged over positions where we could compute it (pos_idx > 0)
-    # So the count might be slightly less than total_positions
-    adv_count = max(1, total_positions - len(batch["label_positions"]))  # Approximate: subtract first positions
 
     metrics = {
         "num_positions": total_positions,
