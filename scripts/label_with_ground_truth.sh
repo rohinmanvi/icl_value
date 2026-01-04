@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --partition=defq
-#SBATCH --job-name=zip_label_ground_truth
+#SBATCH --job-name=icl_label_ground_truth
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-gpu=12
-#SBATCH --output=/home/rohin/ZIP/logs/zip_label_ground_truth.out
-#SBATCH --error=/home/rohin/ZIP/logs/zip_label_ground_truth.err
+#SBATCH --output=/home/rohin/icl_value/logs/label_ground_truth.out
+#SBATCH --error=/home/rohin/icl_value/logs/label_ground_truth.err
 #SBATCH --account=liquidai
 #SBATCH --exclude=liquid-gpu-[054]
 
@@ -31,7 +31,7 @@ export PYTHONUNBUFFERED=1
 # -----------------------------
 # Environment setup
 # -----------------------------
-cd $HOME/ZIP
+cd $HOME/icl_value
 source ~/miniconda3/etc/profile.d/conda.sh
 conda deactivate && conda deactivate
 conda activate zip
@@ -41,34 +41,34 @@ conda activate zip
 # -----------------------------
 
 
-# data_path="/home/rohin/ZIP/data/zip_training_hallucination_data_qwen06b_thinking.parquet"
+# data_path="data/icl_value_training_hallucination_data_qwen06b_thinking.parquet"
 # task="hallucination"
 
-# data_path="/home/rohin/ZIP/data/zip_training_hallucination_data_qwen4b_2507_thinking.parquet"
+# data_path="data/icl_value_training_hallucination_data_qwen4b_2507_thinking.parquet"
 # task="hallucination"
 
-# data_path="/home/rohin/ZIP/data/zip_training_hallucination_data_qwen17b_non_thinking.parquet"
+# data_path="data/icl_value_training_hallucination_data_qwen17b_non_thinking.parquet"
 # task="hallucination"
 
-# data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_non_thinking.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking.parquet"
 # task="correctness"
 
-# data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen4b_2507_thinking.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen4b_2507_thinking.parquet"
 # task="correctness"
 
-# data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_thinking_4_min_p_01.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen17b_thinking_4_min_p_01.parquet"
 # task="correctness"
 
-# data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_thinking_4_min_p_001.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen17b_thinking_4_min_p_001.parquet"
 # task="correctness"
 
-# data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_non_thinking_8_min_p_01.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_8_min_p_01.parquet"
 # task="correctness"
 
-# data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_non_thinking_8_min_p_001.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_8_min_p_001.parquet"
 # task="correctness"
 
-data_path="/home/rohin/ZIP/data/zip_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
+data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
 task="correctness"
 
 
@@ -84,7 +84,7 @@ python3 -u src/label_and_evaluate.py \
     --data "$data_path" \
     --task "$task" \
     --show-examples \
-    2>&1 | tee -a "/home/rohin/ZIP/logs/label_ground_truth_${base_name}.log"
+    2>&1 | tee -a "/home/rohin/icl_value/logs/label_ground_truth_${base_name}.log"
 
 exit_code=${PIPESTATUS[0]}
 echo "Label and evaluate completed with exit code: $exit_code at $(date)"
