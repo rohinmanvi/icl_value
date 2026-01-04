@@ -227,7 +227,8 @@ def compute_kl_loss(
     total_positions = 0
     total_entropy_student = 0.0
     total_entropy_extracted = 0.0
-    total_advantage = 0.0
+    total_advantage_student = 0.0
+    total_advantage_extracted = 0.0
     total_v_state = 0.0
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, taken_ids) in enumerate(
@@ -294,13 +295,16 @@ def compute_kl_loss(
                 v_state = prev_q_taken  # V(s_t) = Q-value of previous taken action
 
                 # A(a) = Q(a) - V(s_t) for candidates, 0 for non-candidates
-                # Expected advantage = Σ π_student(a) * A(a)
                 advantages_extended = torch.zeros(vocab_size, dtype=torch.float32, device=device)
                 advantages_extended[cand_ids_tensor] = cand_qs_tensor - v_state
 
-                expected_advantage = (p_student * advantages_extended).sum()
+                # Expected advantage for student: E_{π_student}[A(a)]
+                p_extracted = log_p_extracted.exp()
+                expected_advantage_student = (p_student * advantages_extended).sum()
+                expected_advantage_extracted = (p_extracted * advantages_extended).sum()
 
-                total_advantage += expected_advantage.detach()
+                total_advantage_student += expected_advantage_student.detach()
+                total_advantage_extracted += expected_advantage_extracted.detach()
                 total_v_state += v_state.detach() if isinstance(v_state, torch.Tensor) else v_state
 
             # Find Q-value of taken action for next position's V(s_{t+1})
@@ -317,7 +321,8 @@ def compute_kl_loss(
             "num_positions": 0,
             "entropy_student": zero.detach(),
             "entropy_extracted": zero.detach(),
-            "advantage": zero.detach(),
+            "advantage_student": zero.detach(),
+            "advantage_extracted": zero.detach(),
             "v_state": zero.detach(),
         }
 
@@ -327,7 +332,8 @@ def compute_kl_loss(
         "num_positions": total_positions,
         "entropy_student": (total_entropy_student / total_positions).detach(),
         "entropy_extracted": (total_entropy_extracted / total_positions).detach(),
-        "advantage": total_advantage / max(1, total_positions) if isinstance(total_advantage, torch.Tensor) else total_advantage / max(1, total_positions),
+        "advantage_student": total_advantage_student / max(1, total_positions) if isinstance(total_advantage_student, torch.Tensor) else total_advantage_student / max(1, total_positions),
+        "advantage_extracted": total_advantage_extracted / max(1, total_positions) if isinstance(total_advantage_extracted, torch.Tensor) else total_advantage_extracted / max(1, total_positions),
         "v_state": total_v_state / max(1, total_positions) if isinstance(total_v_state, torch.Tensor) else total_v_state / max(1, total_positions),
     }
 
@@ -441,7 +447,8 @@ def train(
     accum_loss = 0.0
     accum_entropy_student = 0.0
     accum_entropy_extracted = 0.0
-    accum_advantage = 0.0
+    accum_advantage_student = 0.0
+    accum_advantage_extracted = 0.0
     accum_v_state = 0.0
     accum_count = 0
 
@@ -472,7 +479,8 @@ def train(
             accum_loss += loss_val.item()
             accum_entropy_student += metrics["entropy_student"].item() if isinstance(metrics["entropy_student"], torch.Tensor) else metrics["entropy_student"]
             accum_entropy_extracted += metrics["entropy_extracted"].item() if isinstance(metrics["entropy_extracted"], torch.Tensor) else metrics["entropy_extracted"]
-            accum_advantage += metrics["advantage"].item() if isinstance(metrics["advantage"], torch.Tensor) else metrics["advantage"]
+            accum_advantage_student += metrics["advantage_student"].item() if isinstance(metrics["advantage_student"], torch.Tensor) else metrics["advantage_student"]
+            accum_advantage_extracted += metrics["advantage_extracted"].item() if isinstance(metrics["advantage_extracted"], torch.Tensor) else metrics["advantage_extracted"]
             accum_v_state += metrics["v_state"].item() if isinstance(metrics["v_state"], torch.Tensor) else metrics["v_state"]
             accum_count += 1
 
@@ -497,19 +505,21 @@ def train(
                 avg_loss = accum_loss / max(1, accum_count)
                 avg_ent_s = accum_entropy_student / max(1, accum_count)
                 avg_ent_e = accum_entropy_extracted / max(1, accum_count)
-                avg_adv = accum_advantage / max(1, accum_count)
+                avg_adv_s = accum_advantage_student / max(1, accum_count)
+                avg_adv_e = accum_advantage_extracted / max(1, accum_count)
                 avg_v = accum_v_state / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
-                    f"adv={avg_adv:.4f} V={avg_v:.3f} "
+                    f"adv_s={avg_adv_s:.4f} adv_e={avg_adv_e:.4f} V={avg_v:.3f} "
                     f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} lr={lr:.2e}"
                 )
 
                 if wandb_project:
                     wandb.log({
                         "train/kl_loss": avg_loss,
-                        "train/advantage": avg_adv,
+                        "train/advantage_student": avg_adv_s,
+                        "train/advantage_extracted": avg_adv_e,
                         "train/v_state": avg_v,
                         "train/entropy_student": avg_ent_s,
                         "train/entropy_extracted": avg_ent_e,
@@ -520,7 +530,8 @@ def train(
                 accum_loss = 0.0
                 accum_entropy_student = 0.0
                 accum_entropy_extracted = 0.0
-                accum_advantage = 0.0
+                accum_advantage_student = 0.0
+                accum_advantage_extracted = 0.0
                 accum_v_state = 0.0
                 accum_count = 0
 
