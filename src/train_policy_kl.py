@@ -292,9 +292,9 @@ def compute_kl_loss(
             if prev_q_taken is not None:
                 v_state = prev_q_taken  # V(s_t) = Q-value of previous taken action
 
-                # A(a) = Q(a) - V(s_t) for candidates, min(Q) - V(s_t) for non-candidates
+                # A(a) = Q(a) - V(s_t) for candidates, 0 for non-candidates
                 # Expected advantage = Σ π_student(a) * A(a)
-                advantages_extended = torch.full((vocab_size,), (min_q - v_state).item(), dtype=torch.float32, device=device)
+                advantages_extended = torch.zeros(vocab_size, dtype=torch.float32, device=device)
                 advantages_extended[cand_ids_tensor] = cand_qs_tensor - v_state
 
                 expected_advantage = (p_student * advantages_extended).sum()
