@@ -650,7 +650,7 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--min_learning_rate", type=float, default=0.0)
-    p.add_argument("--warmup_ratio", type=float, default=0.1)
+    p.add_argument("--warmup_ratio", type=float, default=0.05)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--max_steps", type=int, default=-1)
