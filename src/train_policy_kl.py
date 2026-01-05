@@ -243,6 +243,7 @@ def compute_kl_loss(
     total_advantage_student = 0.0
     total_advantage_extracted = 0.0
     total_v_state = 0.0
+    total_ref_mass = 0.0  # Probability mass on candidates from reference policy
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
@@ -312,6 +313,9 @@ def compute_kl_loss(
             total_entropy_student += -(p_student * log_p_student).sum()
             total_entropy_extracted += -(log_p_extracted.exp() * log_p_extracted).sum()
 
+            # Reference probability mass on candidates (should be high if min-p filtering worked)
+            total_ref_mass += cand_ref_lps_tensor.exp().sum()
+
             # --- Proper RL Advantage Computation ---
             # V(s_t) = Q(s_{t-1}, a_{t-1}) = prev_q_taken
             # For first position (pos_idx == 0), we don't have prev_q_taken, so advantage = 0
@@ -349,6 +353,7 @@ def compute_kl_loss(
             "advantage_student": zero.detach(),
             "advantage_extracted": zero.detach(),
             "v_state": zero.detach(),
+            "ref_mass": zero.detach(),
         }
 
     avg_kl = total_kl / total_positions
@@ -360,6 +365,7 @@ def compute_kl_loss(
         "advantage_student": total_advantage_student / max(1, total_positions) if isinstance(total_advantage_student, torch.Tensor) else total_advantage_student / max(1, total_positions),
         "advantage_extracted": total_advantage_extracted / max(1, total_positions) if isinstance(total_advantage_extracted, torch.Tensor) else total_advantage_extracted / max(1, total_positions),
         "v_state": total_v_state / max(1, total_positions) if isinstance(total_v_state, torch.Tensor) else total_v_state / max(1, total_positions),
+        "ref_mass": (total_ref_mass / total_positions).detach(),
     }
 
     return avg_kl, metrics
@@ -475,6 +481,7 @@ def train(
     accum_advantage_student = 0.0
     accum_advantage_extracted = 0.0
     accum_v_state = 0.0
+    accum_ref_mass = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -507,6 +514,7 @@ def train(
             accum_advantage_student += metrics["advantage_student"].item() if isinstance(metrics["advantage_student"], torch.Tensor) else metrics["advantage_student"]
             accum_advantage_extracted += metrics["advantage_extracted"].item() if isinstance(metrics["advantage_extracted"], torch.Tensor) else metrics["advantage_extracted"]
             accum_v_state += metrics["v_state"].item() if isinstance(metrics["v_state"], torch.Tensor) else metrics["v_state"]
+            accum_ref_mass += metrics["ref_mass"].item() if isinstance(metrics["ref_mass"], torch.Tensor) else metrics["ref_mass"]
             accum_count += 1
 
             if not update:
@@ -533,11 +541,12 @@ def train(
                 avg_adv_s = accum_advantage_student / max(1, accum_count)
                 avg_adv_e = accum_advantage_extracted / max(1, accum_count)
                 avg_v = accum_v_state / max(1, accum_count)
+                avg_ref_mass = accum_ref_mass / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
                     f"adv_s={avg_adv_s:.4f} adv_e={avg_adv_e:.4f} V={avg_v:.3f} "
-                    f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} lr={lr:.2e}"
+                    f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} ref_mass={avg_ref_mass:.3f} lr={lr:.2e}"
                 )
 
                 if wandb_project:
@@ -548,6 +557,7 @@ def train(
                         "train/v_state": avg_v,
                         "train/entropy_student": avg_ent_s,
                         "train/entropy_extracted": avg_ent_e,
+                        "train/ref_mass": avg_ref_mass,
                         "lr": lr,
                         "step": global_step,
                     })
@@ -558,6 +568,7 @@ def train(
                 accum_advantage_student = 0.0
                 accum_advantage_extracted = 0.0
                 accum_v_state = 0.0
+                accum_ref_mass = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
