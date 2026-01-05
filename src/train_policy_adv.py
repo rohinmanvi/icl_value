@@ -286,10 +286,12 @@ def compute_adv_loss(
             total_max_q += cand_qs_tensor.max().detach()
             total_mean_q += cand_qs_tensor.mean().detach()
 
-            # Entropy of student policy over candidates
-            cand_probs = cand_log_probs.exp()
-            cand_probs_norm = cand_probs / cand_probs.sum()  # Normalize to candidates only
-            entropy = -(cand_probs_norm * cand_probs_norm.log()).sum()
+            # Entropy of student policy over candidates (numerically stable)
+            # Normalize in log space to avoid numerical issues
+            cand_log_probs_norm = cand_log_probs - torch.logsumexp(cand_log_probs, dim=-1)
+            cand_probs_norm = cand_log_probs_norm.exp()
+            # Clamp to avoid log(0) = -inf, which causes 0 * -inf = nan
+            entropy = -(cand_probs_norm * cand_log_probs_norm.clamp(min=-100)).sum()
             total_entropy += entropy.detach()
 
             # --- Proper RL Advantage Computation ---
@@ -648,7 +650,7 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=1)
     p.add_argument("--learning_rate", type=float, default=1e-5)
     p.add_argument("--min_learning_rate", type=float, default=0.0)
-    p.add_argument("--warmup_ratio", type=float, default=0.05)
+    p.add_argument("--warmup_ratio", type=float, default=0.1)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--max_steps", type=int, default=-1)
