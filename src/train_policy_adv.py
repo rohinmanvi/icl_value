@@ -275,9 +275,9 @@ def compute_adv_loss(
 
             # Metrics
             total_advantage += advantages.mean().detach()
-            total_min_q += min_q.detach()
+            total_min_q += cand_qs_tensor.min().detach()
             total_max_q += cand_qs_tensor.max().detach()
-            total_mean_q += cand_qs_tensor.mean().detach()
+            total_mean_q += mean_q.detach()
 
             # Entropy of student policy over candidates
             cand_probs = cand_log_probs.exp()
