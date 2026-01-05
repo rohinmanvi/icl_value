@@ -20,10 +20,7 @@ Example usage:
 """
 from __future__ import annotations
 import argparse, math, os, time, random
-try:
-    import wandb
-except ImportError:
-    wandb = None
+import wandb
 from typing import List, Dict, Any, Tuple
 import pyarrow.parquet as pq
 import torch
@@ -86,9 +83,9 @@ class PolicyKLDataset(Dataset):
                     row_list = list(rows_with_idx)
                     random.shuffle(row_list)
                     for idx, r in row_list:
-                        self.samples.append(self._process_row(r.to_dict(), row_idx=idx))
+                        self.samples.append(self._process_row(r.to_dict()))
         else:
-            self.samples = [self._process_row(r.to_dict(), row_idx=idx) for idx, r in df.iterrows()]
+            self.samples = [self._process_row(r.to_dict()) for idx, r in df.iterrows()]
             if examples_per_prompt > 1:
                 original = self.samples.copy()
                 for _ in range(examples_per_prompt - 1):
@@ -96,7 +93,7 @@ class PolicyKLDataset(Dataset):
 
         print(f"Constructed {len(self.samples)} training samples")
 
-    def _process_row(self, row: Dict, row_idx: int = -1) -> Dict:
+    def _process_row(self, row: Dict) -> Dict:
         """Process a single row into a training sample."""
         prompt_ids = row["prompt_token_ids"]
         if hasattr(prompt_ids, 'tolist'):
@@ -124,7 +121,6 @@ class PolicyKLDataset(Dataset):
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
             "candidate_ref_logprobs": candidate_ref_logprobs,
-            "row_idx": row_idx,
         }
 
     def __len__(self):
@@ -195,7 +191,6 @@ class PolicyKLDataset(Dataset):
             "candidate_q_values": candidate_q_values,
             "candidate_ref_logprobs": candidate_ref_logprobs,
             "taken_token_ids": taken_token_ids,
-            "row_idx": sample.get("row_idx", -1),
         }
 
     @staticmethod
@@ -213,7 +208,6 @@ class PolicyKLDataset(Dataset):
             "candidate_q_values": [s["candidate_q_values"] for s in batch],
             "candidate_ref_logprobs": [s["candidate_ref_logprobs"] for s in batch],
             "taken_token_ids": [s["taken_token_ids"] for s in batch],
-            "row_idx": [s["row_idx"] for s in batch],
         }
 
 
@@ -238,23 +232,9 @@ def compute_kl_loss(
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
 
-    # Forward pass in eval mode to get consistent logits (no dropout)
-    # This matches how reference log probs were computed during labeling
-    was_training = model.training
-    model.eval()
     outputs = model(input_ids=input_ids, use_cache=False)
-    if was_training:
-        model.train()
     logits = outputs.logits  # [B, S, V]
     vocab_size = logits.shape[-1]
-
-    # Debug: print input info on first call
-    if not hasattr(compute_kl_loss, '_debug_printed'):
-        compute_kl_loss._debug_printed = True
-        print(f"\n[DEBUG] First batch input diagnostics:")
-        print(f"  input_ids shape: {input_ids.shape}")
-        print(f"  First 10 tokens: {input_ids[0, :10].tolist()}")
-        print(f"  logits shape: {logits.shape}")
 
     total_kl = 0.0
     total_positions = 0
@@ -267,10 +247,9 @@ def compute_kl_loss(
     total_sft_loss = 0.0  # SFT loss: -log π_student(a_taken | s)
     total_ref_sft_loss = 0.0  # Reference SFT loss: -log π_ref(a_taken | s)
 
-    row_indices = batch.get("row_idx", [-1] * len(batch["label_positions"]))
-    for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids, row_idx) in enumerate(
+    for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
-            batch["candidate_ref_logprobs"], batch["taken_token_ids"], row_indices)
+            batch["candidate_ref_logprobs"], batch["taken_token_ids"])
     ):
         if positions is None or len(positions) == 0:
             continue
@@ -329,36 +308,6 @@ def compute_kl_loss(
 
             total_kl += kl
             total_positions += 1
-
-            # Debug: on first few positions, check if student log probs match stored ref log probs
-            if total_positions <= 3:
-                student_lps_on_cands = log_p_student[cand_ids_tensor]
-                diff = (student_lps_on_cands - cand_ref_lps_tensor).abs()
-
-                # Check if taken token is in candidates and what its rank is
-                taken_in_cands = taken_id in cand_ids_list_local
-                if taken_in_cands:
-                    taken_idx = cand_ids_list_local.index(taken_id)
-                    taken_student_lp = log_p_student[taken_id].item()
-                    taken_stored_lp = cand_ref_lps_tensor[taken_idx].item()
-                else:
-                    taken_student_lp = log_p_student[taken_id].item()
-                    taken_stored_lp = float('nan')
-
-                # Get the actual token at position pos+1 (what we're predicting)
-                actual_next_token = input_ids[batch_idx, pos + 1].item() if pos + 1 < input_ids.shape[1] else -1
-
-                print(f"[DEBUG] Position {total_positions} (pos={pos}, batch={batch_idx}, row_idx={row_idx}):")
-                print(f"  Token at pos: {input_ids[batch_idx, pos].item()}, predicting next: {actual_next_token}")
-                print(f"  taken_id from data: {taken_id}, match: {taken_id == actual_next_token}")
-                print(f"  prompt_len: {pos - pos_idx + 1}")
-                print(f"  Num candidates: {len(cand_ids_list_local)}, in_cands={taken_in_cands}")
-                print(f"  Stored ref log probs: min={cand_ref_lps_tensor.min().item():.3f}, max={cand_ref_lps_tensor.max().item():.3f}")
-                print(f"  Student log probs:    min={student_lps_on_cands.min().item():.3f}, max={student_lps_on_cands.max().item():.3f}")
-                print(f"  |student - stored_ref|: mean={diff.mean().item():.4f}, max={diff.max().item():.4f}")
-                print(f"  Taken token: student_lp={taken_student_lp:.3f}, stored_lp={taken_stored_lp:.3f}")
-                print(f"  Q-values: min={cand_qs_tensor.min().item():.4f}, max={cand_qs_tensor.max().item():.4f}")
-                print(f"  KL at this position: {kl.item():.4f}")
 
             # Entropy for monitoring
             total_entropy_student += -(p_student * log_p_student).sum()
