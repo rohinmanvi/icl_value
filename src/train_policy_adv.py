@@ -5,11 +5,9 @@ Train a policy with advantage-weighted log likelihood loss.
 Loss: L = -Σ A(a) * log π(a | s)
 
 where:
-- A(a) = Q(a) - V(s) for candidate tokens, where V(s) = Q(s_{t-1}, a_{t-1})
+- A(a) = Q(a) - mean(Q_candidates) for candidate tokens
 - A(a) = 0 for non-candidate tokens
-- For first position, falls back to V(s) = mean(Q_candidates)
 
-This is proper RL advantage using the value function V(s) as baseline.
 Positive advantages push probabilities up, negative push down.
 
 Input data must have columns:
@@ -207,8 +205,7 @@ def compute_adv_loss(
 
     L = -Σ A(a) * log π(a | s)
 
-    where A(a) = Q(a) - V(s) for candidates, 0 otherwise.
-    V(s) = Q(s_{t-1}, a_{t-1}) is the Q-value of the previous taken action.
+    where A(a) = Q(a) - mean(Q_candidates) for candidates, 0 otherwise.
     Positive advantages push probabilities up, negative push down.
     """
     device = next(model.parameters()).device
@@ -260,14 +257,9 @@ def compute_adv_loss(
             cand_ids_tensor = torch.tensor(cand_ids_list_local, dtype=torch.long, device=device)
             cand_qs_tensor = torch.tensor(cand_qs_list_local, dtype=torch.float32, device=device)
 
-            # Compute advantages: A(a) = Q(a) - V(s)
-            # V(s) = Q(s_{t-1}, a_{t-1}) for proper RL advantage
-            # Fall back to mean(Q) for first position where we don't have prev_q_taken
-            if prev_q_taken is not None:
-                baseline = prev_q_taken
-            else:
-                baseline = cand_qs_tensor.mean()
-            advantages = cand_qs_tensor - baseline  # Can be +/-
+            # Compute advantages: A(a) = Q(a) - mean(Q)
+            mean_q = cand_qs_tensor.mean()
+            advantages = cand_qs_tensor - mean_q  # Can be +/-
 
             # Get log probs for candidates
             log_probs = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
