@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Train a policy with policy gradient style loss.
+Train a policy with advantage-weighted log likelihood loss.
 
-Loss: L = -Σ π(a) * A(a) * log π(a | s)
+Loss: L = -Σ A(a) * log π(a | s)
 
 where:
-- π(a) = current policy probability (detached, no gradient)
 - A(a) = Q(a) - mean(Q_candidates) for candidate tokens
 - A(a) = 0 for non-candidate tokens
 
-Weighting by π(a) makes rare actions contribute less gradient,
-matching the expectation form of policy gradient.
+Positive advantages push probabilities up, negative push down.
 
 Input data must have columns:
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
@@ -203,15 +201,12 @@ def compute_adv_loss(
     batch,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Compute policy gradient style loss.
+    Compute advantage-weighted log likelihood loss.
 
-    L = -Σ π(a) * A(a) * log π(a | s)
+    L = -Σ A(a) * log π(a | s)
 
-    where:
-    - π(a) is the current policy probability (detached)
-    - A(a) = Q(a) - mean(Q_candidates) for candidates, 0 otherwise
-
-    Weighting by π(a) matches the expectation form of policy gradient.
+    where A(a) = Q(a) - mean(Q_candidates) for candidates, 0 otherwise.
+    Positive advantages push probabilities up, negative push down.
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -229,6 +224,7 @@ def compute_adv_loss(
     total_mean_q = 0.0
     total_rl_advantage_student = 0.0  # Proper RL advantage: E_π[Q(a) - V(s)]
     total_v_state = 0.0
+    total_sft_loss = 0.0  # SFT loss: -log π(a_taken | s)
     vocab_size = logits.shape[-1]
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, taken_ids) in enumerate(
@@ -270,11 +266,9 @@ def compute_adv_loss(
             log_probs = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
             cand_log_probs = log_probs[cand_ids_tensor]  # [num_candidates]
 
-            # Policy gradient style loss: -Σ π(a) * A(a) * log π(a)
-            # Weight by current policy probability (detached to not backprop through weights)
-            # This makes rare actions contribute less, matching true PG
-            cand_probs = cand_log_probs.exp().detach()
-            pos_loss = -(cand_probs * advantages * cand_log_probs).sum()
+            # Loss: -Σ A(a) * log π(a)
+            # Only candidates contribute (non-candidates have A=0)
+            pos_loss = -(advantages * cand_log_probs).sum()
 
             total_loss += pos_loss
             total_positions += 1
@@ -284,6 +278,10 @@ def compute_adv_loss(
             total_min_q += cand_qs_tensor.min().detach()
             total_max_q += cand_qs_tensor.max().detach()
             total_mean_q += cand_qs_tensor.mean().detach()
+
+            # SFT loss: -log π(a_taken | s) - measures alignment with original behavior
+            sft_loss = -log_probs[taken_id]
+            total_sft_loss += sft_loss.detach()
 
             # Entropy of student policy over candidates (numerically stable)
             # Normalize in log space to avoid numerical issues
@@ -329,6 +327,7 @@ def compute_adv_loss(
             "mean_q": 0.0,
             "rl_advantage_student": 0.0,
             "v_state": 0.0,
+            "sft_loss": 0.0,
         }
 
     avg_loss = total_loss / total_positions
@@ -342,6 +341,7 @@ def compute_adv_loss(
         "mean_q": (total_mean_q / total_positions).item(),
         "rl_advantage_student": total_rl_advantage_student / max(1, total_positions) if isinstance(total_rl_advantage_student, torch.Tensor) else total_rl_advantage_student / max(1, total_positions),
         "v_state": total_v_state / max(1, total_positions) if isinstance(total_v_state, torch.Tensor) else total_v_state / max(1, total_positions),
+        "sft_loss": (total_sft_loss / total_positions).item(),
     }
 
     return avg_loss, metrics
@@ -456,6 +456,7 @@ def train(
     accum_mean_q = 0.0
     accum_rl_advantage_student = 0.0
     accum_v_state = 0.0
+    accum_sft_loss = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -490,6 +491,7 @@ def train(
             accum_mean_q += metrics["mean_q"]
             accum_rl_advantage_student += metrics["rl_advantage_student"].item() if isinstance(metrics["rl_advantage_student"], torch.Tensor) else metrics["rl_advantage_student"]
             accum_v_state += metrics["v_state"].item() if isinstance(metrics["v_state"], torch.Tensor) else metrics["v_state"]
+            accum_sft_loss += metrics["sft_loss"]
             accum_count += 1
 
             if not update:
@@ -518,9 +520,10 @@ def train(
                 avg_mean_q = accum_mean_q / max(1, accum_count)
                 avg_rl_adv = accum_rl_advantage_student / max(1, accum_count)
                 avg_v = accum_v_state / max(1, accum_count)
+                avg_sft = accum_sft_loss / max(1, accum_count)
 
                 print(
-                    f"[Step {global_step}] loss={avg_loss:.4f} "
+                    f"[Step {global_step}] loss={avg_loss:.4f} sft={avg_sft:.3f} "
                     f"adv={avg_adv:.4f} rl_adv={avg_rl_adv:.4f} V={avg_v:.3f} "
                     f"H={avg_ent:.3f} Q=[{avg_min_q:.3f}, {avg_mean_q:.3f}, {avg_max_q:.3f}] lr={lr:.2e}"
                 )
@@ -528,6 +531,7 @@ def train(
                 if wandb_project:
                     wandb.log({
                         "train/loss": avg_loss,
+                        "train/sft_loss": avg_sft,
                         "train/mean_advantage": avg_adv,
                         "train/rl_advantage_student": avg_rl_adv,
                         "train/v_state": avg_v,
@@ -547,6 +551,7 @@ def train(
                 accum_mean_q = 0.0
                 accum_rl_advantage_student = 0.0
                 accum_v_state = 0.0
+                accum_sft_loss = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
