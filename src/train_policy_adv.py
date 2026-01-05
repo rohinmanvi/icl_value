@@ -5,12 +5,11 @@ Train a policy with advantage-weighted log likelihood loss.
 Loss: L = -Σ A(a) * log π(a | s)
 
 where:
-- A(a) = Q(a) - min(Q_candidates) for candidate tokens
+- A(a) = Q(a) - mean(Q_candidates) for candidate tokens
 - A(a) = 0 for non-candidate tokens
 
-This pushes up the probability of high-Q actions proportionally to how much
-better they are than the worst candidate. Non-candidates are pushed down
-implicitly through softmax normalization.
+This pushes up the probability of above-average Q actions and pushes down
+below-average Q actions. Non-candidates don't directly contribute to the loss.
 
 Input data must have columns:
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
@@ -207,7 +206,8 @@ def compute_adv_loss(
 
     L = -Σ A(a) * log π(a | s)
 
-    where A(a) = Q(a) - min(Q_candidates) for candidates, 0 otherwise.
+    where A(a) = Q(a) - mean(Q_candidates) for candidates, 0 otherwise.
+    Positive advantages push probabilities up, negative push down.
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -258,9 +258,9 @@ def compute_adv_loss(
             cand_ids_tensor = torch.tensor(cand_ids_list_local, dtype=torch.long, device=device)
             cand_qs_tensor = torch.tensor(cand_qs_list_local, dtype=torch.float32, device=device)
 
-            # Compute advantages: A(a) = Q(a) - min(Q)
-            min_q = cand_qs_tensor.min()
-            advantages = cand_qs_tensor - min_q  # All >= 0
+            # Compute advantages: A(a) = Q(a) - mean(Q)
+            mean_q = cand_qs_tensor.mean()
+            advantages = cand_qs_tensor - mean_q  # Can be +/-
 
             # Get log probs for candidates
             log_probs = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
