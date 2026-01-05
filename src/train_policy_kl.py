@@ -311,23 +311,21 @@ def compute_kl_loss(
             # For candidates, we have stored ref log probs
             # For non-candidates, use min(Q) and very low reference prob
 
-            min_q = cand_qs_tensor.min()
-            min_ref_lp = cand_ref_lps_tensor.min() - 10.0  # Very low prob for non-candidates
+            # Compute extracted policy ONLY over candidates, then compute KL only over candidates
+            # π_extracted(a) ∝ π_ref(a) * exp(Q(a) / τ)
+            # In log space: log π_extracted = log π_ref + Q / τ - log Z (where Z normalizes over candidates)
 
-            # Build full vocabulary log probs for extracted policy (unnormalized)
-            log_ref_extended = torch.full((vocab_size,), min_ref_lp.item(), dtype=torch.float32, device=device)
-            log_ref_extended[cand_ids_tensor] = cand_ref_lps_tensor
-
-            q_extended = torch.full((vocab_size,), min_q.item(), dtype=torch.float32, device=device)
-            q_extended[cand_ids_tensor] = cand_qs_tensor
-
-            # Log extracted policy: log π_ref + Q / τ, then normalize
-            log_p_extracted = F.log_softmax(log_ref_extended + q_extended / temperature, dim=-1)
+            # The stored ref log probs are already proper log probabilities
+            # We apply softmax to (log_ref + Q/T) to get the extracted policy over candidates
+            log_weights = cand_ref_lps_tensor + cand_qs_tensor / temperature
+            log_p_extracted_cands = F.log_softmax(log_weights, dim=-1)  # Normalized over candidates only
+            p_extracted_cands = log_p_extracted_cands.exp()
 
             # KL(π_extracted || π_student) - forward KL for mode-covering
-            # With log_target=True: computes exp(log_target) * (log_target - input)
-            # This encourages student to cover all modes of extracted policy
-            kl = F.kl_div(log_p_student, log_p_extracted, reduction='sum', log_target=True)
+            # Since π_extracted is only defined over candidates, we compute KL only over candidates:
+            # KL = Σ_{a ∈ candidates} p_ext(a) * (log p_ext(a) - log p_stu(a))
+            log_p_student_cands = log_p_student[cand_ids_tensor]
+            kl = (p_extracted_cands * (log_p_extracted_cands - log_p_student_cands)).sum()
 
             total_kl += kl
             total_positions += 1
@@ -364,7 +362,7 @@ def compute_kl_loss(
 
             # Entropy for monitoring
             total_entropy_student += -(p_student * log_p_student).sum()
-            total_entropy_extracted += -(log_p_extracted.exp() * log_p_extracted).sum()
+            total_entropy_extracted += -(p_extracted_cands * log_p_extracted_cands).sum()
 
             # Reference probability mass on candidates (should be high if min-p filtering worked)
             total_ref_mass += cand_ref_lps_tensor.exp().sum()
@@ -388,14 +386,14 @@ def compute_kl_loss(
             if prev_q_taken is not None:
                 v_state = prev_q_taken  # V(s_t) = Q-value of previous taken action
 
-                # A(a) = Q(a) - V(s_t) for candidates, 0 for non-candidates
-                advantages_extended = torch.zeros(vocab_size, dtype=torch.float32, device=device)
-                advantages_extended[cand_ids_tensor] = cand_qs_tensor - v_state
+                # A(a) = Q(a) - V(s_t) for candidates
+                advantages_cands = cand_qs_tensor - v_state
 
                 # Expected advantage for student and extracted policies
-                p_extracted = log_p_extracted.exp()
-                expected_advantage_student = (p_student * advantages_extended).sum()
-                expected_advantage_extracted = (p_extracted * advantages_extended).sum()
+                # Student: sum over candidates only (non-candidates have 0 advantage)
+                p_student_cands = p_student[cand_ids_tensor]
+                expected_advantage_student = (p_student_cands * advantages_cands).sum()
+                expected_advantage_extracted = (p_extracted_cands * advantages_cands).sum()
 
                 total_advantage_student += expected_advantage_student.detach()
                 total_advantage_extracted += expected_advantage_extracted.detach()
