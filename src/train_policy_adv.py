@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Train a policy with advantage-weighted log likelihood loss.
+Train a policy with policy gradient style loss.
 
-Loss: L = -Σ A(a) * log π(a | s)
+Loss: L = -Σ π(a) * A(a) * log π(a | s)
 
 where:
+- π(a) = current policy probability (detached, no gradient)
 - A(a) = Q(a) - mean(Q_candidates) for candidate tokens
 - A(a) = 0 for non-candidate tokens
 
-Positive advantages push probabilities up, negative push down.
+Weighting by π(a) makes rare actions contribute less gradient,
+matching the expectation form of policy gradient.
 
 Input data must have columns:
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
@@ -201,12 +203,15 @@ def compute_adv_loss(
     batch,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
-    Compute advantage-weighted log likelihood loss.
+    Compute policy gradient style loss.
 
-    L = -Σ A(a) * log π(a | s)
+    L = -Σ π(a) * A(a) * log π(a | s)
 
-    where A(a) = Q(a) - mean(Q_candidates) for candidates, 0 otherwise.
-    Positive advantages push probabilities up, negative push down.
+    where:
+    - π(a) is the current policy probability (detached)
+    - A(a) = Q(a) - mean(Q_candidates) for candidates, 0 otherwise
+
+    Weighting by π(a) matches the expectation form of policy gradient.
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -265,9 +270,11 @@ def compute_adv_loss(
             log_probs = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
             cand_log_probs = log_probs[cand_ids_tensor]  # [num_candidates]
 
-            # Loss: -Σ A(a) * log π(a)
-            # Only candidates contribute (non-candidates have A=0)
-            pos_loss = -(advantages * cand_log_probs).sum()
+            # Policy gradient style loss: -Σ π(a) * A(a) * log π(a)
+            # Weight by current policy probability (detached to not backprop through weights)
+            # This makes rare actions contribute less, matching true PG
+            cand_probs = cand_log_probs.exp().detach()
+            pos_loss = -(cand_probs * advantages * cand_log_probs).sum()
 
             total_loss += pos_loss
             total_positions += 1
