@@ -240,6 +240,14 @@ def compute_kl_loss(
     logits = outputs.logits  # [B, S, V]
     vocab_size = logits.shape[-1]
 
+    # Debug: print input info on first call
+    if not hasattr(compute_kl_loss, '_debug_printed'):
+        compute_kl_loss._debug_printed = True
+        print(f"\n[DEBUG] First batch input diagnostics:")
+        print(f"  input_ids shape: {input_ids.shape}")
+        print(f"  First 10 tokens: {input_ids[0, :10].tolist()}")
+        print(f"  logits shape: {logits.shape}")
+
     total_kl = 0.0
     total_positions = 0
     total_entropy_student = 0.0
@@ -330,8 +338,13 @@ def compute_kl_loss(
                     taken_student_lp = log_p_student[taken_id].item()
                     taken_stored_lp = float('nan')
 
+                # Get the actual token at position pos+1 (what we're predicting)
+                actual_next_token = input_ids[batch_idx, pos + 1].item() if pos + 1 < input_ids.shape[1] else -1
+
                 print(f"[DEBUG] Position {total_positions} (pos={pos}, batch={batch_idx}):")
-                print(f"  Num candidates: {len(cand_ids_list_local)}, taken_id={taken_id}, in_cands={taken_in_cands}")
+                print(f"  Token at pos: {input_ids[batch_idx, pos].item()}, predicting next: {actual_next_token}")
+                print(f"  taken_id from data: {taken_id}, match: {taken_id == actual_next_token}")
+                print(f"  Num candidates: {len(cand_ids_list_local)}, in_cands={taken_in_cands}")
                 print(f"  Stored ref log probs: min={cand_ref_lps_tensor.min().item():.3f}, max={cand_ref_lps_tensor.max().item():.3f}")
                 print(f"  Student log probs:    min={student_lps_on_cands.min().item():.3f}, max={student_lps_on_cands.max().item():.3f}")
                 print(f"  |student - stored_ref|: mean={diff.mean().item():.4f}, max={diff.max().item():.4f}")
@@ -668,6 +681,11 @@ def main_worker(local_rank, world_size, cfg):
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     model.to(device)
+
+    # Disable Qwen3 thinking mode to ensure consistent behavior with reference
+    if hasattr(model, 'generation_config') and hasattr(model.generation_config, 'enable_thinking'):
+        model.generation_config.enable_thinking = False
+        print("[INFO] Disabled Qwen3 thinking mode")
 
     if cfg.gradient_checkpointing:
         model.gradient_checkpointing_enable()
