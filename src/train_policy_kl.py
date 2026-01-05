@@ -238,8 +238,13 @@ def compute_kl_loss(
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
 
-    # Forward pass
+    # Forward pass in eval mode to get consistent logits (no dropout)
+    # This matches how reference log probs were computed during labeling
+    was_training = model.training
+    model.eval()
     outputs = model(input_ids=input_ids, use_cache=False)
+    if was_training:
+        model.train()
     logits = outputs.logits  # [B, S, V]
     vocab_size = logits.shape[-1]
 
