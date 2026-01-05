@@ -14,7 +14,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--data_path", required=True)
-    parser.add_argument("--sample_idx", type=int, default=0)
+    parser.add_argument("--sample_idx", type=int, default=-1, help="Specific sample to check (-1 for auto)")
     parser.add_argument("--num_samples", type=int, default=1, help="Check multiple samples")
     parser.add_argument("--min_prompt_len", type=int, default=0, help="Only check samples with prompt >= this")
     args = parser.parse_args()
@@ -41,25 +41,30 @@ def main():
     df = table.to_pandas()
 
     # Find samples to check
-    samples_to_check = []
-    for idx in range(len(df)):
-        row = df.iloc[idx]
-        prompt_ids = row["prompt_token_ids"]
-        if hasattr(prompt_ids, 'tolist'):
-            prompt_ids = prompt_ids.tolist()
-        if len(prompt_ids) >= args.min_prompt_len:
-            samples_to_check.append(idx)
-        if len(samples_to_check) >= args.num_samples:
-            break
-
-    print(f"Checking {len(samples_to_check)} samples with prompt_len >= {args.min_prompt_len}")
+    if args.sample_idx >= 0:
+        # Check specific sample
+        samples_to_check = [args.sample_idx]
+        print(f"Checking specific sample {args.sample_idx}")
+    else:
+        # Find multiple samples based on criteria
+        samples_to_check = []
+        for idx in range(len(df)):
+            row = df.iloc[idx]
+            prompt_ids = row["prompt_token_ids"]
+            if hasattr(prompt_ids, 'tolist'):
+                prompt_ids = prompt_ids.tolist()
+            if len(prompt_ids) >= args.min_prompt_len:
+                samples_to_check.append(idx)
+            if len(samples_to_check) >= args.num_samples:
+                break
+        print(f"Checking {len(samples_to_check)} samples with prompt_len >= {args.min_prompt_len}")
 
     all_diffs = []
 
     for sample_idx in samples_to_check:
         row = df.iloc[sample_idx]
         print(f"\n{'='*80}")
-        print(f"Sample {sample_idx}:")
+        print(f"Row {sample_idx} (DataFrame index):")
 
         prompt_ids = row["prompt_token_ids"]
         if hasattr(prompt_ids, 'tolist'):
