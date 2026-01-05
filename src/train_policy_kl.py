@@ -78,17 +78,17 @@ class PolicyKLDataset(Dataset):
             self.samples = []
 
             for prompt_idx, group in grouped:
-                rows = group.to_dict('records')
-                if not rows:
+                rows_with_idx = [(idx, row) for idx, row in group.iterrows()]
+                if not rows_with_idx:
                     continue
 
                 for _ in range(int(examples_per_prompt)):
-                    row_list = list(rows)
+                    row_list = list(rows_with_idx)
                     random.shuffle(row_list)
-                    for r in row_list:
-                        self.samples.append(self._process_row(r))
+                    for idx, r in row_list:
+                        self.samples.append(self._process_row(r.to_dict(), row_idx=idx))
         else:
-            self.samples = [self._process_row(r) for _, r in df.iterrows()]
+            self.samples = [self._process_row(r.to_dict(), row_idx=idx) for idx, r in df.iterrows()]
             if examples_per_prompt > 1:
                 original = self.samples.copy()
                 for _ in range(examples_per_prompt - 1):
@@ -96,7 +96,7 @@ class PolicyKLDataset(Dataset):
 
         print(f"Constructed {len(self.samples)} training samples")
 
-    def _process_row(self, row: Dict) -> Dict:
+    def _process_row(self, row: Dict, row_idx: int = -1) -> Dict:
         """Process a single row into a training sample."""
         prompt_ids = row["prompt_token_ids"]
         if hasattr(prompt_ids, 'tolist'):
@@ -124,6 +124,7 @@ class PolicyKLDataset(Dataset):
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
             "candidate_ref_logprobs": candidate_ref_logprobs,
+            "row_idx": row_idx,
         }
 
     def __len__(self):
@@ -194,6 +195,7 @@ class PolicyKLDataset(Dataset):
             "candidate_q_values": candidate_q_values,
             "candidate_ref_logprobs": candidate_ref_logprobs,
             "taken_token_ids": taken_token_ids,
+            "row_idx": sample.get("row_idx", -1),
         }
 
     @staticmethod
@@ -211,6 +213,7 @@ class PolicyKLDataset(Dataset):
             "candidate_q_values": [s["candidate_q_values"] for s in batch],
             "candidate_ref_logprobs": [s["candidate_ref_logprobs"] for s in batch],
             "taken_token_ids": [s["taken_token_ids"] for s in batch],
+            "row_idx": [s["row_idx"] for s in batch],
         }
 
 
@@ -259,9 +262,10 @@ def compute_kl_loss(
     total_sft_loss = 0.0  # SFT loss: -log π_student(a_taken | s)
     total_ref_sft_loss = 0.0  # Reference SFT loss: -log π_ref(a_taken | s)
 
-    for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
+    row_indices = batch.get("row_idx", [-1] * len(batch["label_positions"]))
+    for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids, row_idx) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
-            batch["candidate_ref_logprobs"], batch["taken_token_ids"])
+            batch["candidate_ref_logprobs"], batch["taken_token_ids"], row_indices)
     ):
         if positions is None or len(positions) == 0:
             continue
@@ -341,9 +345,10 @@ def compute_kl_loss(
                 # Get the actual token at position pos+1 (what we're predicting)
                 actual_next_token = input_ids[batch_idx, pos + 1].item() if pos + 1 < input_ids.shape[1] else -1
 
-                print(f"[DEBUG] Position {total_positions} (pos={pos}, batch={batch_idx}):")
+                print(f"[DEBUG] Position {total_positions} (pos={pos}, batch={batch_idx}, row_idx={row_idx}):")
                 print(f"  Token at pos: {input_ids[batch_idx, pos].item()}, predicting next: {actual_next_token}")
                 print(f"  taken_id from data: {taken_id}, match: {taken_id == actual_next_token}")
+                print(f"  prompt_len: {pos - pos_idx + 1}")
                 print(f"  Num candidates: {len(cand_ids_list_local)}, in_cands={taken_in_cands}")
                 print(f"  Stored ref log probs: min={cand_ref_lps_tensor.min().item():.3f}, max={cand_ref_lps_tensor.max().item():.3f}")
                 print(f"  Student log probs:    min={student_lps_on_cands.min().item():.3f}, max={student_lps_on_cands.max().item():.3f}")
