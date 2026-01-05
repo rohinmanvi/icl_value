@@ -19,7 +19,11 @@ Example usage:
                               --data_path data/labeled.parquet
 """
 from __future__ import annotations
-import argparse, math, os, time, wandb, random
+import argparse, math, os, time, random
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from typing import List, Dict, Any, Tuple
 import pyarrow.parquet as pq
 import torch
@@ -311,6 +315,30 @@ def compute_kl_loss(
             total_kl += kl
             total_positions += 1
 
+            # Debug: on first few positions, check if student log probs match stored ref log probs
+            if total_positions <= 3:
+                student_lps_on_cands = log_p_student[cand_ids_tensor]
+                diff = (student_lps_on_cands - cand_ref_lps_tensor).abs()
+
+                # Check if taken token is in candidates and what its rank is
+                taken_in_cands = taken_id in cand_ids_list_local
+                if taken_in_cands:
+                    taken_idx = cand_ids_list_local.index(taken_id)
+                    taken_student_lp = log_p_student[taken_id].item()
+                    taken_stored_lp = cand_ref_lps_tensor[taken_idx].item()
+                else:
+                    taken_student_lp = log_p_student[taken_id].item()
+                    taken_stored_lp = float('nan')
+
+                print(f"[DEBUG] Position {total_positions} (pos={pos}, batch={batch_idx}):")
+                print(f"  Num candidates: {len(cand_ids_list_local)}, taken_id={taken_id}, in_cands={taken_in_cands}")
+                print(f"  Stored ref log probs: min={cand_ref_lps_tensor.min().item():.3f}, max={cand_ref_lps_tensor.max().item():.3f}")
+                print(f"  Student log probs:    min={student_lps_on_cands.min().item():.3f}, max={student_lps_on_cands.max().item():.3f}")
+                print(f"  |student - stored_ref|: mean={diff.mean().item():.4f}, max={diff.max().item():.4f}")
+                print(f"  Taken token: student_lp={taken_student_lp:.3f}, stored_lp={taken_stored_lp:.3f}")
+                print(f"  Q-values: min={cand_qs_tensor.min().item():.4f}, max={cand_qs_tensor.max().item():.4f}")
+                print(f"  KL at this position: {kl.item():.4f}")
+
             # Entropy for monitoring
             total_entropy_student += -(p_student * log_p_student).sum()
             total_entropy_extracted += -(log_p_extracted.exp() * log_p_extracted).sum()
@@ -445,7 +473,7 @@ def train(
         collate_fn=collate_fn,
     )
 
-    if master and wandb_project:
+    if master and wandb_project and wandb:
         wandb.init(
             project=wandb_project,
             name=f"policy_kl_{int(time.time())}",
@@ -573,7 +601,7 @@ def train(
                     f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} ref_mass={avg_ref_mass:.3f} lr={lr:.2e}"
                 )
 
-                if wandb_project:
+                if wandb_project and wandb:
                     wandb.log({
                         "train/kl_loss": avg_loss,
                         "train/sft_loss": avg_sft,
