@@ -223,6 +223,9 @@ def compute_adv_loss(
     total_min_q = 0.0
     total_max_q = 0.0
     total_mean_q = 0.0
+    total_rl_advantage_student = 0.0  # Proper RL advantage: E_π[Q(a) - V(s)]
+    total_v_state = 0.0
+    vocab_size = logits.shape[-1]
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
@@ -233,11 +236,15 @@ def compute_adv_loss(
         if cand_ids_list is None or len(cand_ids_list) == 0:
             continue
 
+        # Track Q-value of taken action at each position for computing V(s_{t+1})
+        prev_q_taken = None
+
         for pos_idx, (pos, cand_ids, cand_qs, taken_id) in enumerate(
             zip(positions, cand_ids_list, cand_q_list, taken_ids)
         ):
             if cand_ids is None or len(cand_ids) < 2:
                 # Need at least 2 candidates for meaningful advantage
+                prev_q_taken = None  # Reset since we skipped
                 continue
 
             # Convert to lists if numpy arrays
@@ -278,6 +285,31 @@ def compute_adv_loss(
             entropy = -(cand_probs_norm * cand_probs_norm.log()).sum()
             total_entropy += entropy.detach()
 
+            # --- Proper RL Advantage Computation ---
+            # V(s_t) = Q(s_{t-1}, a_{t-1}) = prev_q_taken
+            # For first position (pos_idx == 0), we don't have prev_q_taken
+            if prev_q_taken is not None:
+                v_state = prev_q_taken  # V(s_t) = Q-value of previous taken action
+
+                # A(a) = Q(a) - V(s_t) for candidates, 0 for non-candidates
+                rl_advantages = torch.zeros(vocab_size, dtype=torch.float32, device=device)
+                rl_advantages[cand_ids_tensor] = cand_qs_tensor - v_state
+
+                # Expected advantage under student policy
+                p_student = log_probs.exp()
+                expected_rl_advantage = (p_student * rl_advantages).sum()
+
+                total_rl_advantage_student += expected_rl_advantage.detach()
+                total_v_state += v_state.detach() if isinstance(v_state, torch.Tensor) else v_state
+
+            # Find Q-value of taken action for next position's V(s_{t+1})
+            try:
+                taken_idx = cand_ids_list_local.index(taken_id)
+                prev_q_taken = cand_qs_tensor[taken_idx].detach()
+            except ValueError:
+                # Taken action not in candidates (shouldn't happen)
+                prev_q_taken = None
+
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {
@@ -287,6 +319,8 @@ def compute_adv_loss(
             "min_q": 0.0,
             "max_q": 0.0,
             "mean_q": 0.0,
+            "rl_advantage_student": 0.0,
+            "v_state": 0.0,
         }
 
     avg_loss = total_loss / total_positions
@@ -298,6 +332,8 @@ def compute_adv_loss(
         "min_q": (total_min_q / total_positions).item(),
         "max_q": (total_max_q / total_positions).item(),
         "mean_q": (total_mean_q / total_positions).item(),
+        "rl_advantage_student": total_rl_advantage_student / max(1, total_positions) if isinstance(total_rl_advantage_student, torch.Tensor) else total_rl_advantage_student / max(1, total_positions),
+        "v_state": total_v_state / max(1, total_positions) if isinstance(total_v_state, torch.Tensor) else total_v_state / max(1, total_positions),
     }
 
     return avg_loss, metrics
@@ -410,6 +446,8 @@ def train(
     accum_min_q = 0.0
     accum_max_q = 0.0
     accum_mean_q = 0.0
+    accum_rl_advantage_student = 0.0
+    accum_v_state = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -442,6 +480,8 @@ def train(
             accum_min_q += metrics["min_q"]
             accum_max_q += metrics["max_q"]
             accum_mean_q += metrics["mean_q"]
+            accum_rl_advantage_student += metrics["rl_advantage_student"].item() if isinstance(metrics["rl_advantage_student"], torch.Tensor) else metrics["rl_advantage_student"]
+            accum_v_state += metrics["v_state"].item() if isinstance(metrics["v_state"], torch.Tensor) else metrics["v_state"]
             accum_count += 1
 
             if not update:
@@ -468,17 +508,21 @@ def train(
                 avg_min_q = accum_min_q / max(1, accum_count)
                 avg_max_q = accum_max_q / max(1, accum_count)
                 avg_mean_q = accum_mean_q / max(1, accum_count)
+                avg_rl_adv = accum_rl_advantage_student / max(1, accum_count)
+                avg_v = accum_v_state / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
-                    f"adv={avg_adv:.4f} H={avg_ent:.3f} "
-                    f"Q=[{avg_min_q:.3f}, {avg_mean_q:.3f}, {avg_max_q:.3f}] lr={lr:.2e}"
+                    f"adv={avg_adv:.4f} rl_adv={avg_rl_adv:.4f} V={avg_v:.3f} "
+                    f"H={avg_ent:.3f} Q=[{avg_min_q:.3f}, {avg_mean_q:.3f}, {avg_max_q:.3f}] lr={lr:.2e}"
                 )
 
                 if wandb_project:
                     wandb.log({
                         "train/loss": avg_loss,
                         "train/mean_advantage": avg_adv,
+                        "train/rl_advantage_student": avg_rl_adv,
+                        "train/v_state": avg_v,
                         "train/entropy": avg_ent,
                         "train/min_q": avg_min_q,
                         "train/max_q": avg_max_q,
@@ -493,6 +537,8 @@ def train(
                 accum_min_q = 0.0
                 accum_max_q = 0.0
                 accum_mean_q = 0.0
+                accum_rl_advantage_student = 0.0
+                accum_v_state = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
