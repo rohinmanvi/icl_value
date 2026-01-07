@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --partition=defq
-#SBATCH --job-name=icl_label_ground_truth
+#SBATCH --job-name=data_label_ground_truth
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
@@ -41,34 +41,10 @@ conda activate zip
 # -----------------------------
 
 
-# data_path="data/icl_value_training_hallucination_data_qwen06b_thinking.parquet"
-# task="hallucination"
-
-# data_path="data/icl_value_training_hallucination_data_qwen4b_2507_thinking.parquet"
-# task="hallucination"
-
-# data_path="data/icl_value_training_hallucination_data_qwen17b_non_thinking.parquet"
-# task="hallucination"
-
-# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking.parquet"
+# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
 # task="correctness"
 
-# data_path="data/icl_value_training_adaptivemath_data_qwen4b_2507_thinking.parquet"
-# task="correctness"
-
-# data_path="data/icl_value_training_adaptivemath_data_qwen17b_thinking_4_min_p_01.parquet"
-# task="correctness"
-
-# data_path="data/icl_value_training_adaptivemath_data_qwen17b_thinking_4_min_p_001.parquet"
-# task="correctness"
-
-# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_8_min_p_01.parquet"
-# task="correctness"
-
-# data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_8_min_p_001.parquet"
-# task="correctness"
-
-data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
+data_path="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_01.parquet"
 task="correctness"
 
 

@@ -29,7 +29,8 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 DEFAULTS = {
     "thinking_token": "</think>",
     "data_path": "results/results.parquet", 
-    "eval_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    # "eval_model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "eval_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
     "correct_phrase": "Yes",
     "thinking_token_id": 151667,
 }
