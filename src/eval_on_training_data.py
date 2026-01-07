@@ -32,9 +32,24 @@ def extract_unique_prompts(
     data_path: str,
     tokenizer,
     max_prompts: int = None,
-) -> Tuple[List[str], List[int]]:
+    answer_source: str = None,
+) -> Tuple[List[str], List[int], List[str]]:
     """Extract unique prompts from training data by decoding prompt_token_ids."""
     df = pq.read_table(data_path).to_pandas()
+
+    # Load answers from external source if provided
+    answer_map = {}
+    if answer_source:
+        from datasets import load_dataset
+        print(f"Loading answers from {answer_source}")
+        ans_ds = load_dataset(answer_source, split="train")
+        # Try common column names for problem/answer
+        prob_col = next((c for c in ["problem", "question", "prompt"] if c in ans_ds.column_names), None)
+        ans_col = next((c for c in ["answer", "solution", "response"] if c in ans_ds.column_names), None)
+        if prob_col and ans_col:
+            for row in ans_ds:
+                answer_map[row[prob_col].strip()] = str(row[ans_col])
+            print(f"Loaded {len(answer_map)} answers from {answer_source}")
 
     # Group by prompt_idx if available, otherwise use prompt_token_ids
     if "prompt_idx" in df.columns:
@@ -49,6 +64,7 @@ def extract_unique_prompts(
 
     prompts = []
     prompt_indices = []
+    answers = []
 
     for idx, row in unique_df.iterrows():
         prompt_ids = row["prompt_token_ids"]
@@ -60,11 +76,27 @@ def extract_unique_prompts(
         prompts.append(prompt_text)
         prompt_indices.append(row.get("prompt_idx", idx))
 
+        # Get answer: first try row, then external source
+        answer = row.get("answer", "")
+        if pd.isna(answer) or answer == "":
+            # Try to match from answer_map using raw problem text
+            # Extract user content from chat format if present
+            raw_problem = prompt_text
+            if "<|im_start|>user" in raw_problem:
+                start = raw_problem.find("<|im_start|>user") + len("<|im_start|>user")
+                end = raw_problem.find("<|im_end|>", start)
+                if end > start:
+                    raw_problem = raw_problem[start:end].strip()
+            answer = answer_map.get(raw_problem, "")
+        answers.append(str(answer) if answer else "")
+
         if max_prompts and len(prompts) >= max_prompts:
             break
 
     print(f"Extracted {len(prompts)} unique prompts from {len(df)} training samples")
-    return prompts, prompt_indices
+    if answers and any(answers):
+        print(f"Found answers for {sum(1 for a in answers if a)} prompts")
+    return prompts, prompt_indices, answers
 
 
 def worker(
@@ -75,6 +107,7 @@ def worker(
     out_path: str,
     prompts: List[str],
     prompt_indices: List[int],
+    answers: List[str],
     tp_size: int,
     max_model_len: int,
     max_num_seqs: int,
@@ -88,6 +121,7 @@ def worker(
     # Shard prompts
     my_prompts = prompts[rank::dp_size]
     my_indices = prompt_indices[rank::dp_size]
+    my_answers = answers[rank::dp_size]
 
     if not my_prompts:
         print(f"[Rank {rank}] No prompts assigned, exiting.")
@@ -105,6 +139,7 @@ def worker(
         enable_prefix_caching=True,
     )
     tokenizer = llm.get_tokenizer()
+    eos_id = tokenizer.eos_token_id
 
     # Sampling params
     sampling_params = SamplingParams(
@@ -120,13 +155,19 @@ def worker(
 
     # Collect results
     records = []
-    for prompt, prompt_idx, output in zip(my_prompts, my_indices, outputs):
+    for prompt, prompt_idx, answer, output in zip(my_prompts, my_indices, my_answers, outputs):
         for sample_idx, completion in enumerate(output.outputs):
+            # Check if generation finished with EOS
+            token_ids = completion.token_ids
+            finished = bool(eos_id is not None and token_ids and token_ids[-1] == eos_id)
+
             records.append({
                 "prompt": prompt,
                 "prompt_idx": prompt_idx,
+                "answer": answer,
                 "response": completion.text,
                 "sample_idx": sample_idx,
+                "finished": finished,
             })
 
     # Save shard
@@ -156,6 +197,8 @@ def main():
     parser.add_argument("--model", required=True, help="Model path or HF ID")
     parser.add_argument("--training-data", required=True, help="Training parquet file")
     parser.add_argument("--out", required=True, help="Output parquet file")
+    parser.add_argument("--answer-source", default=None,
+                        help="HuggingFace dataset to load answers from (e.g., rohinm/adaptivemath)")
     parser.add_argument("--max-prompts", type=int, default=None)
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
@@ -169,8 +212,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
     # Extract unique prompts
-    prompts, prompt_indices = extract_unique_prompts(
-        args.training_data, tokenizer, args.max_prompts
+    prompts, prompt_indices, answers = extract_unique_prompts(
+        args.training_data, tokenizer, args.max_prompts, args.answer_source
     )
 
     # Determine GPU allocation
@@ -191,7 +234,7 @@ def main():
             target=worker,
             args=(
                 rank, args.dp_size, assigned_gpus, args.model, args.out,
-                prompts, prompt_indices, args.tp_size, args.max_model_len,
+                prompts, prompt_indices, answers, args.tp_size, args.max_model_len,
                 args.max_num_seqs, args.num_samples, args.min_p,
             ),
         )
