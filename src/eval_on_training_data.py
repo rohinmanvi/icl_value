@@ -168,6 +168,7 @@ def worker(
                 "response": completion.text,
                 "sample_idx": sample_idx,
                 "finished": finished,
+                "length": len(token_ids) if token_ids else 0,
             })
 
     # Save shard
