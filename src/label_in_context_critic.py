@@ -72,6 +72,10 @@ class Config:
     max_groups: int = -1  # For debugging: limit number of prompt groups
     max_rollouts_per_prompt: int = -1  # Limit rollouts per prompt (-1 = all)
 
+    min_correct_rate: float = 0.25  # Min fraction of correct samples per prompt
+    min_incorrect_rate: float = 0.25  # Min fraction of incorrect samples per prompt
+    only_label_correct: bool = True  # Only label correct samples
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -443,9 +447,22 @@ def _compute_candidate_q_values(
 # Data Loading
 # ---------------------------------------------------------------------------
 
-def _load_data(data_path: str, reward_col: str) -> Tuple[pa.Table, Dict[int, Dict[str, Any]]]:
+def _load_data(
+    data_path: str,
+    reward_col: str,
+    min_correct_rate: float = 0.0,
+    min_incorrect_rate: float = 0.0,
+    only_label_correct: bool = False,
+) -> Tuple[pa.Table, Dict[int, Dict[str, Any]]]:
     """
     Load the full parquet table and build prompt groups for processing.
+
+    Args:
+        data_path: Path to the parquet file
+        reward_col: Column name for reward values
+        min_correct_rate: Minimum fraction of correct samples per prompt (0.0-1.0)
+        min_incorrect_rate: Minimum fraction of incorrect samples per prompt (0.0-1.0)
+        only_label_correct: If True, only include correct samples for labeling
 
     Returns:
         table: The full PyArrow table with all columns
@@ -459,14 +476,32 @@ def _load_data(data_path: str, reward_col: str) -> Tuple[pa.Table, Dict[int, Dic
         df["correct"] = df["correct"].astype(float)
 
     prompt_groups: Dict[int, Dict[str, Any]] = {}
+    filtered_prompts = 0
+    filtered_incorrect_samples = 0
+
     grouped = df.groupby("prompt_idx", sort=True)
     for pid, group in grouped:
         rows = group.to_dict("records")
         if not rows:
             continue
+
+        # Calculate correct/incorrect rates for this prompt
+        rewards = [float(r[reward_col]) for r in rows]
+        num_correct = sum(1 for rw in rewards if rw > 0.5)
+        num_incorrect = len(rewards) - num_correct
+        correct_rate = num_correct / len(rewards)
+        incorrect_rate = num_incorrect / len(rewards)
+
+        # Filter prompts based on correct/incorrect rate thresholds
+        if correct_rate < min_correct_rate or incorrect_rate < min_incorrect_rate:
+            filtered_prompts += 1
+            continue
+
         prompt_text = rows[0]["prompt"]
         rollouts: List[Rollout] = []
         row_indices: List[int] = []  # Track original row indices
+        all_rollouts: List[Rollout] = []  # Keep all rollouts for context
+
         for idx, r in zip(group.index.tolist(), rows):
             toks = r["output_token_ids"]
             if hasattr(toks, "tolist"):
@@ -474,13 +509,33 @@ def _load_data(data_path: str, reward_col: str) -> Tuple[pa.Table, Dict[int, Dic
             prompt_toks = r["prompt_token_ids"]
             if hasattr(prompt_toks, "tolist"):
                 prompt_toks = prompt_toks.tolist()
-            rollouts.append(Rollout(
+            rollout = Rollout(
                 response_ids=list(toks),
                 reward=float(r[reward_col]),
                 prompt_token_ids=list(prompt_toks),
-            ))
+            )
+            all_rollouts.append(rollout)
+
+            # Only include correct samples for labeling if flag is set
+            if only_label_correct and rollout.reward <= 0.5:
+                filtered_incorrect_samples += 1
+                continue
+
+            rollouts.append(rollout)
             row_indices.append(idx)
-        prompt_groups[int(pid)] = {"prompt": prompt_text, "rollouts": rollouts, "row_indices": row_indices}
+
+        if rollouts:  # Only include if there are samples to label
+            prompt_groups[int(pid)] = {
+                "prompt": prompt_text,
+                "rollouts": rollouts,
+                "row_indices": row_indices,
+                "all_rollouts": all_rollouts,  # Keep all rollouts for context
+            }
+
+    if filtered_prompts > 0 or filtered_incorrect_samples > 0:
+        print(f"[Data] Filtered {filtered_prompts} prompts (correct rate not in [{min_correct_rate:.0%}, {1-min_incorrect_rate:.0%}])")
+        print(f"[Data] Filtered {filtered_incorrect_samples} incorrect samples (only_label_correct={only_label_correct})")
+        print(f"[Data] Kept {len(prompt_groups)} prompts for labeling")
 
     return table, prompt_groups
 
@@ -526,7 +581,13 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
     _print_progress(f"[Rank {rank}] Loading data...")
 
     # Load data (full table + prompt groups)
-    _full_table, prompt_groups = _load_data(cfg.in_parquet, cfg.reward_col)
+    _full_table, prompt_groups = _load_data(
+        cfg.in_parquet,
+        cfg.reward_col,
+        min_correct_rate=cfg.min_correct_rate,
+        min_incorrect_rate=cfg.min_incorrect_rate,
+        only_label_correct=cfg.only_label_correct,
+    )
     prompt_ids_sorted = sorted(prompt_groups.keys())
 
     # Distribute prompts across workers
@@ -558,21 +619,22 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
             continue
 
         prompt_text = str(grp["prompt"])
-        all_rollouts: List[Rollout] = list(grp["rollouts"])
+        rollouts_to_label: List[Rollout] = list(grp["rollouts"])  # Only correct samples if only_label_correct
         row_indices: List[int] = list(grp["row_indices"])
+        context_rollouts: List[Rollout] = list(grp["all_rollouts"])  # All rollouts for context
 
         # Limit rollouts per prompt if specified
         if cfg.max_rollouts_per_prompt > 0:
-            all_rollouts = all_rollouts[:cfg.max_rollouts_per_prompt]
+            rollouts_to_label = rollouts_to_label[:cfg.max_rollouts_per_prompt]
             row_indices = row_indices[:cfg.max_rollouts_per_prompt]
 
-        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (idx={pid}), {len(all_rollouts)} rollouts")
+        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (idx={pid}), {len(rollouts_to_label)} rollouts to label, {len(context_rollouts)} context")
 
-        for rollout_i, (rollout, row_idx) in enumerate(zip(all_rollouts, row_indices)):
+        for rollout_i, (rollout, row_idx) in enumerate(zip(rollouts_to_label, row_indices)):
             seed_i = (cfg.seed * 1000003 + pid * 1009 + rollout_i * 7) & 0xFFFFFFFF
             rng = random.Random(seed_i)
 
-            print(f"\r[Rank {rank}] Rollout {rollout_i+1}/{len(all_rollouts)}: {len(rollout.response_ids)} tokens...", end="", flush=True)
+            print(f"\r[Rank {rank}] Rollout {rollout_i+1}/{len(rollouts_to_label)}: {len(rollout.response_ids)} tokens...", end="", flush=True)
             start_time = time.time()
 
             candidate_ids, candidate_q_values, candidate_ref_logprobs = _compute_candidate_q_values(
@@ -580,7 +642,7 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
                 critic_model=critic_model,
                 tokenizer=tokenizer,
                 rollout=rollout,
-                context_rollouts=all_rollouts,
+                context_rollouts=context_rollouts,
                 prompt_text=prompt_text,
                 cfg=cfg,
                 device=device,
@@ -643,6 +705,10 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--max_groups", type=int, default=-1, help="Max prompt groups to process (-1 = all)")
     p.add_argument("--max_rollouts_per_prompt", type=int, default=-1, help="Max rollouts per prompt (-1 = all)")
+
+    p.add_argument("--min_correct_rate", type=float, default=0.25, help="Min fraction of correct samples per prompt (0.0-1.0)")
+    p.add_argument("--min_incorrect_rate", type=float, default=0.25, help="Min fraction of incorrect samples per prompt (0.0-1.0)")
+    p.add_argument("--only_label_correct", action="store_true", help="Only label correct samples")
 
     return p.parse_args()
 
@@ -734,6 +800,9 @@ def main() -> None:
         attn_implementation=args.attn_implementation,
         max_groups=args.max_groups,
         max_rollouts_per_prompt=args.max_rollouts_per_prompt,
+        min_correct_rate=args.min_correct_rate,
+        min_incorrect_rate=args.min_incorrect_rate,
+        only_label_correct=args.only_label_correct,
     )
 
     _print_progress(
@@ -744,6 +813,9 @@ def main() -> None:
         f"  out_parquet: {cfg.out_parquet}\n"
         f"  dp_size: {dp}\n"
         f"  min_p: {cfg.min_p}\n"
+        f"  min_correct_rate: {cfg.min_correct_rate}\n"
+        f"  min_incorrect_rate: {cfg.min_incorrect_rate}\n"
+        f"  only_label_correct: {cfg.only_label_correct}\n"
     )
 
     if dp == 1:

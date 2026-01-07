@@ -43,6 +43,9 @@ min_p=0.01
 seed=42
 max_groups=128            # -1 for all prompts
 max_rollouts_per_prompt=1 # -1 for all rollouts
+min_correct_rate=0.25     # Minimum fraction of correct samples per prompt
+min_incorrect_rate=0.25   # Minimum fraction of incorrect samples per prompt
+only_label_correct=true   # Only label correct samples
 
 echo "Starting in-context critic Q-value labeling:"
 echo "  Critic model: $critic_path"
@@ -55,7 +58,16 @@ echo "  Min-p:        $min_p"
 echo "  Seed:         $seed"
 echo "  Max groups:   $max_groups"
 echo "  Rollouts/prompt: $max_rollouts_per_prompt"
+echo "  Min correct rate: $min_correct_rate"
+echo "  Min incorrect rate: $min_incorrect_rate"
+echo "  Only label correct: $only_label_correct"
 echo "  Start time:   $(date)"
+
+# Build optional flags
+extra_flags=""
+if [ "$only_label_correct" = true ]; then
+    extra_flags="$extra_flags --only_label_correct"
+fi
 
 python3 -u src/label_in_context_critic.py \
     --critic_path "$critic_path" \
@@ -67,7 +79,10 @@ python3 -u src/label_in_context_critic.py \
     --min_p $min_p \
     --seed $seed \
     --max_groups $max_groups \
-    --max_rollouts_per_prompt $max_rollouts_per_prompt 2>&1 | tee -a /home/rohin/icl_value/logs/critic_label_$(basename ${out_file} .parquet).log
+    --max_rollouts_per_prompt $max_rollouts_per_prompt \
+    --min_correct_rate $min_correct_rate \
+    --min_incorrect_rate $min_incorrect_rate \
+    $extra_flags 2>&1 | tee -a /home/rohin/icl_value/logs/critic_label_$(basename ${out_file} .parquet).log
 
 exit_code=${PIPESTATUS[0]}
 echo "Labeling completed with exit code: $exit_code at $(date)"
