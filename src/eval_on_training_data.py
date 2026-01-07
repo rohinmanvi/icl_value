@@ -158,7 +158,7 @@ def worker(
     for prompt, prompt_idx, answer, output in zip(my_prompts, my_indices, my_answers, outputs):
         for sample_idx, completion in enumerate(output.outputs):
             # Check if generation finished with EOS
-            token_ids = completion.token_ids
+            token_ids = list(completion.token_ids) if completion.token_ids else []
             finished = bool(eos_id is not None and token_ids and token_ids[-1] == eos_id)
 
             records.append({
@@ -168,7 +168,8 @@ def worker(
                 "response": completion.text,
                 "sample_idx": sample_idx,
                 "finished": finished,
-                "length": len(token_ids) if token_ids else 0,
+                "length": len(token_ids),
+                "output_token_ids": token_ids,
             })
 
     # Save shard
