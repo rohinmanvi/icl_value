@@ -45,7 +45,9 @@ max_groups=128            # -1 for all prompts
 max_rollouts_per_prompt=1 # -1 for all rollouts
 min_correct_rate=0.25     # Minimum fraction of correct samples per prompt
 min_incorrect_rate=0.25   # Minimum fraction of incorrect samples per prompt
+# Label mode: set ONE of these to true, or both to false for all samples
 only_label_correct=true   # Only label correct samples
+only_label_incorrect=false # Only label incorrect samples
 
 echo "Starting in-context critic Q-value labeling:"
 echo "  Critic model: $critic_path"
@@ -61,12 +63,16 @@ echo "  Rollouts/prompt: $max_rollouts_per_prompt"
 echo "  Min correct rate: $min_correct_rate"
 echo "  Min incorrect rate: $min_incorrect_rate"
 echo "  Only label correct: $only_label_correct"
+echo "  Only label incorrect: $only_label_incorrect"
 echo "  Start time:   $(date)"
 
 # Build optional flags
 extra_flags=""
 if [ "$only_label_correct" = true ]; then
     extra_flags="$extra_flags --only_label_correct"
+fi
+if [ "$only_label_incorrect" = true ]; then
+    extra_flags="$extra_flags --only_label_incorrect"
 fi
 
 python3 -u src/label_in_context_critic.py \

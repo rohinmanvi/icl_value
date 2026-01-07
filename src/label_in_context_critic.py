@@ -74,7 +74,8 @@ class Config:
 
     min_correct_rate: float = 0.25  # Min fraction of correct samples per prompt
     min_incorrect_rate: float = 0.25  # Min fraction of incorrect samples per prompt
-    only_label_correct: bool = True  # Only label correct samples
+    only_label_correct: bool = False  # Only label correct samples
+    only_label_incorrect: bool = False  # Only label incorrect samples
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +454,7 @@ def _load_data(
     min_correct_rate: float = 0.0,
     min_incorrect_rate: float = 0.0,
     only_label_correct: bool = False,
+    only_label_incorrect: bool = False,
 ) -> Tuple[pa.Table, Dict[int, Dict[str, Any]]]:
     """
     Load the full parquet table and build prompt groups for processing.
@@ -463,11 +465,14 @@ def _load_data(
         min_correct_rate: Minimum fraction of correct samples per prompt (0.0-1.0)
         min_incorrect_rate: Minimum fraction of incorrect samples per prompt (0.0-1.0)
         only_label_correct: If True, only include correct samples for labeling
+        only_label_incorrect: If True, only include incorrect samples for labeling
 
     Returns:
         table: The full PyArrow table with all columns
         prompt_groups: Dict mapping prompt_idx to prompt text and rollouts
     """
+    if only_label_correct and only_label_incorrect:
+        raise ValueError("Cannot set both only_label_correct and only_label_incorrect")
     # Load full table to preserve all columns
     table = pq.read_table(data_path)
     df = table.to_pandas()
@@ -516,9 +521,12 @@ def _load_data(
             )
             all_rollouts.append(rollout)
 
-            # Only include correct samples for labeling if flag is set
+            # Filter samples based on correctness flags
             if only_label_correct and rollout.reward <= 0.5:
                 filtered_incorrect_samples += 1
+                continue
+            if only_label_incorrect and rollout.reward > 0.5:
+                filtered_incorrect_samples += 1  # Reusing counter for filtered samples
                 continue
 
             rollouts.append(rollout)
@@ -534,7 +542,8 @@ def _load_data(
 
     if filtered_prompts > 0 or filtered_incorrect_samples > 0:
         print(f"[Data] Filtered {filtered_prompts} prompts (correct rate not in [{min_correct_rate:.0%}, {1-min_incorrect_rate:.0%}])")
-        print(f"[Data] Filtered {filtered_incorrect_samples} incorrect samples (only_label_correct={only_label_correct})")
+        label_mode = "correct only" if only_label_correct else ("incorrect only" if only_label_incorrect else "all")
+        print(f"[Data] Filtered {filtered_incorrect_samples} samples (mode={label_mode})")
         print(f"[Data] Kept {len(prompt_groups)} prompts for labeling")
 
     return table, prompt_groups
@@ -587,6 +596,7 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
         min_correct_rate=cfg.min_correct_rate,
         min_incorrect_rate=cfg.min_incorrect_rate,
         only_label_correct=cfg.only_label_correct,
+        only_label_incorrect=cfg.only_label_incorrect,
     )
     prompt_ids_sorted = sorted(prompt_groups.keys())
 
@@ -714,6 +724,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_correct_rate", type=float, default=0.25, help="Min fraction of correct samples per prompt (0.0-1.0)")
     p.add_argument("--min_incorrect_rate", type=float, default=0.25, help="Min fraction of incorrect samples per prompt (0.0-1.0)")
     p.add_argument("--only_label_correct", action="store_true", help="Only label correct samples")
+    p.add_argument("--only_label_incorrect", action="store_true", help="Only label incorrect samples")
 
     return p.parse_args()
 
@@ -808,8 +819,10 @@ def main() -> None:
         min_correct_rate=args.min_correct_rate,
         min_incorrect_rate=args.min_incorrect_rate,
         only_label_correct=args.only_label_correct,
+        only_label_incorrect=args.only_label_incorrect,
     )
 
+    label_mode = "correct only" if cfg.only_label_correct else ("incorrect only" if cfg.only_label_incorrect else "all")
     _print_progress(
         f"Labeling trajectories with Q-values:\n"
         f"  critic_path: {cfg.critic_path}\n"
@@ -820,7 +833,7 @@ def main() -> None:
         f"  min_p: {cfg.min_p}\n"
         f"  min_correct_rate: {cfg.min_correct_rate}\n"
         f"  min_incorrect_rate: {cfg.min_incorrect_rate}\n"
-        f"  only_label_correct: {cfg.only_label_correct}\n"
+        f"  label_mode: {label_mode}\n"
     )
 
     if dp == 1:
