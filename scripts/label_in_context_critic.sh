@@ -48,6 +48,7 @@ min_incorrect_rate=0.25   # Minimum fraction of incorrect samples per prompt
 # Label mode: set ONE of these to true, or both to false for all samples
 only_label_correct=false   # Only label correct samples
 only_label_incorrect=true # Only label incorrect samples
+trajectory_only=false      # Only label trajectory tokens (single forward pass, much faster)
 
 echo "Starting in-context critic Q-value labeling:"
 echo "  Critic model: $critic_path"
@@ -64,6 +65,7 @@ echo "  Min correct rate: $min_correct_rate"
 echo "  Min incorrect rate: $min_incorrect_rate"
 echo "  Only label correct: $only_label_correct"
 echo "  Only label incorrect: $only_label_incorrect"
+echo "  Trajectory only: $trajectory_only"
 echo "  Start time:   $(date)"
 
 # Build optional flags
@@ -73,6 +75,9 @@ if [ "$only_label_correct" = true ]; then
 fi
 if [ "$only_label_incorrect" = true ]; then
     extra_flags="$extra_flags --only_label_incorrect"
+fi
+if [ "$trajectory_only" = true ]; then
+    extra_flags="$extra_flags --trajectory_only"
 fi
 
 python3 -u src/label_in_context_critic.py \

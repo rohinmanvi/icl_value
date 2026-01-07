@@ -76,6 +76,7 @@ class Config:
     min_incorrect_rate: float = 0.25  # Min fraction of incorrect samples per prompt
     only_label_correct: bool = False  # Only label correct samples
     only_label_incorrect: bool = False  # Only label incorrect samples
+    trajectory_only: bool = False  # Only label trajectory tokens (single forward pass)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +445,107 @@ def _compute_candidate_q_values(
     return all_candidate_ids, all_candidate_q_values, all_candidate_ref_logprobs
 
 
+@torch.no_grad()
+def _compute_trajectory_q_values(
+    critic_model: Any,
+    tokenizer: Any,
+    rollout: Rollout,
+    context_rollouts: List[Rollout],
+    prompt_text: str,
+    cfg: Config,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    rng: random.Random,
+    num_bins: int,
+    num_length_bins: int,
+    correct_reward_index: int,
+) -> Tuple[List[List[int]], List[List[float]], List[List[float]]]:
+    """
+    Compute Q-values for trajectory tokens only using a single forward pass.
+
+    This is much faster than _compute_candidate_q_values since we only evaluate
+    the tokens that were actually in the trajectory, not all min-p candidates.
+
+    Returns:
+        candidate_ids: List of [token_id] for each position (single element lists)
+        candidate_q_values: List of [q_value] for each position
+        candidate_ref_logprobs: List of [0.0] for each position (placeholder, not computed)
+    """
+    response_ids = list(rollout.response_ids)
+
+    if not response_ids:
+        return [], [], []
+
+    # Build context for critic (same as before)
+    critic_prefix, _ = _pack_context_for_critic(
+        tokenizer, prompt_text, context_rollouts, rollout, cfg.max_length, rng
+    )
+
+    # Full sequence: prefix + response tokens
+    full_seq = critic_prefix + response_ids
+    full_input = torch.tensor([full_seq], dtype=torch.long, device=device)
+
+    # Single forward pass through the entire sequence
+    base = _get_base_model(_unwrap_model(critic_model))
+
+    with torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=amp_dtype):
+        if base is None:
+            out = critic_model(
+                input_ids=full_input,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden_states = out.hidden_states[-1]  # [1, S, H]
+        else:
+            out = base(
+                input_ids=full_input,
+                use_cache=False,
+                return_dict=True,
+            )
+            hidden_states = out.last_hidden_state if hasattr(out, "last_hidden_state") else out.hidden_states[-1]
+
+    # Prepare for Q-value extraction
+    m = _unwrap_model(critic_model)
+    lm_head = _get_lm_head(m)
+    w = lm_head.weight[cfg.distribution_token_id : cfg.distribution_token_id + num_bins]
+    b = lm_head.bias[cfg.distribution_token_id : cfg.distribution_token_id + num_bins] if hasattr(lm_head, "bias") and lm_head.bias is not None else None
+    num_reward_states = num_bins // num_length_bins
+
+    # Extract Q-values for each response position
+    # Position i in response corresponds to position (len(critic_prefix) + i - 1) in hidden states
+    # because hidden state at position p predicts token at position p+1
+    all_candidate_ids: List[List[int]] = []
+    all_candidate_q_values: List[List[float]] = []
+    all_candidate_ref_logprobs: List[List[float]] = []
+
+    prefix_len = len(critic_prefix)
+
+    for i, tid in enumerate(response_ids):
+        # Hidden state position that predicts this token
+        # For token at position prefix_len + i, we use hidden state at position prefix_len + i - 1
+        # But we want the Q-value AFTER seeing this token, so we use position prefix_len + i
+        h_pos = prefix_len + i
+        h = hidden_states[0, h_pos, :]
+
+        # Compute Q-value
+        logits_h = F.linear(h, w, b).float()
+        logits_rs = logits_h.view(num_reward_states, num_length_bins)
+        logits_reward = torch.logsumexp(logits_rs, dim=1)
+        probs_reward = torch.softmax(logits_reward, dim=0)
+        q = probs_reward[correct_reward_index].item()
+
+        all_candidate_ids.append([tid])
+        all_candidate_q_values.append([q])
+        all_candidate_ref_logprobs.append([0.0])  # Placeholder - not computing ref logprobs in this mode
+
+    del full_input, out, hidden_states
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return all_candidate_ids, all_candidate_q_values, all_candidate_ref_logprobs
+
+
 # ---------------------------------------------------------------------------
 # Data Loading
 # ---------------------------------------------------------------------------
@@ -579,9 +681,12 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
     critic_model.to(device)
     critic_model.eval()
 
-    ref_model = AutoModelForCausalLM.from_pretrained(cfg.ref_path, **model_kwargs)
-    ref_model.to(device)
-    ref_model.eval()
+    # Reference model only needed for candidate filtering (not in trajectory_only mode)
+    ref_model = None
+    if not cfg.trajectory_only:
+        ref_model = AutoModelForCausalLM.from_pretrained(cfg.ref_path, **model_kwargs)
+        ref_model.to(device)
+        ref_model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.ref_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
@@ -652,21 +757,39 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
             print(f"\r[Rank {rank}] Rollout {rollout_i+1}/{len(rollouts_to_label)}: {len(rollout.response_ids)} tokens...", end="", flush=True)
             start_time = time.time()
 
-            candidate_ids, candidate_q_values, candidate_ref_logprobs = _compute_candidate_q_values(
-                ref_model=ref_model,
-                critic_model=critic_model,
-                tokenizer=tokenizer,
-                rollout=rollout,
-                context_rollouts=context_rollouts,
-                prompt_text=prompt_text,
-                cfg=cfg,
-                device=device,
-                amp_dtype=amp_dtype,
-                rng=rng,
-                num_bins=num_bins,
-                num_length_bins=num_length_bins,
-                correct_reward_index=correct_reward_index,
-            )
+            if cfg.trajectory_only:
+                # Fast single-pass mode: only compute Q-values for trajectory tokens
+                candidate_ids, candidate_q_values, candidate_ref_logprobs = _compute_trajectory_q_values(
+                    critic_model=critic_model,
+                    tokenizer=tokenizer,
+                    rollout=rollout,
+                    context_rollouts=context_rollouts,
+                    prompt_text=prompt_text,
+                    cfg=cfg,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    rng=rng,
+                    num_bins=num_bins,
+                    num_length_bins=num_length_bins,
+                    correct_reward_index=correct_reward_index,
+                )
+            else:
+                # Full mode: compute Q-values for all min-p filtered candidates
+                candidate_ids, candidate_q_values, candidate_ref_logprobs = _compute_candidate_q_values(
+                    ref_model=ref_model,
+                    critic_model=critic_model,
+                    tokenizer=tokenizer,
+                    rollout=rollout,
+                    context_rollouts=context_rollouts,
+                    prompt_text=prompt_text,
+                    cfg=cfg,
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    rng=rng,
+                    num_bins=num_bins,
+                    num_length_bins=num_length_bins,
+                    correct_reward_index=correct_reward_index,
+                )
 
             elapsed = time.time() - start_time
             print(f" done in {elapsed:.1f}s", flush=True)
@@ -725,6 +848,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_incorrect_rate", type=float, default=0.25, help="Min fraction of incorrect samples per prompt (0.0-1.0)")
     p.add_argument("--only_label_correct", action="store_true", help="Only label correct samples")
     p.add_argument("--only_label_incorrect", action="store_true", help="Only label incorrect samples")
+    p.add_argument("--trajectory_only", action="store_true", help="Only label trajectory tokens (single forward pass, much faster)")
 
     return p.parse_args()
 
@@ -820,6 +944,7 @@ def main() -> None:
         min_incorrect_rate=args.min_incorrect_rate,
         only_label_correct=args.only_label_correct,
         only_label_incorrect=args.only_label_incorrect,
+        trajectory_only=args.trajectory_only,
     )
 
     label_mode = "correct only" if cfg.only_label_correct else ("incorrect only" if cfg.only_label_incorrect else "all")
@@ -834,6 +959,7 @@ def main() -> None:
         f"  min_correct_rate: {cfg.min_correct_rate}\n"
         f"  min_incorrect_rate: {cfg.min_incorrect_rate}\n"
         f"  label_mode: {label_mode}\n"
+        f"  trajectory_only: {cfg.trajectory_only}\n"
     )
 
     if dp == 1:
