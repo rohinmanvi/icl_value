@@ -597,7 +597,12 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
         _print_progress(f"[Rank {rank}] No prompts assigned.")
         return
 
-    _print_progress(f"[Rank {rank}] Processing {len(my_prompt_ids)} prompts...")
+    # Apply max_groups limit for display
+    effective_num_prompts = len(my_prompt_ids)
+    if cfg.max_groups > 0:
+        effective_num_prompts = min(effective_num_prompts, cfg.max_groups)
+
+    _print_progress(f"[Rank {rank}] Processing {effective_num_prompts} prompts (of {len(my_prompt_ids)} assigned)...")
 
     # Critic config
     reward_values = [0.0, 1.0]
@@ -628,7 +633,7 @@ def _worker(rank: int, world: int, cfg: Config) -> None:
             rollouts_to_label = rollouts_to_label[:cfg.max_rollouts_per_prompt]
             row_indices = row_indices[:cfg.max_rollouts_per_prompt]
 
-        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{len(my_prompt_ids)} (idx={pid}), {len(rollouts_to_label)} rollouts to label, {len(context_rollouts)} context")
+        _print_progress(f"[Rank {rank}] Prompt {local_i+1}/{effective_num_prompts} (idx={pid}), {len(rollouts_to_label)} rollouts to label, {len(context_rollouts)} context")
 
         for rollout_i, (rollout, row_idx) in enumerate(zip(rollouts_to_label, row_indices)):
             seed_i = (cfg.seed * 1000003 + pid * 1009 + rollout_i * 7) & 0xFFFFFFFF

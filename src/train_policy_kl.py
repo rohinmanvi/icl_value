@@ -2,15 +2,17 @@
 """
 Train a student policy with KL divergence loss against the extracted policy.
 
-The extracted policy is: π_ext(a) ∝ π_ref(a) * exp(Q(a) / τ)
+The extracted policy is: π_ext(a) ∝ π_student(a) * exp(Q(a) / τ)
 
 We minimize KL(π_extracted || π_student) (forward KL for mode-covering).
-Non-candidate tokens use min-p filtered reference probabilities with min(Q).
+Non-candidate tokens are assigned min(Q) among candidates, extending the
+extracted policy to the full vocabulary using the student as a proxy for
+reference probabilities.
 
 Input data must have columns:
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
 - candidate_q_values: List[List[float]] - Q-values for each candidate
-- candidate_ref_logprobs: List[List[float]] - reference model log probs for each candidate
+- candidate_ref_logprobs: List[List[float]] - reference model log probs for each candidate (unused in current implementation)
 - output_token_ids: List[int] - the actual trajectory tokens (for reference)
 
 Example usage:
@@ -220,9 +222,10 @@ def compute_kl_loss(
     Compute KL divergence loss: KL(π_extracted || π_student) - forward KL for mode-covering
 
     π_student = softmax(student_logits) - full vocabulary from student model
-    π_extracted ∝ π_ref * exp(Q / τ) - using stored reference log probs
+    π_extracted ∝ π_student * exp(Q / τ) - using student as proxy for reference
 
-    For non-candidate tokens, we use min(Q) and assume negligible reference probability.
+    For non-candidate tokens, we use min(Q) among candidates.
+    This extends the extracted policy to the full vocabulary.
 
     Also computes proper RL advantage:
     - V(s_t) = Q(s_{t-1}, a_{t-1}) (Q-value of previous taken action)
@@ -243,9 +246,9 @@ def compute_kl_loss(
     total_advantage_student = 0.0
     total_advantage_extracted = 0.0
     total_v_state = 0.0
-    total_ref_mass = 0.0  # Probability mass on candidates from reference policy
+    total_extracted_mass_on_cands = 0.0  # Probability mass on candidates from extracted policy
     total_sft_loss = 0.0  # SFT loss: -log π_student(a_taken | s)
-    total_ref_sft_loss = 0.0  # Reference SFT loss: -log π_ref(a_taken | s)
+    total_extracted_sft_loss = 0.0  # Extracted policy SFT loss: -log π_ext(a_taken | s)
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
@@ -271,7 +274,6 @@ def compute_kl_loss(
             # Convert to lists if numpy arrays
             cand_ids_list_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
             cand_qs_list_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
-            cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
 
             # Get logits for this position
             pos_logits = logits[batch_idx, pos, :]  # [V]
@@ -279,54 +281,46 @@ def compute_kl_loss(
             # Candidate tensors
             cand_ids_tensor = torch.tensor(cand_ids_list_local, dtype=torch.long, device=device)
             cand_qs_tensor = torch.tensor(cand_qs_list_local, dtype=torch.float32, device=device)
-            cand_ref_lps_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
 
             # π_student = softmax(student_logits) - full vocabulary
             log_p_student = F.log_softmax(pos_logits.float(), dim=-1)  # [V]
             p_student = log_p_student.exp()
 
-            # π_extracted ∝ π_ref * exp(Q / τ)
-            # In log space: log π_extracted = log π_ref + Q / τ - log Z
-            # For candidates, we have stored ref log probs
-            # For non-candidates, use min(Q) and very low reference prob
+            # π_extracted ∝ π_student * exp(Q / τ)
+            # For candidates: use actual Q values
+            # For non-candidates: use min(Q) among candidates
+            min_q = cand_qs_tensor.min()
 
-            # Compute extracted policy ONLY over candidates, then compute KL only over candidates
-            # π_extracted(a) ∝ π_ref(a) * exp(Q(a) / τ)
-            # In log space: log π_extracted = log π_ref + Q / τ - log Z (where Z normalizes over candidates)
+            # Create Q values for full vocabulary, initialized to min(Q)
+            q_full = torch.full((vocab_size,), min_q.item(), dtype=torch.float32, device=device)
+            q_full[cand_ids_tensor] = cand_qs_tensor
 
-            # The stored ref log probs are already proper log probabilities
-            # We apply softmax to (log_ref + Q/T) to get the extracted policy over candidates
-            log_weights = cand_ref_lps_tensor + cand_qs_tensor / temperature
-            log_p_extracted_cands = F.log_softmax(log_weights, dim=-1)  # Normalized over candidates only
-            p_extracted_cands = log_p_extracted_cands.exp()
+            # log π_extracted = log π_student + Q / τ - log Z
+            log_weights = log_p_student + q_full / temperature
+            log_p_extracted = F.log_softmax(log_weights, dim=-1)  # [V]
+            p_extracted = log_p_extracted.exp()
 
             # KL(π_extracted || π_student) - forward KL for mode-covering
-            # Since π_extracted is only defined over candidates, we compute KL only over candidates:
-            # KL = Σ_{a ∈ candidates} p_ext(a) * (log p_ext(a) - log p_stu(a))
-            log_p_student_cands = log_p_student[cand_ids_tensor]
-            kl = (p_extracted_cands * (log_p_extracted_cands - log_p_student_cands)).sum()
+            # KL = Σ_a p_ext(a) * (log p_ext(a) - log p_stu(a))
+            kl = (p_extracted * (log_p_extracted - log_p_student)).sum()
 
             total_kl += kl
             total_positions += 1
 
-            # Entropy for monitoring
+            # Entropy for monitoring (both over full vocabulary now)
             total_entropy_student += -(p_student * log_p_student).sum()
-            total_entropy_extracted += -(p_extracted_cands * log_p_extracted_cands).sum()
+            total_entropy_extracted += -(p_extracted * log_p_extracted).sum()
 
-            # Reference probability mass on candidates (should be high if min-p filtering worked)
-            total_ref_mass += cand_ref_lps_tensor.exp().sum()
+            # Extracted policy probability mass on candidates
+            total_extracted_mass_on_cands += p_extracted[cand_ids_tensor].sum()
 
             # SFT loss: -log π_student(a_taken | s) - measures alignment with original behavior
             sft_loss = -log_p_student[taken_id]
             total_sft_loss += sft_loss.detach()
 
-            # Reference SFT loss: -log π_ref(a_taken | s) - baseline for comparison
-            try:
-                taken_idx = cand_ids_list_local.index(taken_id)
-                ref_sft_loss = -cand_ref_lps_tensor[taken_idx]
-                total_ref_sft_loss += ref_sft_loss.detach()
-            except ValueError:
-                pass  # Taken action not in candidates, skip
+            # Extracted policy SFT loss: -log π_ext(a_taken | s)
+            extracted_sft_loss = -log_p_extracted[taken_id]
+            total_extracted_sft_loss += extracted_sft_loss.detach()
 
             # --- Proper RL Advantage Computation ---
             # V(s_t) = Q(s_{t-1}, a_{t-1}) = prev_q_taken
@@ -335,14 +329,12 @@ def compute_kl_loss(
             if prev_q_taken is not None:
                 v_state = prev_q_taken  # V(s_t) = Q-value of previous taken action
 
-                # A(a) = Q(a) - V(s_t) for candidates
-                advantages_cands = cand_qs_tensor - v_state
+                # A(a) = Q(a) - V(s_t) for all tokens (non-candidates have min(Q) - V)
+                advantages_full = q_full - v_state
 
-                # Expected advantage for student and extracted policies
-                # Student: sum over candidates only (non-candidates have 0 advantage)
-                p_student_cands = p_student[cand_ids_tensor]
-                expected_advantage_student = (p_student_cands * advantages_cands).sum()
-                expected_advantage_extracted = (p_extracted_cands * advantages_cands).sum()
+                # Expected advantage for student and extracted policies over full vocab
+                expected_advantage_student = (p_student * advantages_full).sum()
+                expected_advantage_extracted = (p_extracted * advantages_full).sum()
 
                 total_advantage_student += expected_advantage_student.detach()
                 total_advantage_extracted += expected_advantage_extracted.detach()
@@ -365,9 +357,9 @@ def compute_kl_loss(
             "advantage_student": zero.detach(),
             "advantage_extracted": zero.detach(),
             "v_state": zero.detach(),
-            "ref_mass": zero.detach(),
+            "extracted_mass_on_cands": zero.detach(),
             "sft_loss": zero.detach(),
-            "ref_sft_loss": zero.detach(),
+            "extracted_sft_loss": zero.detach(),
         }
 
     avg_kl = total_kl / total_positions
@@ -379,9 +371,9 @@ def compute_kl_loss(
         "advantage_student": total_advantage_student / max(1, total_positions) if isinstance(total_advantage_student, torch.Tensor) else total_advantage_student / max(1, total_positions),
         "advantage_extracted": total_advantage_extracted / max(1, total_positions) if isinstance(total_advantage_extracted, torch.Tensor) else total_advantage_extracted / max(1, total_positions),
         "v_state": total_v_state / max(1, total_positions) if isinstance(total_v_state, torch.Tensor) else total_v_state / max(1, total_positions),
-        "ref_mass": (total_ref_mass / total_positions).detach(),
+        "extracted_mass_on_cands": (total_extracted_mass_on_cands / total_positions).detach(),
         "sft_loss": (total_sft_loss / total_positions).item(),
-        "ref_sft_loss": (total_ref_sft_loss / total_positions).item(),
+        "extracted_sft_loss": (total_extracted_sft_loss / total_positions).item(),
     }
 
     return avg_kl, metrics
@@ -497,9 +489,9 @@ def train(
     accum_advantage_student = 0.0
     accum_advantage_extracted = 0.0
     accum_v_state = 0.0
-    accum_ref_mass = 0.0
+    accum_extracted_mass_on_cands = 0.0
     accum_sft_loss = 0.0
-    accum_ref_sft_loss = 0.0
+    accum_extracted_sft_loss = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -532,9 +524,9 @@ def train(
             accum_advantage_student += metrics["advantage_student"].item() if isinstance(metrics["advantage_student"], torch.Tensor) else metrics["advantage_student"]
             accum_advantage_extracted += metrics["advantage_extracted"].item() if isinstance(metrics["advantage_extracted"], torch.Tensor) else metrics["advantage_extracted"]
             accum_v_state += metrics["v_state"].item() if isinstance(metrics["v_state"], torch.Tensor) else metrics["v_state"]
-            accum_ref_mass += metrics["ref_mass"].item() if isinstance(metrics["ref_mass"], torch.Tensor) else metrics["ref_mass"]
+            accum_extracted_mass_on_cands += metrics["extracted_mass_on_cands"].item() if isinstance(metrics["extracted_mass_on_cands"], torch.Tensor) else metrics["extracted_mass_on_cands"]
             accum_sft_loss += metrics["sft_loss"].item() if isinstance(metrics["sft_loss"], torch.Tensor) else metrics["sft_loss"]
-            accum_ref_sft_loss += metrics["ref_sft_loss"].item() if isinstance(metrics["ref_sft_loss"], torch.Tensor) else metrics["ref_sft_loss"]
+            accum_extracted_sft_loss += metrics["extracted_sft_loss"].item() if isinstance(metrics["extracted_sft_loss"], torch.Tensor) else metrics["extracted_sft_loss"]
             accum_count += 1
 
             if not update:
@@ -561,27 +553,27 @@ def train(
                 avg_adv_s = accum_advantage_student / max(1, accum_count)
                 avg_adv_e = accum_advantage_extracted / max(1, accum_count)
                 avg_v = accum_v_state / max(1, accum_count)
-                avg_ref_mass = accum_ref_mass / max(1, accum_count)
+                avg_ext_mass = accum_extracted_mass_on_cands / max(1, accum_count)
                 avg_sft = accum_sft_loss / max(1, accum_count)
-                avg_ref_sft = accum_ref_sft_loss / max(1, accum_count)
+                avg_ext_sft = accum_extracted_sft_loss / max(1, accum_count)
 
                 print(
-                    f"[Step {global_step}] loss={avg_loss:.4f} sft={avg_sft:.3f} ref_sft={avg_ref_sft:.3f} "
+                    f"[Step {global_step}] loss={avg_loss:.4f} sft={avg_sft:.3f} ext_sft={avg_ext_sft:.3f} "
                     f"adv_s={avg_adv_s:.4f} adv_e={avg_adv_e:.4f} V={avg_v:.3f} "
-                    f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} ref_mass={avg_ref_mass:.3f} lr={lr:.2e}"
+                    f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} ext_mass={avg_ext_mass:.3f} lr={lr:.2e}"
                 )
 
                 if wandb_project and wandb:
                     wandb.log({
                         "train/kl_loss": avg_loss,
                         "train/sft_loss": avg_sft,
-                        "train/ref_sft_loss": avg_ref_sft,
+                        "train/extracted_sft_loss": avg_ext_sft,
                         "train/advantage_student": avg_adv_s,
                         "train/advantage_extracted": avg_adv_e,
                         "train/v_state": avg_v,
                         "train/entropy_student": avg_ent_s,
                         "train/entropy_extracted": avg_ent_e,
-                        "train/ref_mass": avg_ref_mass,
+                        "train/extracted_mass_on_cands": avg_ext_mass,
                         "lr": lr,
                         "step": global_step,
                     })
@@ -592,9 +584,9 @@ def train(
                 accum_advantage_student = 0.0
                 accum_advantage_extracted = 0.0
                 accum_v_state = 0.0
-                accum_ref_mass = 0.0
+                accum_extracted_mass_on_cands = 0.0
                 accum_sft_loss = 0.0
-                accum_ref_sft_loss = 0.0
+                accum_extracted_sft_loss = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
