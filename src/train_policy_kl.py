@@ -244,9 +244,8 @@ def compute_kl_loss(
     total_entropy_extracted = 0.0
     total_advantage_student = 0.0
     total_advantage_extracted = 0.0
-    total_v_state = 0.0
-    total_sft_loss = 0.0  # SFT loss: -log π_student(a_taken | candidates)
-    total_extracted_sft_loss = 0.0  # Extracted policy SFT loss: -log π_ext(a_taken | candidates)
+    total_kl_student_ref = 0.0  # KL(π_student || π_ref) - student divergence from reference
+    total_kl_extracted_ref = 0.0  # KL(π_extracted || π_ref) - extracted divergence from reference
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_q_values"],
@@ -302,26 +301,21 @@ def compute_kl_loss(
             total_entropy_student += -(p_student_cands * log_p_student_cands).sum()
             total_entropy_extracted += -(p_extracted_cands * log_p_extracted_cands).sum()
 
-            # Find taken token index within candidates
-            try:
-                taken_idx_in_cands = cand_ids_list_local.index(taken_id)
-            except ValueError:
-                # Taken action not in candidates (shouldn't happen)
-                taken_idx_in_cands = None
+            # Reference policy normalized over candidates
+            log_p_ref_cands = F.log_softmax(cand_ref_logprobs_tensor, dim=-1)
+            p_ref_cands = log_p_ref_cands.exp()
 
-            # SFT loss: -log π_student(a_taken | candidates)
-            if taken_idx_in_cands is not None:
-                sft_loss = -log_p_student_cands[taken_idx_in_cands]
-                total_sft_loss += sft_loss.detach()
+            # KL divergences from reference
+            # KL(π_student || π_ref) = Σ_a π_student(a) * (log π_student(a) - log π_ref(a))
+            kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+            total_kl_student_ref += kl_student_ref.detach()
 
-                # Extracted policy SFT loss: -log π_ext(a_taken | candidates)
-                extracted_sft_loss = -log_p_extracted_cands[taken_idx_in_cands]
-                total_extracted_sft_loss += extracted_sft_loss.detach()
+            # KL(π_extracted || π_ref) = Σ_a π_extracted(a) * (log π_extracted(a) - log π_ref(a))
+            kl_extracted_ref = (p_extracted_cands * (log_p_extracted_cands - log_p_ref_cands)).sum()
+            total_kl_extracted_ref += kl_extracted_ref.detach()
 
             # --- RL Advantage Computation ---
             # V(s_t) = E_{π_ref}[Q(s_t, a)] - expected Q under reference policy
-            # Normalize reference logprobs to get π_ref over candidates
-            p_ref_cands = F.softmax(cand_ref_logprobs_tensor, dim=-1)
             v_state = (p_ref_cands * cand_qs_tensor).sum()
 
             # A(a) = Q(a) - V(s_t) for candidates
@@ -333,7 +327,6 @@ def compute_kl_loss(
 
             total_advantage_student += expected_advantage_student.detach()
             total_advantage_extracted += expected_advantage_extracted.detach()
-            total_v_state += v_state.detach()
 
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -343,9 +336,8 @@ def compute_kl_loss(
             "entropy_extracted": zero.detach(),
             "advantage_student": zero.detach(),
             "advantage_extracted": zero.detach(),
-            "v_state": zero.detach(),
-            "sft_loss": zero.detach(),
-            "extracted_sft_loss": zero.detach(),
+            "kl_student_ref": zero.detach(),
+            "kl_extracted_ref": zero.detach(),
         }
 
     avg_kl = total_kl / total_positions
@@ -356,9 +348,8 @@ def compute_kl_loss(
         "entropy_extracted": (total_entropy_extracted / total_positions).detach(),
         "advantage_student": (total_advantage_student / total_positions).detach(),
         "advantage_extracted": (total_advantage_extracted / total_positions).detach(),
-        "v_state": (total_v_state / total_positions).detach(),
-        "sft_loss": (total_sft_loss / total_positions).item(),
-        "extracted_sft_loss": (total_extracted_sft_loss / total_positions).item(),
+        "kl_student_ref": (total_kl_student_ref / total_positions).detach(),
+        "kl_extracted_ref": (total_kl_extracted_ref / total_positions).detach(),
     }
 
     return avg_kl, metrics
@@ -473,9 +464,8 @@ def train(
     accum_entropy_extracted = 0.0
     accum_advantage_student = 0.0
     accum_advantage_extracted = 0.0
-    accum_v_state = 0.0
-    accum_sft_loss = 0.0
-    accum_extracted_sft_loss = 0.0
+    accum_kl_student_ref = 0.0
+    accum_kl_extracted_ref = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -507,9 +497,8 @@ def train(
             accum_entropy_extracted += metrics["entropy_extracted"].item()
             accum_advantage_student += metrics["advantage_student"].item()
             accum_advantage_extracted += metrics["advantage_extracted"].item()
-            accum_v_state += metrics["v_state"].item()
-            accum_sft_loss += metrics["sft_loss"]
-            accum_extracted_sft_loss += metrics["extracted_sft_loss"]
+            accum_kl_student_ref += metrics["kl_student_ref"].item()
+            accum_kl_extracted_ref += metrics["kl_extracted_ref"].item()
             accum_count += 1
 
             if not update:
@@ -535,24 +524,23 @@ def train(
                 avg_ent_e = accum_entropy_extracted / max(1, accum_count)
                 avg_adv_s = accum_advantage_student / max(1, accum_count)
                 avg_adv_e = accum_advantage_extracted / max(1, accum_count)
-                avg_v = accum_v_state / max(1, accum_count)
-                avg_sft = accum_sft_loss / max(1, accum_count)
-                avg_ext_sft = accum_extracted_sft_loss / max(1, accum_count)
+                avg_kl_s_ref = accum_kl_student_ref / max(1, accum_count)
+                avg_kl_e_ref = accum_kl_extracted_ref / max(1, accum_count)
 
                 print(
-                    f"[Step {global_step}] loss={avg_loss:.4f} sft={avg_sft:.3f} ext_sft={avg_ext_sft:.3f} "
-                    f"adv_s={avg_adv_s:.4f} adv_e={avg_adv_e:.4f} V={avg_v:.3f} "
+                    f"[Step {global_step}] loss={avg_loss:.4f} "
+                    f"kl_s_ref={avg_kl_s_ref:.4f} kl_e_ref={avg_kl_e_ref:.4f} "
+                    f"adv_s={avg_adv_s:.4f} adv_e={avg_adv_e:.4f} "
                     f"H_s={avg_ent_s:.3f} H_e={avg_ent_e:.3f} lr={lr:.2e}"
                 )
 
                 if wandb_project and wandb:
                     wandb.log({
                         "train/kl_loss": avg_loss,
-                        "train/sft_loss": avg_sft,
-                        "train/extracted_sft_loss": avg_ext_sft,
+                        "train/kl_student_ref": avg_kl_s_ref,
+                        "train/kl_extracted_ref": avg_kl_e_ref,
                         "train/advantage_student": avg_adv_s,
                         "train/advantage_extracted": avg_adv_e,
-                        "train/v_state": avg_v,
                         "train/entropy_student": avg_ent_s,
                         "train/entropy_extracted": avg_ent_e,
                         "lr": lr,
@@ -564,9 +552,8 @@ def train(
                 accum_entropy_extracted = 0.0
                 accum_advantage_student = 0.0
                 accum_advantage_extracted = 0.0
-                accum_v_state = 0.0
-                accum_sft_loss = 0.0
-                accum_extracted_sft_loss = 0.0
+                accum_kl_student_ref = 0.0
+                accum_kl_extracted_ref = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
