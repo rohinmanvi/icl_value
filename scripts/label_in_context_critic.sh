@@ -35,7 +35,7 @@ conda activate zip
 critic_path="models/joint_distribution_critic_no_ans_supervise_from_8_with_32"
 ref_path="Qwen/Qwen3-1.7B"
 in_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001.parquet"
-out_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_q_labels_reflogprobs.parquet"
+out_file="data/icl_value_training_adaptivemath_data_qwen17b_non_thinking_32_min_p_001_with_q_labels_reflogprobs_incorrect_only.parquet"
 
 dp_size=8
 max_length=131072
@@ -46,8 +46,8 @@ max_rollouts_per_prompt=1 # -1 for all rollouts
 min_correct_rate=0.25     # Minimum fraction of correct samples per prompt
 min_incorrect_rate=0.25   # Minimum fraction of incorrect samples per prompt
 # Label mode: set ONE of these to true, or both to false for all samples
-only_label_correct=true   # Only label correct samples
-only_label_incorrect=false # Only label incorrect samples
+only_label_correct=false   # Only label correct samples
+only_label_incorrect=true # Only label incorrect samples
 
 echo "Starting in-context critic Q-value labeling:"
 echo "  Critic model: $critic_path"
