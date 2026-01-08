@@ -267,7 +267,16 @@ def main() -> None:
     })
     
     print(f"Finished responses: {finished_count}/{total} ({finished_pct:.2f}%)")
-    
+
+    # Average accuracy: percentage of all finished responses that are correct
+    correct_count = df['correct'].sum()
+    avg_accuracy = df['correct'].mean() * 100
+    metrics.update({
+        "correct_responses": int(correct_count),
+        "average_accuracy": float(avg_accuracy)
+    })
+    print(f"Average Accuracy:   {correct_count}/{total} ({avg_accuracy:.2f}%)")
+
     if "pruned" in df.columns:
         pruned_count = df['pruned'].sum()
         pruned_pct = df['pruned'].mean() * 100
