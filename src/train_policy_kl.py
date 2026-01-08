@@ -4,7 +4,7 @@ Train a student policy with KL divergence loss against the extracted policy.
 
 The extracted policy is: π_ext(a | candidates) ∝ π_ref(a) * exp(Q(a) / τ)
 
-We minimize KL(π_student || π_extracted) (reverse KL for mode-seeking),
+We minimize KL(π_extracted || π_student) (forward KL for mode-covering),
 restricted to candidate tokens only. The reference policy is frozen (from
 pre-computed logprobs in the data), giving a stable target distribution.
 
@@ -218,7 +218,7 @@ def compute_kl_loss(
     temperature: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Compute KL divergence loss: KL(π_student || π_extracted) - reverse KL for mode-seeking
+    Compute KL divergence loss: KL(π_extracted || π_student) - forward KL for mode-covering
 
     Both distributions are restricted to candidate tokens only:
     π_student(a | candidates) = softmax(student_logits[candidates])
@@ -290,9 +290,9 @@ def compute_kl_loss(
             log_p_extracted_cands = F.log_softmax(log_weights, dim=-1)  # [num_candidates]
             p_extracted_cands = log_p_extracted_cands.exp()
 
-            # KL(π_student || π_extracted) over candidates - reverse KL for mode-seeking
-            # KL = Σ_a p_stu(a) * (log p_stu(a) - log p_ext(a))
-            kl = (p_student_cands * (log_p_student_cands - log_p_extracted_cands)).sum()
+            # KL(π_extracted || π_student) over candidates - forward KL for mode-covering
+            # KL = Σ_a p_ext(a) * (log p_ext(a) - log p_stu(a))
+            kl = (p_extracted_cands * (log_p_extracted_cands - log_p_student_cands)).sum()
 
             total_kl += kl
             total_positions += 1
