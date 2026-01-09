@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse, math, os, time, random
 import wandb
 from typing import List, Dict, Any, Tuple
+import pandas as pd
 import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
@@ -56,8 +57,18 @@ class PolicyKLDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        # Load data
-        df = pq.read_table(table).to_pandas() if isinstance(table, str) else table
+        # Load data - support single path, list of paths, or table
+        if isinstance(table, str):
+            df = pq.read_table(table).to_pandas()
+        elif isinstance(table, list):
+            # Multiple paths - concatenate all tables
+            dfs = []
+            for path in table:
+                dfs.append(pq.read_table(path).to_pandas())
+                print(f"Loaded {len(dfs[-1])} samples from {path}")
+            df = pd.concat(dfs, ignore_index=True)
+        else:
+            df = table
 
         # Validate required columns
         required_cols = ["prompt_token_ids", "output_token_ids", "candidate_ids", "candidate_q_values", "candidate_ref_logprobs"]
@@ -650,7 +661,8 @@ def parse_args():
     # Model and data
     p.add_argument("--model_id", default="Qwen/Qwen3-1.7B")
     p.add_argument("--weights_path", default="models/policy_kl")
-    p.add_argument("--data_path", required=True, help="Path to labeled parquet file")
+    p.add_argument("--data_path", required=True, nargs='+',
+                   help="Path(s) to labeled parquet file(s). Multiple files will be concatenated and shuffled.")
 
     # KL loss parameters
     p.add_argument("--temperature", type=float, default=1.0,
