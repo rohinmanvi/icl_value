@@ -3,13 +3,18 @@
 Train a student policy with rejection finetuning (RFT) baseline.
 
 This is a simple baseline that:
-1. Filters trajectories based on final Q-value > threshold (success)
+1. Filters trajectories based on reward > threshold (success)
 2. Performs standard SFT (cross-entropy loss) on successful trajectories
+
+Reward is determined by (in order of preference):
+- 'correct' column if available (0 or 1)
+- Final Q-value from 'candidate_q_values' as fallback
 
 Input data must have columns:
 - prompt_token_ids: List[int] - tokenized prompt
 - output_token_ids: List[int] - the actual trajectory tokens
-- candidate_q_values: List[List[float]] - Q-values for each candidate (used for filtering)
+- correct (optional): float - trajectory reward (0 or 1)
+- candidate_q_values (fallback): List[List[float]] - Q-values for each candidate
 
 Example usage:
     python train_policy_rft.py --model_id Qwen/Qwen3-1.7B \
@@ -20,6 +25,7 @@ from __future__ import annotations
 import argparse, math, os, time, random
 import wandb
 from typing import List, Dict, Any, Tuple
+import pandas as pd
 import pyarrow.parquet as pq
 import torch
 import torch.distributed as dist
@@ -60,35 +66,48 @@ class PolicyRFTDataset(Dataset):
         df = pq.read_table(table).to_pandas() if isinstance(table, str) else table
 
         # Validate required columns
-        required_cols = ["prompt_token_ids", "output_token_ids", "candidate_q_values"]
+        required_cols = ["prompt_token_ids", "output_token_ids"]
         for c in required_cols:
             if c not in df.columns:
                 raise ValueError(f"Dataset missing required column: {c}")
 
-        # Filter out rows without labels (None values)
-        df = df[df["candidate_q_values"].notna()].copy()
+        # Check for reward columns
+        has_correct = "correct" in df.columns
+        has_q_values = "candidate_q_values" in df.columns
+
+        if not has_correct and not has_q_values:
+            raise ValueError("Dataset must have either 'correct' column or 'candidate_q_values' column")
 
         total_samples = len(df)
-        print(f"Loaded {total_samples} labeled samples")
+        print(f"Loaded {total_samples} samples")
 
-        # Filter based on final Q-value > threshold
-        def get_final_q(q_values):
-            if q_values is None or len(q_values) == 0:
-                return None
-            last_position = q_values[-1]
-            if last_position is None or len(last_position) == 0:
-                return None
-            # Get max Q-value at the last position (the taken action's Q)
-            if hasattr(last_position, 'tolist'):
-                last_position = last_position.tolist()
-            return max(last_position)
+        # Compute reward for each trajectory (prefer 'correct', fall back to final Q-value)
+        def get_reward(row):
+            # Prefer 'correct' column if available
+            if has_correct and pd.notna(row.get("correct")):
+                return float(row["correct"])
+            # Fall back to final Q-value
+            if has_q_values:
+                q_values = row.get("candidate_q_values")
+                if q_values is not None and len(q_values) > 0:
+                    last_position = q_values[-1]
+                    if last_position is not None and len(last_position) > 0:
+                        if hasattr(last_position, 'tolist'):
+                            last_position = last_position.tolist()
+                        return max(last_position)
+            return None
 
-        df["final_q"] = df["candidate_q_values"].apply(get_final_q)
-        df = df[df["final_q"].notna()]
-        df = df[df["final_q"] > success_threshold].copy()
+        df["reward"] = df.apply(get_reward, axis=1)
+        df = df[df["reward"].notna()].copy()
+
+        print(f"Found {len(df)} samples with valid rewards")
+
+        # Filter based on reward > threshold
+        df = df[df["reward"] > success_threshold].copy()
 
         success_samples = len(df)
-        print(f"Filtered to {success_samples} successful samples (final Q > {success_threshold})")
+        reward_source = "correct column" if has_correct else "final Q-value"
+        print(f"Filtered to {success_samples} successful samples (reward > {success_threshold}, using {reward_source})")
         print(f"Success rate: {success_samples / total_samples * 100:.1f}%")
 
         # Group by prompt for shuffling
