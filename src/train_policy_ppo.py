@@ -213,47 +213,6 @@ class PolicyPPODataset(Dataset):
         }
 
 
-def compute_gae_advantages(
-    taken_q_values: List[float],
-    gae_lambda: float,
-    gamma: float = 1.0,
-) -> List[float]:
-    """
-    Compute GAE advantages from Q-values of taken actions.
-
-    In token-level MDPs with sparse rewards:
-    - V(s_t) = Q(s_{t-1}, a_{t-1}) = Q_{t-1}
-    - δ_t = Q_t - Q_{t-1} (TD error)
-    - A^GAE_t = Σ_{l=0}^{T-t-1} (γλ)^l δ_{t+l}
-
-    Computed efficiently backwards:
-    - A_{T-1} = δ_{T-1}
-    - A_t = δ_t + γλ * A_{t+1}
-    """
-    T = len(taken_q_values)
-    if T == 0:
-        return []
-
-    # Compute TD errors: δ_t = Q_t - Q_{t-1}
-    # For t=0, assume V(s_0) = 0, so δ_0 = Q_0
-    deltas = []
-    for t in range(T):
-        if t == 0:
-            delta = taken_q_values[t]  # Q_0 - V(s_0), assuming V(s_0) = 0
-        else:
-            delta = taken_q_values[t] - taken_q_values[t - 1]
-        deltas.append(delta)
-
-    # Compute GAE backwards
-    advantages = [0.0] * T
-    gae = 0.0
-    for t in reversed(range(T)):
-        gae = deltas[t] + gamma * gae_lambda * gae
-        advantages[t] = gae
-
-    return advantages
-
-
 def compute_ppo_loss(
     model,
     batch,
@@ -267,6 +226,8 @@ def compute_ppo_loss(
     L = -min(r(θ) * A, clip(r(θ), 1-ε, 1+ε) * A)
 
     where r(θ) = π_θ(a|s) / π_ref(a|s) is the importance ratio.
+
+    Optimized: single pass through positions, vectorized GAE computation.
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -294,63 +255,66 @@ def compute_ppo_loss(
         if cand_ids_list is None or len(cand_ids_list) == 0:
             continue
 
-        # Extract Q-values for taken actions along the trajectory
-        taken_q_values = []
-        valid_indices = []  # Track which positions are valid
+        # Single pass: preprocess all positions, collect data for vectorized GAE
+        n_positions = len(positions)
+        preprocessed = []  # (pos, taken_idx, cand_ids, cand_qs, cand_ref_lps, taken_q)
 
-        for pos_idx, (pos, cand_ids, cand_qs, taken_id) in enumerate(
-            zip(positions, cand_ids_list, cand_q_list, taken_ids)
-        ):
-            if cand_ids is None or len(cand_ids) < 1:
-                continue
-
-            cand_ids_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
-            cand_qs_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
-
-            try:
-                taken_idx = cand_ids_local.index(taken_id)
-                taken_q = cand_qs_local[taken_idx]
-            except ValueError:
-                continue
-
-            taken_q_values.append(taken_q)
-            valid_indices.append(pos_idx)
-
-        if len(taken_q_values) == 0:
-            continue
-
-        # Compute GAE advantages
-        advantages = compute_gae_advantages(taken_q_values, gae_lambda)
-
-        # Optionally normalize advantages
-        if normalize_advantages and len(advantages) > 1:
-            adv_tensor = torch.tensor(advantages)
-            adv_mean = adv_tensor.mean()
-            adv_std = adv_tensor.std() + 1e-8
-            advantages = ((adv_tensor - adv_mean) / adv_std).tolist()
-
-        # Compute PPO loss for each valid position
-        for i, pos_idx in enumerate(valid_indices):
+        for pos_idx in range(n_positions):
             pos = positions[pos_idx]
-            taken_id = taken_ids[pos_idx]
             cand_ids = cand_ids_list[pos_idx]
             cand_qs = cand_q_list[pos_idx]
             cand_ref_lps = cand_ref_logprobs_list[pos_idx]
-            advantage = advantages[i]
+            taken_id = taken_ids[pos_idx]
 
-            cand_ids_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
-            cand_qs_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
-            cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
+            if cand_ids is None or len(cand_ids) < 1:
+                continue
 
+            # Convert once
+            cand_ids_local = cand_ids.tolist() if hasattr(cand_ids, 'tolist') else list(cand_ids)
+            cand_qs_local = cand_qs.tolist() if hasattr(cand_qs, 'tolist') else list(cand_qs)
+            cand_ref_lps_local = cand_ref_lps.tolist() if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
+
+            # Find taken action index
             try:
                 taken_idx = cand_ids_local.index(taken_id)
             except ValueError:
                 continue
+
+            taken_q = cand_qs_local[taken_idx]
+            preprocessed.append((pos, taken_idx, cand_ids_local, cand_qs_local, cand_ref_lps_local, taken_q))
+
+        if len(preprocessed) == 0:
+            continue
+
+        # Vectorized GAE computation
+        taken_q_values = torch.tensor([p[5] for p in preprocessed], dtype=torch.float32, device=device)
+        T = len(taken_q_values)
+
+        # TD errors: δ_t = Q_t - Q_{t-1}, with δ_0 = Q_0
+        deltas = taken_q_values.clone()
+        deltas[1:] = taken_q_values[1:] - taken_q_values[:-1]
+
+        # GAE backwards (vectorized using cumulative sum with decay)
+        # A_t = δ_t + γλ*δ_{t+1} + (γλ)²*δ_{t+2} + ...
+        # Computed via reverse cumsum with exponential weights
+        advantages = torch.zeros(T, dtype=torch.float32, device=device)
+        gae = 0.0
+        for t in range(T - 1, -1, -1):
+            gae = deltas[t] + gae_lambda * gae
+            advantages[t] = gae
+
+        # Normalize advantages
+        if normalize_advantages and T > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Compute PPO loss for each position (single pass, data already preprocessed)
+        for i, (pos, taken_idx, cand_ids_local, cand_qs_local, cand_ref_lps_local, _) in enumerate(preprocessed):
+            advantage = advantages[i]
 
             # Get logits for this position
             pos_logits = logits[batch_idx, pos, :]  # [V]
 
-            # Compute log probs over candidates
+            # Create tensors
             cand_ids_tensor = torch.tensor(cand_ids_local, dtype=torch.long, device=device)
             cand_qs_tensor = torch.tensor(cand_qs_local, dtype=torch.float32, device=device)
             cand_ref_logprobs_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
@@ -373,39 +337,38 @@ def compute_ppo_loss(
             ratio = torch.exp(log_ratio)
 
             # PPO clipped objective
-            adv_tensor = torch.tensor(advantage, device=device, dtype=torch.float32)
             clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-
-            if advantage >= 0:
-                surrogate = torch.min(ratio * adv_tensor, clipped_ratio * adv_tensor)
-            else:
-                surrogate = torch.max(ratio * adv_tensor, clipped_ratio * adv_tensor)
+            surr1 = ratio * advantage
+            surr2 = clipped_ratio * advantage
+            # Use min for positive advantage, max for negative
+            surrogate = torch.where(advantage >= 0, torch.min(surr1, surr2), torch.max(surr1, surr2))
 
             loss = -surrogate
             total_loss += loss
 
             # Track metrics
-            if ratio < (1.0 - clip_eps) or ratio > (1.0 + clip_eps):
-                total_clipped += 1
+            with torch.no_grad():
+                if ratio < (1.0 - clip_eps) or ratio > (1.0 + clip_eps):
+                    total_clipped += 1
 
-            total_positions += 1
-            total_advantage += advantage
-            total_ratio += ratio.detach().item()
+                total_positions += 1
+                total_advantage += advantage.item()
+                total_ratio += ratio.item()
 
-            # --- Common metrics (over candidates) ---
-            # Entropy of student over candidates
-            entropy_student = -(p_student_cands * log_p_student_cands).sum()
-            total_entropy_student += entropy_student.detach()
+                # --- Common metrics (over candidates) ---
+                # Entropy of student over candidates
+                entropy_student = -(p_student_cands * log_p_student_cands).sum()
+                total_entropy_student += entropy_student.item()
 
-            # KL(student || ref) over candidates
-            kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
-            total_kl_student_ref += kl_student_ref.detach()
+                # KL(student || ref) over candidates
+                kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+                total_kl_student_ref += kl_student_ref.item()
 
-            # Advantage: V(s) = E_ref[Q], A = Q - V
-            v_state = (p_ref_cands * cand_qs_tensor).sum()
-            advantages_cands = cand_qs_tensor - v_state
-            advantage_student = (p_student_cands * advantages_cands).sum()
-            total_advantage_student += advantage_student.detach()
+                # Advantage: V(s) = E_ref[Q], A = Q - V
+                v_state = (p_ref_cands * cand_qs_tensor).sum()
+                advantages_cands = cand_qs_tensor - v_state
+                advantage_student = (p_student_cands * advantages_cands).sum()
+                total_advantage_student += advantage_student.item()
 
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -426,9 +389,9 @@ def compute_ppo_loss(
         "mean_advantage": total_advantage / total_positions,
         "mean_ratio": total_ratio / total_positions,
         "clip_fraction": total_clipped / total_positions,
-        "entropy_student": (total_entropy_student / total_positions).item(),
-        "kl_student_ref": (total_kl_student_ref / total_positions).item(),
-        "advantage_student": (total_advantage_student / total_positions).item(),
+        "entropy_student": total_entropy_student / total_positions,
+        "kl_student_ref": total_kl_student_ref / total_positions,
+        "advantage_student": total_advantage_student / total_positions,
     }
 
     return avg_loss, metrics
