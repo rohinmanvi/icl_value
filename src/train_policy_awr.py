@@ -5,14 +5,13 @@ Train a student policy with Advantage-Weighted Regression (AWR).
 AWR performs weighted maximum likelihood where each action is weighted by
 exp(A/β), with A being the advantage and β the temperature.
 
-This implementation supports two advantage computation methods:
-1. TD-style (default): A_t = Q_t - Q_{t-1}
-   - Uses the insight that in token-level MDPs with sparse terminal rewards,
-     Q(s_{t-1}, a_{t-1}) = V(s_t), so advantage = Q_t - Q_{t-1}
+Uses GAE (Generalized Advantage Estimation) for advantage computation:
+- λ=0: TD advantages, A_t = Q_t - Q_{t-1} (low variance, high bias)
+- λ=1: MC advantages, A_t ≈ R - V(s_t) (high variance, low bias)
+- 0<λ<1: Interpolation via exponentially-weighted TD errors
 
-2. MC-style (paper): A_t = R - V(s_t)
-   - R is the trajectory's final reward (from 'correct' column)
-   - V(s_t) = E_{π_ref}[Q(s_t, a)] estimated over candidates
+The TD errors are: δ_t = Q_t - Q_{t-1} (since V(s_t) = Q_{t-1} in token MDPs)
+GAE: A^GAE_t = Σ_{l=0}^{T-t-1} λ^l δ_{t+l}
 
 Reference: "Advantage-Weighted Regression: Simple and Scalable Off-Policy RL"
            Peng et al., 2019
@@ -22,14 +21,12 @@ Input data must have columns:
 - output_token_ids: List[int] - the actual trajectory tokens
 - candidate_ids: List[List[int]] - token IDs of candidates at each position
 - candidate_q_values: List[List[float]] - Q-values for each candidate
-- candidate_ref_logprobs: List[List[float]] - reference model log probs (for MC mode)
-- correct (optional): float - trajectory reward (required for MC mode)
 
 Example usage:
     python train_policy_awr.py --model_id Qwen/Qwen3-1.7B \
                                --weights_path models/policy_awr \
                                --data_path data/labeled.parquet \
-                               --advantage_type td
+                               --gae_lambda 0.95
 """
 from __future__ import annotations
 import argparse, math, os, time, random
@@ -56,18 +53,12 @@ class PolicyAWRDataset(Dataset):
         tokenizer,
         max_length: int = 131072,
         examples_per_prompt: int = 1,
-        advantage_type: str = "td",
     ):
         """
-        Dataset for AWR training.
-
-        Args:
-            advantage_type: "td" for A_t = Q_t - Q_{t-1}
-                           "mc" for A_t = R - V(s_t) (paper style)
+        Dataset for AWR training with GAE advantages.
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.advantage_type = advantage_type
 
         # Load data - support single path, list of paths, or table
         if isinstance(table, str):
@@ -86,12 +77,6 @@ class PolicyAWRDataset(Dataset):
         for c in required_cols:
             if c not in df.columns:
                 raise ValueError(f"Dataset missing required column: {c}")
-
-        if advantage_type == "mc":
-            if "candidate_ref_logprobs" not in df.columns:
-                raise ValueError("MC advantage requires 'candidate_ref_logprobs' column")
-            if "correct" not in df.columns:
-                raise ValueError("MC advantage requires 'correct' column for trajectory reward")
 
         # Filter out rows without labels
         df = df[df["candidate_ids"].notna()].copy()
@@ -141,22 +126,12 @@ class PolicyAWRDataset(Dataset):
         if hasattr(candidate_q_values, 'tolist'):
             candidate_q_values = candidate_q_values.tolist()
 
-        result = {
+        return {
             "prompt_ids": list(prompt_ids),
             "output_ids": list(output_ids),
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
         }
-
-        # For MC mode, also need ref logprobs and reward
-        if self.advantage_type == "mc":
-            candidate_ref_logprobs = row.get("candidate_ref_logprobs")
-            if hasattr(candidate_ref_logprobs, 'tolist'):
-                candidate_ref_logprobs = candidate_ref_logprobs.tolist()
-            result["candidate_ref_logprobs"] = candidate_ref_logprobs
-            result["reward"] = float(row.get("correct", 0.0))
-
-        return result
 
     def __len__(self):
         return len(self.samples)
@@ -203,7 +178,7 @@ class PolicyAWRDataset(Dataset):
 
         input_tensor = torch.tensor(full_ids, dtype=torch.long)
 
-        result = {
+        return {
             "input_ids": input_tensor,
             "label_positions": label_positions,
             "candidate_ids": candidate_ids,
@@ -211,21 +186,12 @@ class PolicyAWRDataset(Dataset):
             "taken_token_ids": taken_token_ids,
         }
 
-        if self.advantage_type == "mc":
-            candidate_ref_logprobs = sample.get("candidate_ref_logprobs", [])
-            if prompt_len <= 0 and candidate_ref_logprobs:
-                candidate_ref_logprobs = candidate_ref_logprobs[1:]
-            result["candidate_ref_logprobs"] = candidate_ref_logprobs
-            result["reward"] = sample.get("reward", 0.0)
-
-        return result
-
     @staticmethod
     def collate_fn(batch):
         max_len = max(s["input_ids"].size(0) for s in batch)
         pad_val = 0
 
-        result = {
+        return {
             "input_ids": torch.stack([
                 F.pad(s["input_ids"], (0, max_len - s["input_ids"].size(0)), value=pad_val)
                 for s in batch
@@ -236,12 +202,46 @@ class PolicyAWRDataset(Dataset):
             "taken_token_ids": [s["taken_token_ids"] for s in batch],
         }
 
-        # Optional fields for MC mode
-        if "candidate_ref_logprobs" in batch[0]:
-            result["candidate_ref_logprobs"] = [s["candidate_ref_logprobs"] for s in batch]
-            result["rewards"] = torch.tensor([s["reward"] for s in batch], dtype=torch.float32)
 
-        return result
+def compute_gae_advantages(
+    taken_q_values: List[float],
+    gae_lambda: float,
+    gamma: float = 1.0,
+) -> List[float]:
+    """
+    Compute GAE advantages from Q-values of taken actions.
+
+    In token-level MDPs with sparse rewards:
+    - V(s_t) = Q(s_{t-1}, a_{t-1}) = Q_{t-1}
+    - δ_t = Q_t - Q_{t-1} (TD error)
+    - A^GAE_t = Σ_{l=0}^{T-t-1} (γλ)^l δ_{t+l}
+
+    Computed efficiently backwards:
+    - A_{T-1} = δ_{T-1}
+    - A_t = δ_t + γλ * A_{t+1}
+    """
+    T = len(taken_q_values)
+    if T == 0:
+        return []
+
+    # Compute TD errors: δ_t = Q_t - Q_{t-1}
+    # For t=0, assume V(s_0) = 0, so δ_0 = Q_0
+    deltas = []
+    for t in range(T):
+        if t == 0:
+            delta = taken_q_values[t]  # Q_0 - V(s_0), assuming V(s_0) = 0
+        else:
+            delta = taken_q_values[t] - taken_q_values[t - 1]
+        deltas.append(delta)
+
+    # Compute GAE backwards
+    advantages = [0.0] * T
+    gae = 0.0
+    for t in reversed(range(T)):
+        gae = deltas[t] + gamma * gae_lambda * gae
+        advantages[t] = gae
+
+    return advantages
 
 
 def compute_awr_loss(
@@ -249,7 +249,7 @@ def compute_awr_loss(
     batch,
     temperature: float = 1.0,
     weight_clip: float = 20.0,
-    advantage_type: str = "td",
+    gae_lambda: float = 0.95,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     """
     Compute AWR loss: weighted negative log-likelihood.
@@ -259,7 +259,7 @@ def compute_awr_loss(
     Args:
         temperature: β in exp(A/β), controls weight sharpness
         weight_clip: Maximum weight value (for stability)
-        advantage_type: "td" or "mc"
+        gae_lambda: GAE λ parameter (0=TD, 1=MC)
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -282,16 +282,10 @@ def compute_awr_loss(
         if cand_ids_list is None or len(cand_ids_list) == 0:
             continue
 
-        # For MC mode, get reward and ref logprobs
-        if advantage_type == "mc":
-            reward = batch["rewards"][batch_idx].item()
-            cand_ref_logprobs_list = batch["candidate_ref_logprobs"][batch_idx]
-
         # Extract Q-values for taken actions along the trajectory
         taken_q_values = []
         valid_positions = []
         valid_taken_ids = []
-        value_estimates = []  # V(s_t) for MC mode
 
         for pos_idx, (pos, cand_ids, cand_qs, taken_id) in enumerate(
             zip(positions, cand_ids_list, cand_q_list, taken_ids)
@@ -313,39 +307,11 @@ def compute_awr_loss(
             valid_positions.append(pos)
             valid_taken_ids.append(taken_id)
 
-            # For MC mode, compute V(s_t) = E_{π_ref}[Q(s_t, a)]
-            if advantage_type == "mc":
-                cand_ref_lps = cand_ref_logprobs_list[pos_idx]
-                cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
-
-                # Normalize ref logprobs over candidates to get π_ref(a|candidates)
-                cand_ref_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
-                p_ref = F.softmax(cand_ref_tensor, dim=-1)
-
-                cand_qs_tensor = torch.tensor(cand_qs_local, dtype=torch.float32, device=device)
-                v_state = (p_ref * cand_qs_tensor).sum().item()
-                value_estimates.append(v_state)
-
         if len(taken_q_values) == 0:
             continue
 
-        # Compute advantages
-        advantages = []
-
-        if advantage_type == "td":
-            # TD-style: A_t = Q_t - Q_{t-1}
-            for i in range(len(taken_q_values)):
-                if i == 0:
-                    # First position: use Q_0 as advantage (assume V(s_0) = 0)
-                    adv = taken_q_values[i]
-                else:
-                    adv = taken_q_values[i] - taken_q_values[i - 1]
-                advantages.append(adv)
-        else:
-            # MC-style (paper): A_t = R - V(s_t)
-            for i in range(len(taken_q_values)):
-                adv = reward - value_estimates[i]
-                advantages.append(adv)
+        # Compute GAE advantages
+        advantages = compute_gae_advantages(taken_q_values, gae_lambda)
 
         # Compute weighted loss for each position
         for i, (pos, taken_id, adv) in enumerate(zip(valid_positions, valid_taken_ids, advantages)):
@@ -424,7 +390,7 @@ def train(
     wandb_project,
     temperature,
     weight_clip,
-    advantage_type,
+    gae_lambda,
     max_steps=-1,
     log_freq=10,
 ):
@@ -454,7 +420,7 @@ def train(
     if master and wandb_project and wandb:
         wandb.init(
             project=wandb_project,
-            name=f"policy_awr_{advantage_type}_{int(time.time())}",
+            name=f"policy_awr_gae{gae_lambda}_{int(time.time())}",
             config={
                 "num_epochs": num_epochs,
                 "batch_size": batch_size,
@@ -465,7 +431,7 @@ def train(
                 "compile_mode": compile_mode,
                 "temperature": temperature,
                 "weight_clip": weight_clip,
-                "advantage_type": advantage_type,
+                "gae_lambda": gae_lambda,
                 "max_steps": max_steps,
             },
         )
@@ -523,7 +489,7 @@ def train(
                     model, batch,
                     temperature=temperature,
                     weight_clip=weight_clip,
-                    advantage_type=advantage_type,
+                    gae_lambda=gae_lambda,
                 )
                 loss_scaled = loss / gradient_accumulation_steps
 
@@ -640,13 +606,16 @@ def main_worker(local_rank, world_size, cfg):
         tokenizer=tokenizer,
         max_length=cfg.max_length,
         examples_per_prompt=cfg.examples_per_prompt,
-        advantage_type=cfg.advantage_type,
     )
 
     if local_rank == 0:
-        adv_desc = "A_t = Q_t - Q_{t-1}" if cfg.advantage_type == "td" else "A_t = R - V(s_t)"
-        print(f"[INFO] AWR with {cfg.advantage_type} advantage: {adv_desc}")
-        print(f"[INFO] Temperature β={cfg.temperature}, weight_clip={cfg.weight_clip}")
+        print(f"[INFO] AWR with GAE λ={cfg.gae_lambda}, temperature β={cfg.temperature}, weight_clip={cfg.weight_clip}")
+        if cfg.gae_lambda == 0:
+            print("[INFO] λ=0: Using TD(0) advantages (A_t = Q_t - Q_{t-1})")
+        elif cfg.gae_lambda == 1:
+            print("[INFO] λ=1: Using MC advantages (full return)")
+        else:
+            print(f"[INFO] λ={cfg.gae_lambda}: Interpolating between TD and MC")
 
     if local_rank == 0 and not os.path.exists(cfg.weights_path):
         os.makedirs(cfg.weights_path, exist_ok=True)
@@ -674,7 +643,7 @@ def main_worker(local_rank, world_size, cfg):
         wandb_project=cfg.wandb_project,
         temperature=cfg.temperature,
         weight_clip=cfg.weight_clip,
-        advantage_type=cfg.advantage_type,
+        gae_lambda=cfg.gae_lambda,
         max_steps=cfg.max_steps,
         log_freq=cfg.log_freq,
     )
@@ -690,8 +659,8 @@ def parse_args():
                    help="Path(s) to labeled parquet file(s)")
 
     # AWR parameters
-    p.add_argument("--advantage_type", type=str, default="td", choices=["td", "mc"],
-                   help="Advantage computation: 'td' for A=Q_t-Q_{t-1}, 'mc' for A=R-V(s) (paper)")
+    p.add_argument("--gae_lambda", type=float, default=0.95,
+                   help="GAE lambda: 0=TD(0), 1=MC, 0.95=typical (default: 0.95)")
     p.add_argument("--temperature", type=float, default=1.0,
                    help="Temperature β for exp(A/β) weights")
     p.add_argument("--weight_clip", type=float, default=20.0,
