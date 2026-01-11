@@ -227,9 +227,14 @@ def compute_kl_loss(
     model,
     batch,
     temperature: float = 1.0,
+    kl_direction: str = "reverse",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
-    Compute KL divergence loss: KL(π_student || π_extracted) - reverse KL for mode-seeking
+    Compute KL divergence loss between student and extracted policy.
+
+    Args:
+        kl_direction: "reverse" for KL(π_student || π_extracted) - mode-seeking
+                      "forward" for KL(π_extracted || π_student) - mode-covering
 
     Both distributions are restricted to candidate tokens only:
     π_student(a | candidates) = softmax(student_logits[candidates])
@@ -301,9 +306,15 @@ def compute_kl_loss(
             log_p_extracted_cands = F.log_softmax(log_weights, dim=-1)  # [num_candidates]
             p_extracted_cands = log_p_extracted_cands.exp()
 
-            # KL(π_student || π_extracted) over candidates - reverse KL for mode-seeking
-            # KL = Σ_a p_stu(a) * (log p_stu(a) - log p_ext(a))
-            kl = (p_student_cands * (log_p_student_cands - log_p_extracted_cands)).sum()
+            # Compute KL based on direction
+            if kl_direction == "reverse":
+                # KL(π_student || π_extracted) - mode-seeking (student covers high-prob modes of extracted)
+                # KL = Σ_a p_stu(a) * (log p_stu(a) - log p_ext(a))
+                kl = (p_student_cands * (log_p_student_cands - log_p_extracted_cands)).sum()
+            else:
+                # KL(π_extracted || π_student) - mode-covering (student covers all modes of extracted)
+                # KL = Σ_a p_ext(a) * (log p_ext(a) - log p_stu(a))
+                kl = (p_extracted_cands * (log_p_extracted_cands - log_p_student_cands)).sum()
 
             total_kl += kl
             total_positions += 1
@@ -396,6 +407,7 @@ def train(
     grad_clip,
     wandb_project,
     temperature,
+    kl_direction="reverse",
     max_steps=-1,
     log_freq=10,
 ):
@@ -435,6 +447,7 @@ def train(
                 "weight_decay": weight_decay,
                 "compile_mode": compile_mode,
                 "temperature": temperature,
+                "kl_direction": kl_direction,
                 "max_steps": max_steps,
             },
         )
@@ -492,7 +505,7 @@ def train(
                 "cuda" if torch.cuda.is_available() else "cpu",
                 dtype=getattr(torch, dtype),
             ):
-                loss, metrics = compute_kl_loss(model, batch, temperature=temperature)
+                loss, metrics = compute_kl_loss(model, batch, temperature=temperature, kl_direction=kl_direction)
                 loss_scaled = loss / gradient_accumulation_steps
 
             scaler.scale(loss_scaled).backward()
@@ -625,6 +638,10 @@ def main_worker(local_rank, world_size, cfg):
         examples_per_prompt=cfg.examples_per_prompt,
     )
 
+    if local_rank == 0:
+        kl_desc = "KL(student||extracted) mode-seeking" if cfg.kl_direction == "reverse" else "KL(extracted||student) mode-covering"
+        print(f"[INFO] KL direction: {cfg.kl_direction} - {kl_desc}")
+
     if local_rank == 0 and not os.path.exists(cfg.weights_path):
         os.makedirs(cfg.weights_path, exist_ok=True)
         tokenizer.save_pretrained(cfg.weights_path)
@@ -650,6 +667,7 @@ def main_worker(local_rank, world_size, cfg):
         grad_clip=cfg.grad_clip,
         wandb_project=cfg.wandb_project,
         temperature=cfg.temperature,
+        kl_direction=cfg.kl_direction,
         max_steps=cfg.max_steps,
         log_freq=cfg.log_freq,
     )
@@ -667,6 +685,8 @@ def parse_args():
     # KL loss parameters
     p.add_argument("--temperature", type=float, default=1.0,
                    help="Temperature τ for extracted policy: π_ext ∝ π_ref * exp(Q/τ)")
+    p.add_argument("--kl_direction", type=str, default="reverse", choices=["forward", "reverse"],
+                   help="KL direction: 'reverse' for KL(student||extracted) mode-seeking, 'forward' for KL(extracted||student) mode-covering")
 
     # Dataset
     p.add_argument("--max_length", type=int, default=131072)
