@@ -235,15 +235,15 @@ def compute_ppo_loss(
     outputs = model(input_ids=input_ids, use_cache=False)
     logits = outputs.logits  # [B, S, V]
 
-    total_loss = torch.tensor(0.0, device=device)
+    total_loss = 0.0
     total_positions = 0
-    total_advantage = torch.tensor(0.0, device=device)
-    total_ratio = torch.tensor(0.0, device=device)
+    total_advantage = 0.0
+    total_ratio = 0.0
     total_clipped = 0
     # Common metrics
-    total_entropy_student = torch.tensor(0.0, device=device)
-    total_kl_student_ref = torch.tensor(0.0, device=device)
-    total_advantage_student = torch.tensor(0.0, device=device)
+    total_entropy_student = 0.0
+    total_kl_student_ref = 0.0
+    total_advantage_student = 0.0
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"],
@@ -346,25 +346,27 @@ def compute_ppo_loss(
             loss = -surrogate
             total_loss += loss
 
-            # Track metrics - use detach() not item() to avoid GPU sync
+            # Track metrics (no .item() calls - avoid GPU sync)
             total_positions += 1
             total_advantage += advantage.detach()
             total_ratio += ratio.detach()
-
             if ratio < (1.0 - clip_eps) or ratio > (1.0 + clip_eps):
                 total_clipped += 1
 
             # --- Common metrics (over candidates) ---
             # Entropy of student over candidates
-            total_entropy_student += -(p_student_cands * log_p_student_cands).sum().detach()
+            entropy_student = -(p_student_cands * log_p_student_cands).sum()
+            total_entropy_student += entropy_student.detach()
 
             # KL(student || ref) over candidates
-            total_kl_student_ref += (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum().detach()
+            kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+            total_kl_student_ref += kl_student_ref.detach()
 
             # Advantage: V(s) = E_ref[Q], A = Q - V
             v_state = (p_ref_cands * cand_qs_tensor).sum()
             advantages_cands = cand_qs_tensor - v_state
-            total_advantage_student += (p_student_cands * advantages_cands).sum().detach()
+            advantage_student = (p_student_cands * advantages_cands).sum()
+            total_advantage_student += advantage_student.detach()
 
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
@@ -380,6 +382,7 @@ def compute_ppo_loss(
 
     avg_loss = total_loss / total_positions
 
+    # Call .item() only once at the end to avoid GPU sync in loop
     metrics = {
         "num_positions": total_positions,
         "mean_advantage": (total_advantage / total_positions).item(),
