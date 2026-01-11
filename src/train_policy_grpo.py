@@ -176,18 +176,22 @@ class PolicyGRPODataset(Dataset):
 
         candidate_ids = row["candidate_ids"]
         candidate_ref_logprobs = row["candidate_ref_logprobs"]
+        candidate_q_values = row.get("candidate_q_values")
 
         # Convert numpy arrays if needed
         if hasattr(candidate_ids, 'tolist'):
             candidate_ids = candidate_ids.tolist()
         if hasattr(candidate_ref_logprobs, 'tolist'):
             candidate_ref_logprobs = candidate_ref_logprobs.tolist()
+        if candidate_q_values is not None and hasattr(candidate_q_values, 'tolist'):
+            candidate_q_values = candidate_q_values.tolist()
 
         return {
             "prompt_ids": list(prompt_ids),
             "output_ids": list(output_ids),
             "candidate_ids": candidate_ids,
             "candidate_ref_logprobs": candidate_ref_logprobs,
+            "candidate_q_values": candidate_q_values,
             "advantage": float(row["advantage"]),
             "reward": float(row["reward"]),
         }
@@ -202,6 +206,7 @@ class PolicyGRPODataset(Dataset):
         output_ids = sample["output_ids"]
         candidate_ids = sample["candidate_ids"]
         candidate_ref_logprobs = sample["candidate_ref_logprobs"]
+        candidate_q_values = sample["candidate_q_values"]
         advantage = sample["advantage"]
         reward = sample["reward"]
 
@@ -217,12 +222,15 @@ class PolicyGRPODataset(Dataset):
                 full_ids = full_ids[:self.max_length]
                 candidate_ids = []
                 candidate_ref_logprobs = []
+                candidate_q_values = [] if candidate_q_values else None
                 output_ids = []
             else:
                 output_ids = output_ids[:max_output]
                 full_ids = prompt_ids + output_ids
                 candidate_ids = candidate_ids[:max_output]
                 candidate_ref_logprobs = candidate_ref_logprobs[:max_output]
+                if candidate_q_values:
+                    candidate_q_values = candidate_q_values[:max_output]
 
         # Label positions: positions in full_ids that correspond to output tokens
         # Position i predicts token at position i+1
@@ -242,6 +250,8 @@ class PolicyGRPODataset(Dataset):
             # Skip first output token (no position to predict it from)
             candidate_ids = candidate_ids[1:] if candidate_ids else []
             candidate_ref_logprobs = candidate_ref_logprobs[1:] if candidate_ref_logprobs else []
+            if candidate_q_values:
+                candidate_q_values = candidate_q_values[1:]
 
         input_tensor = torch.tensor(full_ids, dtype=torch.long)
 
@@ -250,6 +260,7 @@ class PolicyGRPODataset(Dataset):
             "label_positions": label_positions,
             "candidate_ids": candidate_ids,
             "candidate_ref_logprobs": candidate_ref_logprobs,
+            "candidate_q_values": candidate_q_values,
             "taken_token_ids": taken_token_ids,
             "advantage": advantage,
             "reward": reward,
@@ -268,6 +279,7 @@ class PolicyGRPODataset(Dataset):
             "label_positions": [s["label_positions"] for s in batch],
             "candidate_ids": [s["candidate_ids"] for s in batch],
             "candidate_ref_logprobs": [s["candidate_ref_logprobs"] for s in batch],
+            "candidate_q_values": [s["candidate_q_values"] for s in batch],
             "taken_token_ids": [s["taken_token_ids"] for s in batch],
             "advantages": torch.tensor([s["advantage"] for s in batch], dtype=torch.float32),
             "rewards": torch.tensor([s["reward"] for s in batch], dtype=torch.float32),
@@ -302,9 +314,14 @@ def compute_grpo_loss(
     total_positions = 0
     total_clipped = 0
     total_ratio_sum = 0.0
+    # Common metrics
+    total_entropy_student = 0.0
+    total_kl_student_ref = 0.0
+    total_advantage_student = 0.0
 
-    for batch_idx, (positions, cand_ids_list, cand_ref_logprobs_list, taken_ids) in enumerate(
-        zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_ref_logprobs"], batch["taken_token_ids"])
+    for batch_idx, (positions, cand_ids_list, cand_ref_logprobs_list, cand_q_values_list, taken_ids) in enumerate(
+        zip(batch["label_positions"], batch["candidate_ids"], batch["candidate_ref_logprobs"],
+            batch["candidate_q_values"], batch["taken_token_ids"])
     ):
         if positions is None or len(positions) == 0:
             continue
@@ -323,6 +340,13 @@ def compute_grpo_loss(
             cand_ids_list_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
             cand_ref_lps_list = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
 
+            # Get Q-values for this position if available
+            cand_qs = None
+            if cand_q_values_list is not None and pos_idx < len(cand_q_values_list):
+                cand_qs = cand_q_values_list[pos_idx]
+                if cand_qs is not None:
+                    cand_qs = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
+
             # Find the taken action in candidates
             try:
                 taken_idx = cand_ids_list_local.index(taken_id)
@@ -340,9 +364,11 @@ def compute_grpo_loss(
             # π_θ(a | candidates) - student policy over candidates
             cand_logits = pos_logits[cand_ids_tensor].float()  # [num_candidates]
             log_p_student_cands = F.log_softmax(cand_logits, dim=-1)  # [num_candidates]
+            p_student_cands = log_p_student_cands.exp()
 
             # π_ref(a | candidates) - reference policy over candidates
             log_p_ref_cands = F.log_softmax(cand_ref_logprobs_tensor, dim=-1)  # [num_candidates]
+            p_ref_cands = log_p_ref_cands.exp()
 
             # Log probabilities for the taken action
             log_p_student_taken = log_p_student_cands[taken_idx]
@@ -373,9 +399,25 @@ def compute_grpo_loss(
 
             # Optional KL regularization: KL(π_θ || π_ref) over candidates
             if kl_coef > 0:
-                p_student_cands = log_p_student_cands.exp()
                 kl = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
                 total_kl += kl
+
+            # --- Common metrics (over candidates) ---
+            # Entropy of student over candidates
+            entropy_student = -(p_student_cands * log_p_student_cands).sum()
+            total_entropy_student += entropy_student.detach()
+
+            # KL(student || ref) over candidates
+            kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+            total_kl_student_ref += kl_student_ref.detach()
+
+            # Advantage: V(s) = E_ref[Q], A = Q - V (if Q-values available)
+            if cand_qs is not None and len(cand_qs) == len(cand_ids_list_local):
+                cand_qs_tensor = torch.tensor(cand_qs, dtype=torch.float32, device=device)
+                v_state = (p_ref_cands * cand_qs_tensor).sum()
+                advantages_cands = cand_qs_tensor - v_state
+                advantage_student = (p_student_cands * advantages_cands).sum()
+                total_advantage_student += advantage_student.detach()
 
             total_positions += 1
 
@@ -388,6 +430,9 @@ def compute_grpo_loss(
             "kl": zero.detach(),
             "mean_reward": batch["rewards"].mean().item(),
             "mean_advantage": batch["advantages"].mean().item(),
+            "entropy_student": 0.0,
+            "kl_student_ref": 0.0,
+            "advantage_student": 0.0,
         }
 
     avg_policy_loss = total_policy_loss / total_positions
@@ -402,6 +447,10 @@ def compute_grpo_loss(
         "kl": avg_kl.detach() if isinstance(avg_kl, torch.Tensor) else avg_kl,
         "mean_reward": batch["rewards"].mean().item(),
         "mean_advantage": batch["advantages"].mean().item(),
+        # Common metrics
+        "entropy_student": (total_entropy_student / total_positions).item(),
+        "kl_student_ref": (total_kl_student_ref / total_positions).item(),
+        "advantage_student": (total_advantage_student / total_positions).item(),
     }
 
     return total_loss, metrics
@@ -520,6 +569,10 @@ def train(
     accum_reward = 0.0
     accum_advantage = 0.0
     accum_count = 0
+    # Common metrics accumulators
+    accum_entropy_student = 0.0
+    accum_kl_student_ref = 0.0
+    accum_advantage_student = 0.0
 
     for epoch in range(num_epochs):
         if distributed:
@@ -552,6 +605,10 @@ def train(
             accum_reward += metrics["mean_reward"]
             accum_advantage += metrics["mean_advantage"]
             accum_count += 1
+            # Common metrics
+            accum_entropy_student += metrics["entropy_student"]
+            accum_kl_student_ref += metrics["kl_student_ref"]
+            accum_advantage_student += metrics["advantage_student"]
 
             if not update:
                 continue
@@ -577,6 +634,10 @@ def train(
                 avg_kl = accum_kl / max(1, accum_count)
                 avg_reward = accum_reward / max(1, accum_count)
                 avg_adv = accum_advantage / max(1, accum_count)
+                # Common metrics
+                avg_entropy_student = accum_entropy_student / max(1, accum_count)
+                avg_kl_student_ref = accum_kl_student_ref / max(1, accum_count)
+                avg_advantage_student = accum_advantage_student / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
@@ -592,6 +653,10 @@ def train(
                         "train/kl": avg_kl,
                         "train/mean_reward": avg_reward,
                         "train/mean_advantage": avg_adv,
+                        # Common metrics
+                        "train/entropy_student": avg_entropy_student,
+                        "train/kl_student_ref": avg_kl_student_ref,
+                        "train/advantage_student": avg_advantage_student,
                         "lr": lr,
                         "step": global_step,
                     })
@@ -603,6 +668,10 @@ def train(
                 accum_reward = 0.0
                 accum_advantage = 0.0
                 accum_count = 0
+                # Reset common metrics accumulators
+                accum_entropy_student = 0.0
+                accum_kl_student_ref = 0.0
+                accum_advantage_student = 0.0
 
             if max_steps > 0 and global_step >= max_steps:
                 break

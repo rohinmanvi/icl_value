@@ -279,6 +279,10 @@ def compute_ppo_loss(
     total_advantage = 0.0
     total_ratio = 0.0
     total_clipped = 0
+    # Common metrics
+    total_entropy_student = 0.0
+    total_kl_student_ref = 0.0
+    total_advantage_student = 0.0
 
     for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"],
@@ -330,10 +334,12 @@ def compute_ppo_loss(
             pos = positions[pos_idx]
             taken_id = taken_ids[pos_idx]
             cand_ids = cand_ids_list[pos_idx]
+            cand_qs = cand_q_list[pos_idx]
             cand_ref_lps = cand_ref_logprobs_list[pos_idx]
             advantage = advantages[i]
 
             cand_ids_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
+            cand_qs_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
             cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
 
             try:
@@ -346,14 +352,17 @@ def compute_ppo_loss(
 
             # Compute log probs over candidates
             cand_ids_tensor = torch.tensor(cand_ids_local, dtype=torch.long, device=device)
+            cand_qs_tensor = torch.tensor(cand_qs_local, dtype=torch.float32, device=device)
             cand_ref_logprobs_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
 
             # Student policy: π_θ(a | candidates)
             cand_logits = pos_logits[cand_ids_tensor].float()
             log_p_student_cands = F.log_softmax(cand_logits, dim=-1)
+            p_student_cands = log_p_student_cands.exp()
 
             # Reference policy: π_ref(a | candidates)
             log_p_ref_cands = F.log_softmax(cand_ref_logprobs_tensor, dim=-1)
+            p_ref_cands = log_p_ref_cands.exp()
 
             # Log probs for taken action
             log_p_student_taken = log_p_student_cands[taken_idx]
@@ -383,6 +392,21 @@ def compute_ppo_loss(
             total_advantage += advantage
             total_ratio += ratio.detach().item()
 
+            # --- Common metrics (over candidates) ---
+            # Entropy of student over candidates
+            entropy_student = -(p_student_cands * log_p_student_cands).sum()
+            total_entropy_student += entropy_student.detach()
+
+            # KL(student || ref) over candidates
+            kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+            total_kl_student_ref += kl_student_ref.detach()
+
+            # Advantage: V(s) = E_ref[Q], A = Q - V
+            v_state = (p_ref_cands * cand_qs_tensor).sum()
+            advantages_cands = cand_qs_tensor - v_state
+            advantage_student = (p_student_cands * advantages_cands).sum()
+            total_advantage_student += advantage_student.detach()
+
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {
@@ -390,6 +414,9 @@ def compute_ppo_loss(
             "mean_advantage": 0.0,
             "mean_ratio": 0.0,
             "clip_fraction": 0.0,
+            "entropy_student": 0.0,
+            "kl_student_ref": 0.0,
+            "advantage_student": 0.0,
         }
 
     avg_loss = total_loss / total_positions
@@ -399,6 +426,9 @@ def compute_ppo_loss(
         "mean_advantage": total_advantage / total_positions,
         "mean_ratio": total_ratio / total_positions,
         "clip_fraction": total_clipped / total_positions,
+        "entropy_student": (total_entropy_student / total_positions).item(),
+        "kl_student_ref": (total_kl_student_ref / total_positions).item(),
+        "advantage_student": (total_advantage_student / total_positions).item(),
     }
 
     return avg_loss, metrics
@@ -516,6 +546,10 @@ def train(
     accum_ratio = 0.0
     accum_clip_frac = 0.0
     accum_count = 0
+    # Common metrics accumulators
+    accum_entropy_student = 0.0
+    accum_kl_student_ref = 0.0
+    accum_advantage_student = 0.0
 
     for epoch in range(num_epochs):
         if distributed:
@@ -550,6 +584,10 @@ def train(
             accum_ratio += metrics["mean_ratio"]
             accum_clip_frac += metrics["clip_fraction"]
             accum_count += 1
+            # Common metrics
+            accum_entropy_student += metrics["entropy_student"]
+            accum_kl_student_ref += metrics["kl_student_ref"]
+            accum_advantage_student += metrics["advantage_student"]
 
             if not update:
                 continue
@@ -573,6 +611,10 @@ def train(
                 avg_adv = accum_advantage / max(1, accum_count)
                 avg_ratio = accum_ratio / max(1, accum_count)
                 avg_clip = accum_clip_frac / max(1, accum_count)
+                # Common metrics
+                avg_entropy_student = accum_entropy_student / max(1, accum_count)
+                avg_kl_student_ref = accum_kl_student_ref / max(1, accum_count)
+                avg_advantage_student = accum_advantage_student / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
@@ -586,6 +628,10 @@ def train(
                         "train/mean_advantage": avg_adv,
                         "train/mean_ratio": avg_ratio,
                         "train/clip_fraction": avg_clip,
+                        # Common metrics
+                        "train/entropy_student": avg_entropy_student,
+                        "train/kl_student_ref": avg_kl_student_ref,
+                        "train/advantage_student": avg_advantage_student,
                         "lr": lr,
                         "step": global_step,
                     })
@@ -595,6 +641,10 @@ def train(
                 accum_ratio = 0.0
                 accum_clip_frac = 0.0
                 accum_count = 0
+                # Reset common metrics accumulators
+                accum_entropy_student = 0.0
+                accum_kl_student_ref = 0.0
+                accum_advantage_student = 0.0
 
             if max_steps > 0 and global_step >= max_steps:
                 break

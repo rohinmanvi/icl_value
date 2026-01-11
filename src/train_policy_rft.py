@@ -144,9 +144,24 @@ class PolicyRFTDataset(Dataset):
         if hasattr(output_ids, 'tolist'):
             output_ids = output_ids.tolist()
 
+        # Get candidate data for common metrics (if available)
+        candidate_ids = row.get("candidate_ids")
+        candidate_q_values = row.get("candidate_q_values")
+        candidate_ref_logprobs = row.get("candidate_ref_logprobs")
+
+        if candidate_ids is not None and hasattr(candidate_ids, 'tolist'):
+            candidate_ids = candidate_ids.tolist()
+        if candidate_q_values is not None and hasattr(candidate_q_values, 'tolist'):
+            candidate_q_values = candidate_q_values.tolist()
+        if candidate_ref_logprobs is not None and hasattr(candidate_ref_logprobs, 'tolist'):
+            candidate_ref_logprobs = candidate_ref_logprobs.tolist()
+
         return {
             "prompt_ids": list(prompt_ids),
             "output_ids": list(output_ids),
+            "candidate_ids": candidate_ids,
+            "candidate_q_values": candidate_q_values,
+            "candidate_ref_logprobs": candidate_ref_logprobs,
         }
 
     def __len__(self):
@@ -157,6 +172,9 @@ class PolicyRFTDataset(Dataset):
 
         prompt_ids = sample["prompt_ids"]
         output_ids = sample["output_ids"]
+        candidate_ids = sample["candidate_ids"]
+        candidate_q_values = sample["candidate_q_values"]
+        candidate_ref_logprobs = sample["candidate_ref_logprobs"]
 
         # Full sequence: prompt + output
         full_ids = prompt_ids + output_ids
@@ -169,11 +187,38 @@ class PolicyRFTDataset(Dataset):
                 # Truncate prompt too
                 full_ids = full_ids[:self.max_length]
                 output_ids = []
+                candidate_ids = [] if candidate_ids else None
+                candidate_q_values = [] if candidate_q_values else None
+                candidate_ref_logprobs = [] if candidate_ref_logprobs else None
             else:
                 output_ids = output_ids[:max_output]
                 full_ids = prompt_ids + output_ids
+                if candidate_ids:
+                    candidate_ids = candidate_ids[:max_output]
+                if candidate_q_values:
+                    candidate_q_values = candidate_q_values[:max_output]
+                if candidate_ref_logprobs:
+                    candidate_ref_logprobs = candidate_ref_logprobs[:max_output]
 
         prompt_len = len(prompt_ids)
+
+        # Build label positions and taken token ids for common metrics
+        label_positions = []
+        taken_token_ids = []
+        for j in range(len(output_ids)):
+            pos = prompt_len + j - 1
+            if pos >= 0:
+                label_positions.append(pos)
+                taken_token_ids.append(output_ids[j])
+
+        # Adjust candidate arrays for label positions
+        if prompt_len <= 0:
+            if candidate_ids:
+                candidate_ids = candidate_ids[1:]
+            if candidate_q_values:
+                candidate_q_values = candidate_q_values[1:]
+            if candidate_ref_logprobs:
+                candidate_ref_logprobs = candidate_ref_logprobs[1:]
 
         input_tensor = torch.tensor(full_ids, dtype=torch.long)
 
@@ -188,6 +233,11 @@ class PolicyRFTDataset(Dataset):
             "input_ids": input_tensor,
             "labels": labels,
             "prompt_len": prompt_len,
+            "label_positions": label_positions,
+            "candidate_ids": candidate_ids,
+            "candidate_q_values": candidate_q_values,
+            "candidate_ref_logprobs": candidate_ref_logprobs,
+            "taken_token_ids": taken_token_ids,
         }
 
     @staticmethod
@@ -209,6 +259,11 @@ class PolicyRFTDataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "prompt_lens": [s["prompt_len"] for s in batch],
+            "label_positions": [s["label_positions"] for s in batch],
+            "candidate_ids": [s["candidate_ids"] for s in batch],
+            "candidate_q_values": [s["candidate_q_values"] for s in batch],
+            "candidate_ref_logprobs": [s["candidate_ref_logprobs"] for s in batch],
+            "taken_token_ids": [s["taken_token_ids"] for s in batch],
         }
 
 
@@ -220,6 +275,8 @@ def compute_sft_loss(
     Compute standard SFT (cross-entropy) loss.
 
     Loss is computed only on output tokens (labels != -100).
+    Also computes common metrics (entropy_student, kl_student_ref, advantage_student)
+    if candidate data is available.
     """
     device = next(model.parameters()).device
     input_ids = batch["input_ids"].to(device)
@@ -256,10 +313,87 @@ def compute_sft_loss(
         else:
             accuracy = torch.tensor(0.0)
 
+    # Compute common metrics over candidates (if available)
+    total_entropy_student = 0.0
+    total_kl_student_ref = 0.0
+    total_advantage_student = 0.0
+    total_common_positions = 0
+
+    with torch.no_grad():
+        for batch_idx, (positions, cand_ids_list, cand_q_values_list, cand_ref_logprobs_list, taken_ids) in enumerate(
+            zip(batch["label_positions"], batch["candidate_ids"],
+                batch["candidate_q_values"], batch["candidate_ref_logprobs"],
+                batch["taken_token_ids"])
+        ):
+            if positions is None or cand_ids_list is None or cand_ref_logprobs_list is None:
+                continue
+            if len(positions) == 0 or len(cand_ids_list) == 0:
+                continue
+
+            for pos_idx, pos in enumerate(positions):
+                if pos_idx >= len(cand_ids_list):
+                    continue
+
+                cand_ids = cand_ids_list[pos_idx]
+                cand_ref_lps = cand_ref_logprobs_list[pos_idx] if cand_ref_logprobs_list else None
+
+                if cand_ids is None or len(cand_ids) < 1:
+                    continue
+                if cand_ref_lps is None or len(cand_ref_lps) < 1:
+                    continue
+
+                cand_ids_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
+                cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
+
+                # Get Q-values if available
+                cand_qs = None
+                if cand_q_values_list is not None and pos_idx < len(cand_q_values_list):
+                    cand_qs = cand_q_values_list[pos_idx]
+                    if cand_qs is not None:
+                        cand_qs = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
+
+                # Get logits for this position
+                pos_logits = logits[batch_idx, pos, :]  # [V]
+
+                # Candidate tensors
+                cand_ids_tensor = torch.tensor(cand_ids_local, dtype=torch.long, device=device)
+                cand_ref_logprobs_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
+
+                # Student policy over candidates
+                cand_logits = pos_logits[cand_ids_tensor].float()
+                log_p_student_cands = F.log_softmax(cand_logits, dim=-1)
+                p_student_cands = log_p_student_cands.exp()
+
+                # Reference policy over candidates
+                log_p_ref_cands = F.log_softmax(cand_ref_logprobs_tensor, dim=-1)
+                p_ref_cands = log_p_ref_cands.exp()
+
+                # Entropy of student over candidates
+                entropy_student = -(p_student_cands * log_p_student_cands).sum()
+                total_entropy_student += entropy_student.item()
+
+                # KL(student || ref) over candidates
+                kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+                total_kl_student_ref += kl_student_ref.item()
+
+                # Advantage: V(s) = E_ref[Q], A = Q - V (if Q-values available)
+                if cand_qs is not None and len(cand_qs) == len(cand_ids_local):
+                    cand_qs_tensor = torch.tensor(cand_qs, dtype=torch.float32, device=device)
+                    v_state = (p_ref_cands * cand_qs_tensor).sum()
+                    advantages_cands = cand_qs_tensor - v_state
+                    advantage_student = (p_student_cands * advantages_cands).sum()
+                    total_advantage_student += advantage_student.item()
+
+                total_common_positions += 1
+
     metrics = {
         "num_tokens": num_tokens,
         "perplexity": perplexity,
         "accuracy": accuracy.item() if isinstance(accuracy, torch.Tensor) else accuracy,
+        # Common metrics
+        "entropy_student": total_entropy_student / max(1, total_common_positions),
+        "kl_student_ref": total_kl_student_ref / max(1, total_common_positions),
+        "advantage_student": total_advantage_student / max(1, total_common_positions),
     }
 
     return loss, metrics
@@ -372,6 +506,10 @@ def train(
     accum_accuracy = 0.0
     accum_tokens = 0
     accum_count = 0
+    # Common metrics accumulators
+    accum_entropy_student = 0.0
+    accum_kl_student_ref = 0.0
+    accum_advantage_student = 0.0
 
     for epoch in range(num_epochs):
         if distributed:
@@ -402,6 +540,10 @@ def train(
             accum_accuracy += metrics["accuracy"]
             accum_tokens += metrics["num_tokens"]
             accum_count += 1
+            # Common metrics
+            accum_entropy_student += metrics["entropy_student"]
+            accum_kl_student_ref += metrics["kl_student_ref"]
+            accum_advantage_student += metrics["advantage_student"]
 
             if not update:
                 continue
@@ -425,6 +567,10 @@ def train(
                 avg_ppl = accum_perplexity / max(1, accum_count)
                 avg_acc = accum_accuracy / max(1, accum_count)
                 avg_tokens = accum_tokens / max(1, accum_count)
+                # Common metrics
+                avg_entropy_student = accum_entropy_student / max(1, accum_count)
+                avg_kl_student_ref = accum_kl_student_ref / max(1, accum_count)
+                avg_advantage_student = accum_advantage_student / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} ppl={avg_ppl:.2f} "
@@ -437,6 +583,10 @@ def train(
                         "train/perplexity": avg_ppl,
                         "train/accuracy": avg_acc,
                         "train/tokens_per_batch": avg_tokens,
+                        # Common metrics
+                        "train/entropy_student": avg_entropy_student,
+                        "train/kl_student_ref": avg_kl_student_ref,
+                        "train/advantage_student": avg_advantage_student,
                         "lr": lr,
                         "step": global_step,
                     })
@@ -446,6 +596,10 @@ def train(
                 accum_accuracy = 0.0
                 accum_tokens = 0
                 accum_count = 0
+                # Reset common metrics accumulators
+                accum_entropy_student = 0.0
+                accum_kl_student_ref = 0.0
+                accum_advantage_student = 0.0
 
             if max_steps > 0 and global_step >= max_steps:
                 break

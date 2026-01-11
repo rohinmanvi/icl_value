@@ -73,7 +73,7 @@ class PolicyAWRDataset(Dataset):
             df = table
 
         # Validate required columns
-        required_cols = ["prompt_token_ids", "output_token_ids", "candidate_ids", "candidate_q_values"]
+        required_cols = ["prompt_token_ids", "output_token_ids", "candidate_ids", "candidate_q_values", "candidate_ref_logprobs"]
         for c in required_cols:
             if c not in df.columns:
                 raise ValueError(f"Dataset missing required column: {c}")
@@ -120,17 +120,21 @@ class PolicyAWRDataset(Dataset):
 
         candidate_ids = row["candidate_ids"]
         candidate_q_values = row["candidate_q_values"]
+        candidate_ref_logprobs = row["candidate_ref_logprobs"]
 
         if hasattr(candidate_ids, 'tolist'):
             candidate_ids = candidate_ids.tolist()
         if hasattr(candidate_q_values, 'tolist'):
             candidate_q_values = candidate_q_values.tolist()
+        if hasattr(candidate_ref_logprobs, 'tolist'):
+            candidate_ref_logprobs = candidate_ref_logprobs.tolist()
 
         return {
             "prompt_ids": list(prompt_ids),
             "output_ids": list(output_ids),
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
+            "candidate_ref_logprobs": candidate_ref_logprobs,
         }
 
     def __len__(self):
@@ -143,6 +147,7 @@ class PolicyAWRDataset(Dataset):
         output_ids = sample["output_ids"]
         candidate_ids = sample["candidate_ids"]
         candidate_q_values = sample["candidate_q_values"]
+        candidate_ref_logprobs = sample["candidate_ref_logprobs"]
 
         # Full sequence: prompt + output
         full_ids = prompt_ids + output_ids
@@ -154,12 +159,14 @@ class PolicyAWRDataset(Dataset):
                 full_ids = full_ids[:self.max_length]
                 candidate_ids = []
                 candidate_q_values = []
+                candidate_ref_logprobs = []
                 output_ids = []
             else:
                 output_ids = output_ids[:max_output]
                 full_ids = prompt_ids + output_ids
                 candidate_ids = candidate_ids[:max_output]
                 candidate_q_values = candidate_q_values[:max_output]
+                candidate_ref_logprobs = candidate_ref_logprobs[:max_output]
 
         prompt_len = len(prompt_ids)
         label_positions = []
@@ -175,6 +182,7 @@ class PolicyAWRDataset(Dataset):
         if prompt_len <= 0:
             candidate_ids = candidate_ids[1:] if candidate_ids else []
             candidate_q_values = candidate_q_values[1:] if candidate_q_values else []
+            candidate_ref_logprobs = candidate_ref_logprobs[1:] if candidate_ref_logprobs else []
 
         input_tensor = torch.tensor(full_ids, dtype=torch.long)
 
@@ -183,6 +191,7 @@ class PolicyAWRDataset(Dataset):
             "label_positions": label_positions,
             "candidate_ids": candidate_ids,
             "candidate_q_values": candidate_q_values,
+            "candidate_ref_logprobs": candidate_ref_logprobs,
             "taken_token_ids": taken_token_ids,
         }
 
@@ -199,6 +208,7 @@ class PolicyAWRDataset(Dataset):
             "label_positions": [s["label_positions"] for s in batch],
             "candidate_ids": [s["candidate_ids"] for s in batch],
             "candidate_q_values": [s["candidate_q_values"] for s in batch],
+            "candidate_ref_logprobs": [s["candidate_ref_logprobs"] for s in batch],
             "taken_token_ids": [s["taken_token_ids"] for s in batch],
         }
 
@@ -272,10 +282,14 @@ def compute_awr_loss(
     total_advantage = 0.0
     total_weight = 0.0
     total_clipped = 0
+    # Common metrics
+    total_entropy_student = 0.0
+    total_kl_student_ref = 0.0
+    total_advantage_student = 0.0
 
-    for batch_idx, (positions, cand_ids_list, cand_q_list, taken_ids) in enumerate(
+    for batch_idx, (positions, cand_ids_list, cand_q_list, cand_ref_logprobs_list, taken_ids) in enumerate(
         zip(batch["label_positions"], batch["candidate_ids"],
-            batch["candidate_q_values"], batch["taken_token_ids"])
+            batch["candidate_q_values"], batch["candidate_ref_logprobs"], batch["taken_token_ids"])
     ):
         if positions is None or len(positions) == 0:
             continue
@@ -284,8 +298,7 @@ def compute_awr_loss(
 
         # Extract Q-values for taken actions along the trajectory
         taken_q_values = []
-        valid_positions = []
-        valid_taken_ids = []
+        valid_indices = []
 
         for pos_idx, (pos, cand_ids, cand_qs, taken_id) in enumerate(
             zip(positions, cand_ids_list, cand_q_list, taken_ids)
@@ -304,8 +317,7 @@ def compute_awr_loss(
                 continue
 
             taken_q_values.append(taken_q)
-            valid_positions.append(pos)
-            valid_taken_ids.append(taken_id)
+            valid_indices.append(pos_idx)
 
         if len(taken_q_values) == 0:
             continue
@@ -313,8 +325,19 @@ def compute_awr_loss(
         # Compute GAE advantages
         advantages = compute_gae_advantages(taken_q_values, gae_lambda)
 
-        # Compute weighted loss for each position
-        for i, (pos, taken_id, adv) in enumerate(zip(valid_positions, valid_taken_ids, advantages)):
+        # Compute weighted loss for each valid position
+        for i, pos_idx in enumerate(valid_indices):
+            pos = positions[pos_idx]
+            taken_id = taken_ids[pos_idx]
+            cand_ids = cand_ids_list[pos_idx]
+            cand_qs = cand_q_list[pos_idx]
+            cand_ref_lps = cand_ref_logprobs_list[pos_idx]
+            adv = advantages[i]
+
+            cand_ids_local = list(cand_ids) if hasattr(cand_ids, 'tolist') else list(cand_ids)
+            cand_qs_local = list(cand_qs) if hasattr(cand_qs, 'tolist') else list(cand_qs)
+            cand_ref_lps_local = list(cand_ref_lps) if hasattr(cand_ref_lps, 'tolist') else list(cand_ref_lps)
+
             # Get logits for this position
             pos_logits = logits[batch_idx, pos, :]  # [V]
 
@@ -338,6 +361,34 @@ def compute_awr_loss(
             total_advantage += adv
             total_weight += weight_clipped.item()
 
+            # --- Common metrics (over candidates) ---
+            cand_ids_tensor = torch.tensor(cand_ids_local, dtype=torch.long, device=device)
+            cand_qs_tensor = torch.tensor(cand_qs_local, dtype=torch.float32, device=device)
+            cand_ref_logprobs_tensor = torch.tensor(cand_ref_lps_local, dtype=torch.float32, device=device)
+
+            # Student distribution over candidates
+            cand_logits = pos_logits[cand_ids_tensor].float()
+            log_p_student_cands = F.log_softmax(cand_logits, dim=-1)
+            p_student_cands = log_p_student_cands.exp()
+
+            # Reference distribution over candidates
+            log_p_ref_cands = F.log_softmax(cand_ref_logprobs_tensor, dim=-1)
+            p_ref_cands = log_p_ref_cands.exp()
+
+            # Entropy of student over candidates
+            entropy_student = -(p_student_cands * log_p_student_cands).sum()
+            total_entropy_student += entropy_student.detach()
+
+            # KL(student || ref) over candidates
+            kl_student_ref = (p_student_cands * (log_p_student_cands - log_p_ref_cands)).sum()
+            total_kl_student_ref += kl_student_ref.detach()
+
+            # Advantage: V(s) = E_ref[Q], A = Q - V
+            v_state = (p_ref_cands * cand_qs_tensor).sum()
+            advantages_cands = cand_qs_tensor - v_state
+            advantage_student = (p_student_cands * advantages_cands).sum()
+            total_advantage_student += advantage_student.detach()
+
     if total_positions == 0:
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {
@@ -345,6 +396,9 @@ def compute_awr_loss(
             "mean_advantage": 0.0,
             "mean_weight": 0.0,
             "clip_fraction": 0.0,
+            "entropy_student": 0.0,
+            "kl_student_ref": 0.0,
+            "advantage_student": 0.0,
         }
 
     avg_loss = total_loss / total_positions
@@ -354,6 +408,9 @@ def compute_awr_loss(
         "mean_advantage": total_advantage / total_positions,
         "mean_weight": total_weight / total_positions,
         "clip_fraction": total_clipped / total_positions,
+        "entropy_student": (total_entropy_student / total_positions).item(),
+        "kl_student_ref": (total_kl_student_ref / total_positions).item(),
+        "advantage_student": (total_advantage_student / total_positions).item(),
     }
 
     return avg_loss, metrics
@@ -470,6 +527,9 @@ def train(
     accum_advantage = 0.0
     accum_weight = 0.0
     accum_clip_frac = 0.0
+    accum_entropy_student = 0.0
+    accum_kl_student_ref = 0.0
+    accum_advantage_student = 0.0
     accum_count = 0
 
     for epoch in range(num_epochs):
@@ -504,6 +564,9 @@ def train(
             accum_advantage += metrics["mean_advantage"]
             accum_weight += metrics["mean_weight"]
             accum_clip_frac += metrics["clip_fraction"]
+            accum_entropy_student += metrics["entropy_student"]
+            accum_kl_student_ref += metrics["kl_student_ref"]
+            accum_advantage_student += metrics["advantage_student"]
             accum_count += 1
 
             if not update:
@@ -528,19 +591,24 @@ def train(
                 avg_adv = accum_advantage / max(1, accum_count)
                 avg_weight = accum_weight / max(1, accum_count)
                 avg_clip = accum_clip_frac / max(1, accum_count)
+                avg_entropy = accum_entropy_student / max(1, accum_count)
+                avg_kl = accum_kl_student_ref / max(1, accum_count)
+                avg_adv_s = accum_advantage_student / max(1, accum_count)
 
                 print(
                     f"[Step {global_step}] loss={avg_loss:.4f} "
-                    f"adv={avg_adv:.4f} weight={avg_weight:.3f} "
-                    f"clip={avg_clip:.3f} lr={lr:.2e}"
+                    f"kl_s_ref={avg_kl:.4f} adv_s={avg_adv_s:.4f} "
+                    f"H_s={avg_entropy:.3f} lr={lr:.2e}"
                 )
 
                 if wandb_project and wandb:
                     wandb.log({
                         "train/loss": avg_loss,
-                        "train/mean_advantage": avg_adv,
                         "train/mean_weight": avg_weight,
                         "train/clip_fraction": avg_clip,
+                        "train/entropy_student": avg_entropy,
+                        "train/kl_student_ref": avg_kl,
+                        "train/advantage_student": avg_adv_s,
                         "lr": lr,
                         "step": global_step,
                     })
@@ -549,6 +617,9 @@ def train(
                 accum_advantage = 0.0
                 accum_weight = 0.0
                 accum_clip_frac = 0.0
+                accum_entropy_student = 0.0
+                accum_kl_student_ref = 0.0
+                accum_advantage_student = 0.0
                 accum_count = 0
 
             if max_steps > 0 and global_step >= max_steps:
